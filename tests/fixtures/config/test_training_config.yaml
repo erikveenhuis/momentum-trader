@@ -1,0 +1,59 @@
+# Test Configuration for Rainbow DQN - Minimal Run
+# Based on config/training_config.yaml
+
+agent:
+  # Core RL params
+  gamma: 0.99
+  lr: 0.0001
+  batch_size: 32            # Smaller batch size for faster startup/less memory
+  replay_buffer_size: 1000  # Much smaller buffer
+  target_update_freq: 100   # Faster target updates
+
+  # Network architecture
+  window_size: 60
+  n_features: 5
+  hidden_dim: 32           # Smaller network
+  num_actions: 7
+  # Transformer specific params (add if missing)
+  nhead: 4 # Number of attention heads (ensure divisible by hidden_dim)
+  num_encoder_layers: 1 # Minimal layers for testing
+  dim_feedforward: 64 # Smaller feedforward dim for testing
+  transformer_dropout: 0.0 # No dropout for simple test
+
+  # Rainbow specific params
+  n_steps: 3
+  num_atoms: 51
+  v_min: -10.0
+  v_max: 10.0
+  alpha: 0.6
+  beta_start: 0.4
+  beta_frames: 1000        # Much faster annealing
+
+  # Other agent params
+  grad_clip_norm: 10.0
+  debug: false
+
+environment:
+  initial_balance: 10000.0
+  transaction_fee: 0.001
+  reward_scale: 10.0 # Scale factor for PnL component of reward (if used)
+  invalid_action_penalty: -0.1 # Penalty for invalid actions
+
+trainer:
+  seed: 42
+  warmup_steps: 10         # Very few warmup steps (Reduced from 50)
+  update_freq: 4
+  log_freq: 10             # Log more frequently
+  validation_freq: 2       # Validate only after the last episode (was 1)
+  checkpoint_save_freq: 1  # Save checkpoint every episode
+  reward_window: 1         # Small reward window
+  early_stopping_patience: 1 # Stop very quickly if no improvement
+  min_validation_threshold: -1.0 # Allow negative scores for testing short runs
+
+# Run specific settings (ensure this section exists)
+run:
+  mode: 'train'             # Ensure mode is train for the test
+  episodes: 2               # Run only 2 episodes
+  model_dir: 'tests/output/models' # Default, will be overridden by test
+  resume: false
+  # log_dir: 'tests/output/logs' # Optional: Specify log dir if needed by setup 

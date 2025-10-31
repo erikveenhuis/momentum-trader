@@ -1,0 +1,9 @@
+extracted_dir: data/extracted
+split_output_base_dir: data/processed # Output train/val/test subdirs here
+train_subdir: train
+val_subdir: validation
+test_subdir: test
+test_months: 3  # Use last 3 months for test set
+validation_size: 100
+seed: 42
+clear_output: true # Clears train/val/test subdirs before moving 

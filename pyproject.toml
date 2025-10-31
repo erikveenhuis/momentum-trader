@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.poetry]
+version = "0.1.5"
+description = "Momentum Trader - Monorepo for reinforcement learning trading system"
+authors = ["Erik Veenhuis"]
+
+[tool.poetry.dependencies]
+python = ">=3.13"
+
+# Include all workspace packages as dependencies
+[tool.poetry.group.dev.dependencies]
+momentum-env = { path = "packages/momentum_env", develop = true }
+momentum-agent = { path = "packages/momentum_agent", develop = true }
+momentum-train = { path = "packages/momentum_train", develop = true }
+momentum-live = { path = "packages/momentum_live", develop = true }
+
+[tool.black]
+line-length = 128
+target-version = ['py313']
+
+[tool.ruff]
+line-length = 128
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**.py" = ["F841", "E501"]
+"**/tests/**.py" = ["F841", "E501"]
+
+[tool.pylance]
+extraPaths = [
+    "./packages/momentum_env/src",
+    "./packages/momentum_agent/src",
+    "./packages/momentum_train/src",
+    "./packages/momentum_live/src"
+]
+
+[tool.pyright]
+extraPaths = [
+    "./packages/momentum_env/src",
+    "./packages/momentum_agent/src",
+    "./packages/momentum_train/src",
+    "./packages/momentum_live/src"
+]

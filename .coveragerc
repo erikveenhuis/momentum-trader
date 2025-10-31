@@ -1,0 +1,20 @@
+[run]
+source = packages
+branch = True
+parallel = True
+
+[report]
+# Report on all files in packages
+show_missing = True
+skip_covered = False
+# Exclude __init__.py files from coverage report
+omit =
+    packages/*/src/*/__init__.py
+
+[paths]
+source =
+    packages
+    */site-packages
+
+[html]
+directory = htmlcov 

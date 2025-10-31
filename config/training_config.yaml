@@ -1,0 +1,75 @@
+# Configuration for Rainbow DQN Trading Agent Training
+
+window_size: 60
+
+agent:
+  # Core RL params
+  gamma: 0.99
+  lr: 0.001 # Learning rate
+  batch_size: 256
+  replay_buffer_size: 500000
+  target_update_freq: 2500 # Steps to update target network
+
+  # Network architecture
+  window_size: 60 # Window size for the agent same as the environment
+  n_features: 5
+  hidden_dim: 256
+  num_actions: 7 # Needs to match environment action space
+
+  # Transformer specific params (add if missing)
+  nhead: 4 # Number of attention heads
+  num_encoder_layers: 3 # Example: Number of Transformer encoder layers
+  dim_feedforward: 512 # Example: Feedforward dimension
+  transformer_dropout: 0.2 # Example: Dropout within transformer
+
+  # Rainbow specific params
+  n_steps: 3          # Multi-step returns
+  num_atoms: 51       # Distributional RL atoms
+  v_min: -1.0        # Distributional RL support min value (Adjusted for new reward scale)
+  v_max: 1.0         # Distributional RL support max value (Adjusted for new reward scale)
+  alpha: 0.6          # PER priority exponent
+  beta_start: 0.5     # PER importance sampling exponent (initial)
+  beta_frames: 1000000 # PER beta annealing frames (steps)
+
+  # Learning rate scheduler params
+  lr_scheduler_enabled: true # Enable/disable LR scheduler
+  lr_scheduler_type: 'ReduceLROnPlateau' # e.g., 'StepLR', 'CosineAnnealingLR', 'ReduceLROnPlateau'
+  lr_scheduler_params: # Parameters specific to the chosen scheduler
+    mode: 'max'        # 'max' because higher validation score is better
+    factor: 0.1        # Factor by which the learning rate will be reduced. new_lr = lr * factor
+    patience: 5       # Number of epochs with no improvement after which learning rate will be reduced
+    threshold: 0.0001  # Threshold for measuring the new optimum, to only focus on significant changes
+    min_lr: 0.000001   # A lower bound on the learning rate
+
+  # Other agent params
+  grad_clip_norm: 1.0 # Gradient clipping norm
+  debug: False        # Enable debug checks (e.g., gradient checks)
+
+environment:
+  window_size: 60 # Window size for the environment same as the agent
+  initial_balance: 1000.0
+  transaction_fee: 0.001 # Percentage fee
+  reward_scale: 200.0 # Scale factor for PnL component of reward (if used)
+  invalid_action_penalty: -0.05 # Penalty for invalid actions
+
+trainer:
+  seed: 42
+  warmup_steps: 150000     # Steps with random actions before training
+  update_freq: 4          # Agent learning update frequency (steps)
+  log_freq: 60            # Logging frequency (steps)
+  validation_freq: 100     # Validation frequency (episodes)
+  checkpoint_save_freq: 100 # Checkpoint save frequency (episodes)
+  reward_window: 10       # Window for averaging episode rewards in logs
+  early_stopping_patience: 15 # Episodes without validation improvement to stop
+  min_validation_threshold: 0.0 # Minimum score change considered improvement
+
+# --- Run Configuration --- #
+run:
+  mode: 'train'              # 'train' or 'eval'
+  episodes: 50000            # Number of training episodes
+  model_dir: 'models'        # Directory to save models and logs
+  resume: false             # Resume training from latest checkpoint if true
+  specific_file: null       # Path to a specific training file (relative to data root) or null/None
+  skip_evaluation: false    # Skip final evaluation on test set after training
+  # data_base_dir: 'data'   # Optional: Override base data directory (defaults to 'data')
+  # eval_model_prefix: 'models/rainbow_transformer_best' # Optional: Model prefix for eval mode 
