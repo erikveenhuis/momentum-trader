@@ -227,6 +227,9 @@ def run_training(config: dict, data_manager: DataManager, resume_training_flag: 
 
     # --- Initial Env Setup ---
     try:
+        logger.info(f"DataManager type: {type(data_manager)}")
+        logger.info(f"DataManager has organize_data: {hasattr(data_manager, 'organize_data')}")
+        logger.info(f"DataManager _data_organized: {getattr(data_manager, '_data_organized', 'N/A')}")
         initial_file = get_random_data_file(data_manager)
         assert isinstance(
             initial_file, Path
@@ -338,7 +341,8 @@ def main():  # Remove default config_path
     
     # --- Initialize DataManager ---
     # Pass base_dir from config. Processed dir name defaults to 'processed' unless specified.
-    data_manager = DataManager(base_dir=data_base_dir) 
+    data_manager = DataManager(base_dir=data_base_dir)
+    data_manager.organize_data()  # Load file lists from directories
     assert isinstance(data_manager, DataManager), "Failed to initialize DataManager"
 
     os.makedirs(model_dir, exist_ok=True)

@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import logging.handlers  # Import handlers
 import sys  # Import sys for console output
-from momentum_train.data import DataManager  # Import from package
+from ..data import DataManager  # Import from relative path
 
 logger = logging.getLogger("Utils")  # Use a specific logger or the root logger
 
