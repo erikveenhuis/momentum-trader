@@ -1,6 +1,6 @@
 """Momentum Agent Package - Rainbow DQN for Reinforcement Learning."""
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 
 from .agent import RainbowDQNAgent
 from .model import RainbowNetwork

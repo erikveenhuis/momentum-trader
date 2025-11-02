@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "momentum_env"
-version = "0.1.5"
+version = "0.1.6"
 description = "A flexible trading environment for reinforcement learning"
 authors = [
   { name="Erik Veenhuis" },
@@ -18,7 +18,7 @@ classifiers = [
 ]
 dependencies = [
     "gymnasium==1.1.1",
-    "numpy==2.2.5",
+    "numpy==2.3.3",
     "pandas==2.2.3",
     "matplotlib"
 ]

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "momentum_agent"
-version = "0.1.5"
+version = "0.1.6"
 description = "Rainbow DQN agent for reinforcement learning"
 authors = [
   { name="Erik Veenhuis" },
@@ -17,10 +17,10 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "torch==2.7.0",
-    "numpy==2.2.5",
+    "torch==2.8.0",
+    "numpy==2.3.3",
     "PyYAML==6.0.2",
-    "momentum_env==0.1.5",
+    "momentum_env==0.1.6",
 ]
 
 [project.optional-dependencies]

@@ -1,6 +1,6 @@
 """Training module for momentum trader."""
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 
 from .trainer import RainbowTrainerModule
 from .data import DataManager

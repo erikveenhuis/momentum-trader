@@ -135,6 +135,7 @@ class RainbowTrainerModule:
             # --- ADDED Agent State ---
             "agent_config": self.agent.config,
             "agent_total_steps": self.agent.total_steps,
+            "total_steps": self.agent.total_steps,
             "network_state_dict": self.agent.network.state_dict() if self.agent.network else None,
             "target_network_state_dict": self.agent.target_network.state_dict() if self.agent.target_network else None,
             "optimizer_state_dict": self.agent.optimizer.state_dict() if self.agent.optimizer else None,

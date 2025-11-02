@@ -321,14 +321,10 @@ def test_save_load_model(agent, default_config, tmp_path):
     # Save the model
     agent.save_model(save_prefix)
     
-    # Check that all expected files exist
-    network_path = f"{save_prefix}_network.pth"
-    optimizer_path = f"{save_prefix}_optimizer.pth"
-    misc_path = f"{save_prefix}_misc.yaml"
+    # Check that unified checkpoint file exists
+    checkpoint_path = f"{save_prefix}_agent_state.pt"
     
-    assert os.path.exists(network_path)
-    assert os.path.exists(optimizer_path)
-    assert os.path.exists(misc_path)
+    assert os.path.exists(checkpoint_path)
 
     # Create a new agent instance with the same config
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -387,14 +383,10 @@ def test_load_model_config_mismatch(agent, default_config, caplog, tmp_path):
     agent.total_steps = 50
     agent.save_model(save_prefix)
     
-    # Check that all expected files exist
-    network_path = f"{save_prefix}_network.pth"
-    optimizer_path = f"{save_prefix}_optimizer.pth"
-    misc_path = f"{save_prefix}_misc.yaml"
+    # Check that unified checkpoint file exists
+    checkpoint_path = f"{save_prefix}_agent_state.pt"
     
-    assert os.path.exists(network_path)
-    assert os.path.exists(optimizer_path)
-    assert os.path.exists(misc_path)
+    assert os.path.exists(checkpoint_path)
 
     # Create a new config with a mismatch
     mismatched_config = default_config.copy()

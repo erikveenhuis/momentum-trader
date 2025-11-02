@@ -70,6 +70,17 @@ def test_buffer_store_single(per_buffer):
 
 
 @pytest.mark.unittest
+def test_buffer_store_respects_max_priority(per_buffer):
+    """New experiences should inherit the tracked max priority without reapplying alpha."""
+    per_buffer.max_priority = 0.25
+    exp = create_dummy_experience()
+    per_buffer.store(*exp)
+
+    # Only one item stored, total priority should equal the set max priority.
+    assert per_buffer.tree.total() == pytest.approx(0.25)
+
+
+@pytest.mark.unittest
 def test_buffer_store_multiple(per_buffer):
     """Test storing multiple experiences."""
     num_items = 50

@@ -10,6 +10,8 @@ import numpy as np
 import yaml  # Added for config loading
 import argparse  # Added for command-line arguments
 import time # Added for timestamping log directories
+import json
+from datetime import datetime
 # --- Add AMP imports ---
 from torch.cuda.amp import GradScaler, autocast
 # ---------------------
@@ -62,6 +64,86 @@ setup_logging(
 logger = get_logger("Main")
 
 
+def evaluate_on_test_data(agent: RainbowDQNAgent, trainer: RainbowTrainerModule, config: dict) -> None:
+    """Run evaluation across the test split and log aggregate results."""
+    if not hasattr(trainer, "data_manager"):
+        logger.error("Trainer does not expose a data_manager; cannot evaluate on test data.")
+        return
+
+    try:
+        test_files = trainer.data_manager.get_test_files()
+    except Exception as exc:
+        logger.error(f"Unable to retrieve test files for evaluation: {exc}")
+        return
+
+    if not test_files:
+        logger.warning("Test evaluation skipped: no test files available.")
+        return
+
+    logger.info("============================================")
+    logger.info(f"RUNNING TEST EVALUATION ON {len(test_files)} FILES")
+    logger.info("============================================")
+
+    all_file_metrics = []
+    detailed_results = []
+    episode_scores = []
+
+    for test_file in test_files:
+        try:
+            result = trainer._validate_single_file(test_file)
+        except Exception as exc:  # Defensive: _validate_single_file already catches most errors
+            logger.error(f"Unexpected error while evaluating {test_file.name}: {exc}")
+            continue
+
+        if not result:
+            continue
+
+        all_file_metrics.append(result.get("file_metrics", {}))
+        detailed_results.append(result.get("detailed_result", {}))
+        episode_scores.append(result.get("episode_score", -np.inf))
+
+    if not all_file_metrics:
+        logger.warning("Test evaluation produced no valid metrics.")
+        return
+
+    avg_metrics = trainer._calculate_average_validation_metrics(all_file_metrics)
+
+    finite_scores = [score for score in episode_scores if np.isfinite(score)]
+    average_score = float(np.mean(finite_scores)) if finite_scores else -np.inf
+
+    logger.info("\n=== TEST EVALUATION SUMMARY ===")
+    logger.info(f"Average Episode Score: {average_score:.4f}")
+    logger.info(f"Average Reward: {avg_metrics['avg_reward']:.2f}")
+    logger.info(f"Average Portfolio: ${avg_metrics['portfolio_value']:.2f}")
+    logger.info(f"Average Return: {avg_metrics['total_return']:.2f}%")
+    logger.info(f"Average Sharpe: {avg_metrics['sharpe_ratio']:.4f}")
+    logger.info(f"Average Max Drawdown: {avg_metrics['max_drawdown']*100:.2f}%")
+    logger.info(f"Average Transaction Costs: ${avg_metrics['transaction_costs']:.2f}")
+    logger.info("============================================")
+
+    # Persist detailed test results alongside validation outputs
+    model_dir = Path(config.get("run", {}).get("model_dir", "models"))
+    model_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_file = model_dir / f"test_results_{timestamp}.json"
+
+    try:
+        with results_file.open("w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "timestamp": timestamp,
+                    "average_episode_score": average_score,
+                    "average_metrics": avg_metrics,
+                    "detailed_results": detailed_results,
+                },
+                f,
+                indent=4,
+            )
+        logger.info(f"Test evaluation results saved to {results_file}")
+    except Exception as exc:
+        logger.error(f"Failed to save test evaluation results: {exc}")
+
+
 def run_training(config: dict, data_manager: DataManager, resume_training_flag: bool):
     """Runs the training loop for the Rainbow DQN agent."""
     # Extract relevant config sections directly (will raise KeyError if missing)
@@ -82,12 +164,17 @@ def run_training(config: dict, data_manager: DataManager, resume_training_flag: 
     logger.info(f"Running training with config: {config}")
 
     # Determine device
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
+    if torch.cuda.is_available():
         device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
     else:
-        device = torch.device("cpu")
+        error_msg = (
+            "GPU required: neither CUDA nor MPS devices detected. "
+            "Aborting to prevent running training on CPU."
+        )
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
     logger.info(f"Using {device} device")
 
     # --- Initialize GradScaler for AMP if using CUDA ---
@@ -169,12 +256,16 @@ def run_training(config: dict, data_manager: DataManager, resume_training_flag: 
                     agent_loaded = agent.load_state(loaded_checkpoint) # Pass the whole dict
 
                     if agent_loaded:
-                        # Agent state loaded successfully, use its step count
-                        start_total_steps = agent.total_steps
-                        logger.info(f"Agent state loaded successfully. Resuming from Agent Step: {start_total_steps}")
-                        # Sanity check step counts
-                        if start_total_steps != trainer_steps_from_checkpoint:
-                            logger.warning(f"Agent steps ({start_total_steps}) differ from trainer checkpoint steps ({trainer_steps_from_checkpoint}). Using agent steps.")
+                        # Prefer the trainer's recorded step count for resume consistency
+                        start_total_steps = trainer_steps_from_checkpoint
+                        if agent.total_steps != trainer_steps_from_checkpoint:
+                            logger.warning(
+                                "Agent total_steps (%s) differ from trainer checkpoint steps (%s). Synchronizing to trainer steps.",
+                                agent.total_steps,
+                                trainer_steps_from_checkpoint,
+                            )
+                            agent.total_steps = trainer_steps_from_checkpoint
+                        logger.info(f"Agent state loaded successfully. Resuming from Trainer Step: {start_total_steps}")
                     else:
                         # Agent state loading failed, reset trainer progress
                         logger.error("Failed to load agent state from the checkpoint dictionary, even though checkpoint file was loaded. Starting training from scratch.")

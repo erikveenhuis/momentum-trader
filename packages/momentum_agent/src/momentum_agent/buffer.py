@@ -123,7 +123,9 @@ class PrioritizedReplayBuffer:
     def store(self, *args):
         """Stores experience and assigns max priority."""
         experience = Experience(*args)
-        priority = self.max_priority**self.alpha  # Store priority^alpha in SumTree
+        priority = self.max_priority  # Already tracked in alpha-space
+        if priority <= 0:
+            priority = 1.0
 
         # Add experience to buffer deque
         if len(self.buffer) < self.capacity:

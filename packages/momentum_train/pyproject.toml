@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "momentum_train"
-version = "0.1.5"
+version = "0.1.6"
 description = "Training module for momentum trader"
 authors = [
   { name="Erik Veenhuis" },
@@ -17,13 +17,13 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "torch==2.7.0",
-    "numpy==2.2.5",
+    "torch==2.8.0",
+    "numpy==2.3.3",
     "pandas==2.2.3",
     "scikit-learn",
     "PyYAML==6.0.2",
-    "momentum_agent==0.1.5",
-    "momentum_env==0.1.5",
+    "momentum_agent==0.1.6",
+    "momentum_env==0.1.6",
     "tensorboard",
     "wandb",
 ]
