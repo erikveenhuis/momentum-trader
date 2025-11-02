@@ -1,10 +1,10 @@
+import math  # Import math for positional encoding calculation
+from typing import Any, Dict  # Added for type hinting
+
 import torch
 import torch.nn as nn
-import logging
-import math  # Import math for positional encoding calculation
 import torch.nn.functional as F
-from typing import Dict, Any  # Added for type hinting
-from .buffer import Experience
+
 from .constants import ACCOUNT_STATE_DIM
 from .utils.logging_config import get_logger
 
@@ -43,9 +43,7 @@ class NoisyLinear(nn.Module):
         self.weight_mu.data.uniform_(-mu_range, mu_range)
         self.weight_sigma.data.fill_(self.std_init / math.sqrt(self.in_features))
         self.bias_mu.data.uniform_(-mu_range, mu_range)
-        self.bias_sigma.data.fill_(
-            self.std_init / math.sqrt(self.out_features)
-        )  # Corrected bias sigma init
+        self.bias_sigma.data.fill_(self.std_init / math.sqrt(self.out_features))  # Corrected bias sigma init
 
     def _scale_noise(self, size: int) -> torch.Tensor:
         x = torch.randn(size, device=self.weight_mu.device)
@@ -58,9 +56,7 @@ class NoisyLinear(nn.Module):
         self.bias_epsilon.copy_(epsilon_out)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        assert (
-            x.ndim >= 2
-        ), f"Input to NoisyLinear must have at least 2 dims (Batch, Features), got shape {x.shape}"
+        assert x.ndim >= 2, f"Input to NoisyLinear must have at least 2 dims (Batch, Features), got shape {x.shape}"
         assert (
             x.shape[-1] == self.in_features
         ), f"Input feature dim ({x.shape[-1]}) does not match NoisyLinear in_features ({self.in_features})"
@@ -70,9 +66,7 @@ class NoisyLinear(nn.Module):
                 self.out_features,
                 self.in_features,
             ), "weight_epsilon shape mismatch"
-            assert self.bias_epsilon.shape == (
-                self.out_features,
-            ), "bias_epsilon shape mismatch"
+            assert self.bias_epsilon.shape == (self.out_features,), "bias_epsilon shape mismatch"
             weight = self.weight_mu + self.weight_sigma * self.weight_epsilon
             bias = self.bias_mu + self.bias_sigma * self.bias_epsilon
         else:
@@ -97,9 +91,7 @@ class PositionalEncoding(nn.Module):
         self.d_model = d_model  # Store d_model
 
         position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model)
-        )
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
         pe = torch.zeros(max_len, 1, d_model)
         pe[:, 0, 0::2] = torch.sin(position * div_term)
         if d_model % 2 != 0:
@@ -114,12 +106,8 @@ class PositionalEncoding(nn.Module):
         Args:
             x: Tensor, shape [batch_size, seq_len, embedding_dim]
         """
-        assert (
-            x.ndim == 3
-        ), f"Input to PositionalEncoding must be 3D (Batch, Seq, Emb), got shape {x.shape}"
-        assert (
-            x.shape[2] == self.d_model
-        ), f"Input embedding dim ({x.shape[2]}) does not match PositionalEncoding d_model ({self.d_model})"
+        assert x.ndim == 3, f"Input to PositionalEncoding must be 3D (Batch, Seq, Emb), got shape {x.shape}"
+        assert x.shape[2] == self.d_model, f"Input embedding dim ({x.shape[2]}) does not match PositionalEncoding d_model ({self.d_model})"
         assert (
             x.shape[1] <= self.pe.shape[0]
         ), f"Input sequence length ({x.shape[1]}) exceeds max_len ({self.pe.shape[0]}) of PositionalEncoding"
@@ -146,7 +134,7 @@ class RainbowNetwork(nn.Module):
         # Extract parameters from config - NO DEFAULTS, will raise KeyError if missing
         self.window_size = config["window_size"]
         self.n_features = config["n_features"]
-        self.hidden_dim = config["hidden_dim"] # Also embedding dim
+        self.hidden_dim = config["hidden_dim"]  # Also embedding dim
         self.num_actions = config["num_actions"]
         self.num_atoms = config["num_atoms"]
         self.v_min = config["v_min"]
@@ -156,7 +144,7 @@ class RainbowNetwork(nn.Module):
         self.num_encoder_layers = config["num_encoder_layers"]
         self.dim_feedforward = config["dim_feedforward"]
         self.transformer_dropout = config["transformer_dropout"]
-        
+
         # Check validity
         assert self.hidden_dim % self.nhead == 0, f"hidden_dim ({self.hidden_dim}) must be divisible by nhead ({self.nhead})"
         assert ACCOUNT_STATE_DIM == 2, "ACCOUNT_STATE_DIM mismatch"
@@ -166,39 +154,28 @@ class RainbowNetwork(nn.Module):
         self.device = device
 
         # Save configuration
-        self.register_buffer(
-            "support", torch.linspace(self.v_min, self.v_max, self.num_atoms)
-        )
+        self.register_buffer("support", torch.linspace(self.v_min, self.v_max, self.num_atoms))
         self.delta_z = (self.v_max - self.v_min) / (self.num_atoms - 1)
 
         # --- Shared Feature Extractor (Similar to Actor/Critic start) ---
         self.feature_embedding = nn.Linear(self.n_features, self.hidden_dim)
-        self.pos_encoder = PositionalEncoding(
-            self.hidden_dim, dropout=self.transformer_dropout, max_len=self.window_size
-        )
+        self.pos_encoder = PositionalEncoding(self.hidden_dim, dropout=self.transformer_dropout, max_len=self.window_size)
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.hidden_dim, 
-            nhead=self.nhead, # Use config value
-            dim_feedforward=self.dim_feedforward, # Use config value
-            dropout=self.transformer_dropout, # Use config value
-            activation="relu", 
-            batch_first=True
+            d_model=self.hidden_dim,
+            nhead=self.nhead,  # Use config value
+            dim_feedforward=self.dim_feedforward,  # Use config value
+            dropout=self.transformer_dropout,  # Use config value
+            activation="relu",
+            batch_first=True,
         )
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer, 
-            num_layers=self.num_encoder_layers # Use config value
-        )
-        self.account_processor = nn.Sequential(
-            nn.Linear(2, self.hidden_dim // 4), nn.ReLU(), nn.Dropout(self.transformer_dropout)
-        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=self.num_encoder_layers)  # Use config value
+        self.account_processor = nn.Sequential(nn.Linear(2, self.hidden_dim // 4), nn.ReLU(), nn.Dropout(self.transformer_dropout))
         # --- End Shared Feature Extractor ---
 
         # --- Dueling Network Heads (Using Noisy Layers) ---
         # Calculate input dimension for heads after feature extraction and aggregation
         shared_feature_dim = self.hidden_dim + self.hidden_dim // 4
-        head_hidden_dim = (
-            self.hidden_dim // 2
-        )  # Hidden dimension for value/advantage streams
+        head_hidden_dim = self.hidden_dim // 2  # Hidden dimension for value/advantage streams
 
         # Value Stream
         self.value_stream = nn.Sequential(
@@ -228,28 +205,18 @@ class RainbowNetwork(nn.Module):
             elif isinstance(m, NoisyLinear):
                 m.reset_parameters()
 
-    def forward(
-        self, market_data: torch.Tensor, account_state: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, market_data: torch.Tensor, account_state: torch.Tensor) -> torch.Tensor:
         # --- Input Asserts ---
-        assert (
-            market_data.ndim == 3
-        ), f"Input market_data must be 3D (Batch, Seq, Feat), got shape {market_data.shape}"
+        assert market_data.ndim == 3, f"Input market_data must be 3D (Batch, Seq, Feat), got shape {market_data.shape}"
         assert (
             market_data.shape[1] == self.window_size
         ), f"Input market_data seq len ({market_data.shape[1]}) != window_size ({self.window_size})"
         assert (
             market_data.shape[2] == self.n_features
         ), f"Input market_data feat dim ({market_data.shape[2]}) != n_features ({self.n_features})"
-        assert (
-            account_state.ndim == 2
-        ), f"Input account_state must be 2D (Batch, Feat=2), got shape {account_state.shape}"
-        assert (
-            account_state.shape[1] == 2
-        ), f"Input account_state must have 2 features, got {account_state.shape[1]}"
-        assert (
-            market_data.shape[0] == account_state.shape[0]
-        ), "Batch size mismatch between market_data and account_state"
+        assert account_state.ndim == 2, f"Input account_state must be 2D (Batch, Feat=2), got shape {account_state.shape}"
+        assert account_state.shape[1] == 2, f"Input account_state must have 2 features, got {account_state.shape[1]}"
+        assert market_data.shape[0] == account_state.shape[0], "Batch size mismatch between market_data and account_state"
         batch_size = market_data.shape[0]
         # --- End Input Asserts ---
 
@@ -304,15 +271,11 @@ class RainbowNetwork(nn.Module):
 
         # Reshape for distributional calculations
         value_logits = value_logits.view(batch_size, 1, self.num_atoms)
-        advantage_logits = advantage_logits.view(
-            batch_size, self.num_actions, self.num_atoms
-        )
+        advantage_logits = advantage_logits.view(batch_size, self.num_actions, self.num_atoms)
         # ---------------------
 
         # --- Combine Streams for Q-Distribution ---
-        q_logits = (
-            value_logits + advantage_logits - advantage_logits.mean(dim=1, keepdim=True)
-        )
+        q_logits = value_logits + advantage_logits - advantage_logits.mean(dim=1, keepdim=True)
         # Add numerical stability
         q_logits = torch.clamp(q_logits, min=-1e4, max=1e4)
         assert q_logits.shape == (
@@ -320,10 +283,10 @@ class RainbowNetwork(nn.Module):
             self.num_actions,
             self.num_atoms,
         ), "q_logits shape mismatch"
-        # --- ADDED: Check q_logits before log_softmax --- 
+        # --- ADDED: Check q_logits before log_softmax ---
         assert not torch.isnan(q_logits).any(), "NaN detected in q_logits before log_softmax"
         assert not torch.isinf(q_logits).any(), "Inf detected in q_logits before log_softmax"
-        # --- END ADDED --- 
+        # --- END ADDED ---
         # -----------------------------------------
 
         # --- Get Log Probabilities (for training loss) ---
@@ -340,16 +303,12 @@ class RainbowNetwork(nn.Module):
 
         return log_probs
 
-    def get_q_values(
-        self, market_data: torch.Tensor, account_state: torch.Tensor
-    ) -> torch.Tensor:
+    def get_q_values(self, market_data: torch.Tensor, account_state: torch.Tensor) -> torch.Tensor:
         """Helper function to get expected Q-values for action selection."""
         log_probs = self.forward(market_data, account_state)
         probs = torch.exp(log_probs)
         # Calculate Q-values from probabilities and support
-        q_values = (probs * self.support.unsqueeze(0).unsqueeze(1)).sum(
-            dim=2
-        )  # Expand support dims for broadcast
+        q_values = (probs * self.support.unsqueeze(0).unsqueeze(1)).sum(dim=2)  # Expand support dims for broadcast
 
         assert q_values.shape == (
             market_data.shape[0],

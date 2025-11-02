@@ -1,22 +1,21 @@
+import os  # Added for save/load path handling
+import random
+from collections import deque
+
+import numpy as np
 import torch
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
-import logging
-import numpy as np
-import time
-import random
-from collections import deque
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
+
 from .buffer import PrioritizedReplayBuffer
+from .constants import ACCOUNT_STATE_DIM  # Import constant
 from .model import RainbowNetwork
-import os  # Added for save/load path handling
-from .utils.utils import set_seeds
-import yaml  # Added for config load/save
-from .constants import ACCOUNT_STATE_DIM # Import constant
 from .utils.logging_config import get_logger
 
 # Get logger instance
 logger = get_logger("Agent")
+
 
 # --- Start: Rainbow DQN Agent ---
 class RainbowDQNAgent:
@@ -66,7 +65,7 @@ class RainbowDQNAgent:
         self.grad_clip_norm = config["grad_clip_norm"]
         # Optional flags can still use .get()
         self.debug_mode = config.get("debug", False)
-        self.scaler = scaler # Store the scaler instance
+        self.scaler = scaler  # Store the scaler instance
 
         # Setup seeds
         np.random.seed(self.seed)
@@ -79,28 +78,22 @@ class RainbowDQNAgent:
         elif self.device == "cuda":
             logger.warning("CUDA device requested but not available. Using CPU.")
             self.device = "cpu"
-            self.scaler = None # Ensure scaler is None if not on CUDA
-            logger.info(f"Agent on CPU. AMP Disabled.")
+            self.scaler = None  # Ensure scaler is None if not on CUDA
+            logger.info("Agent on CPU. AMP Disabled.")
         else:
-            logger.info(f"Agent on CPU. AMP Disabled.")
+            logger.info("Agent on CPU. AMP Disabled.")
 
         logger.info(f"Initializing RainbowDQNAgent on {self.device}")
         logger.info(f"Config: {config}")  # Log the entire config
 
         # Distributional RL setup
-        self.support = torch.linspace(self.v_min, self.v_max, self.num_atoms).to(
-            self.device
-        )
+        self.support = torch.linspace(self.v_min, self.v_max, self.num_atoms).to(self.device)
         self.delta_z = (self.v_max - self.v_min) / (self.num_atoms - 1)
 
         # Initialize Networks
         # Pass the agent's config dictionary and device directly
-        self.network = RainbowNetwork(config=self.config, device=self.device).to(
-            self.device
-        )
-        self.target_network = RainbowNetwork(config=self.config, device=self.device).to(
-            self.device
-        )
+        self.network = RainbowNetwork(config=self.config, device=self.device).to(self.device)
+        self.target_network = RainbowNetwork(config=self.config, device=self.device).to(self.device)
 
         # # Check if PyTorch version >= 2.0 to use torch.compile
         # if int(torch.__version__.split('.')[0]) >= 2:
@@ -130,18 +123,18 @@ class RainbowDQNAgent:
         self.optimizer = optim.Adam(self.network.parameters(), lr=self.lr)
 
         # Learning Rate Scheduler Initialization (moved after optimizer init)
-        self.lr_scheduler_enabled = self.config.get("lr_scheduler_enabled", False) # Get from self.config
+        self.lr_scheduler_enabled = self.config.get("lr_scheduler_enabled", False)  # Get from self.config
         self.scheduler = None
         if self.lr_scheduler_enabled:
             scheduler_type = self.config.get("lr_scheduler_type", "StepLR")
             scheduler_params = self.config.get("lr_scheduler_params", {})
-            
+
             # Ensure optimizer is defined before scheduler initialization
-            if hasattr(self, 'optimizer') and self.optimizer is not None:
+            if hasattr(self, "optimizer") and self.optimizer is not None:
                 if scheduler_type == "StepLR":
                     # Ensure all required params for StepLR are present or have defaults
                     step_size = scheduler_params.get("step_size")
-                    gamma = scheduler_params.get("gamma", 0.1) # Default gamma if not provided
+                    gamma = scheduler_params.get("gamma", 0.1)  # Default gamma if not provided
                     if step_size is None:
                         logger.error("StepLR 'step_size' not provided in scheduler_params. Disabling scheduler.")
                         self.lr_scheduler_enabled = False
@@ -149,7 +142,7 @@ class RainbowDQNAgent:
                         self.scheduler = lr_scheduler.StepLR(self.optimizer, step_size=step_size, gamma=gamma)
                 elif scheduler_type == "CosineAnnealingLR":
                     t_max = scheduler_params.get("T_max")
-                    eta_min = scheduler_params.get("min_lr", 0) # min_lr maps to eta_min
+                    eta_min = scheduler_params.get("min_lr", 0)  # min_lr maps to eta_min
                     if t_max is None:
                         logger.error("CosineAnnealingLR 'T_max' not provided in scheduler_params. Disabling scheduler.")
                         self.lr_scheduler_enabled = False
@@ -158,19 +151,19 @@ class RainbowDQNAgent:
                 # Add other schedulers like ReduceLROnPlateau if needed, with similar param checks
                 elif scheduler_type == "ReduceLROnPlateau":
                     # Parameters for ReduceLROnPlateau
-                    mode = scheduler_params.get("mode", 'min') # Default to min if not specified
+                    mode = scheduler_params.get("mode", "min")  # Default to min if not specified
                     factor = scheduler_params.get("factor", 0.1)
                     patience = scheduler_params.get("patience", 10)
                     threshold = scheduler_params.get("threshold", 1e-4)
                     min_lr = scheduler_params.get("min_lr", 0)
 
                     self.scheduler = lr_scheduler.ReduceLROnPlateau(
-                        self.optimizer, 
-                        mode=mode, 
-                        factor=factor, 
-                        patience=patience, 
-                        threshold=threshold, 
-                        min_lr=min_lr
+                        self.optimizer,
+                        mode=mode,
+                        factor=factor,
+                        patience=patience,
+                        threshold=threshold,
+                        min_lr=min_lr,
                     )
                     logger.info(f"Initialized ReduceLROnPlateau with mode='{mode}', factor={factor}, patience={patience}")
                 else:
@@ -179,16 +172,14 @@ class RainbowDQNAgent:
             else:
                 logger.error("Optimizer not initialized before attempting to create LR scheduler. Disabling scheduler.")
                 self.lr_scheduler_enabled = False
-            
+
             if self.scheduler:
                 logger.info(f"Initialized LR scheduler: {scheduler_type} with effective params for {scheduler_type}.")
         else:
             logger.info("LR scheduler is disabled by config.")
 
         logger.info("Rainbow networks and optimizer created.")
-        logger.info(
-            f"Network parameters: {sum(p.numel() for p in self.network.parameters()):,}"
-        )
+        logger.info(f"Network parameters: {sum(p.numel() for p in self.network.parameters()):,}")
 
         # Replay buffer
         self.buffer = PrioritizedReplayBuffer(
@@ -200,29 +191,21 @@ class RainbowDQNAgent:
         # For N-step returns
         self.n_step_buffer = deque(maxlen=self.n_steps)
         # --- ADDED: Deque for n-step reward logging window ---
-        self.n_step_reward_window = deque(maxlen=60) 
+        self.n_step_reward_window = deque(maxlen=60)
         # --- END ADDED ---
         # --- ADDED: List for comprehensive N-step reward history ---
         self.observed_n_step_rewards_history = []
         # --- END ADDED ---
 
         self.training_mode = True  # Start in training mode by default
-        self.total_steps = (
-            0  # Track total steps for target network updates and beta annealing
-        )
+        self.total_steps = 0  # Track total steps for target network updates and beta annealing
 
     def select_action(self, obs):
         """Selects action based on the current Q-value estimates using Noisy Nets."""
         assert isinstance(obs, dict), "Observation must be a dictionary"
-        assert (
-            "market_data" in obs and "account_state" in obs
-        ), "Observation missing required keys"
-        assert isinstance(
-            obs["market_data"], np.ndarray
-        ), "obs['market_data'] must be a numpy array"
-        assert isinstance(
-            obs["account_state"], np.ndarray
-        ), "obs['account_state'] must be a numpy array"
+        assert "market_data" in obs and "account_state" in obs, "Observation missing required keys"
+        assert isinstance(obs["market_data"], np.ndarray), "obs['market_data'] must be a numpy array"
+        assert isinstance(obs["account_state"], np.ndarray), "obs['account_state'] must be a numpy array"
         # Check shapes (before adding batch dimension)
         assert obs["market_data"].shape == (
             self.window_size,
@@ -234,9 +217,7 @@ class RainbowDQNAgent:
 
         # Convert observation to tensors
         market_data = torch.FloatTensor(obs["market_data"]).unsqueeze(0).to(self.device)
-        account_state = (
-            torch.FloatTensor(obs["account_state"]).unsqueeze(0).to(self.device)
-        )
+        account_state = torch.FloatTensor(obs["account_state"]).unsqueeze(0).to(self.device)
         assert market_data.shape == (
             1,
             self.window_size,
@@ -255,15 +236,9 @@ class RainbowDQNAgent:
                 1,
                 self.num_actions,
             ), f"Q-values shape mismatch. Expected (1, {self.num_actions}), got {q_values.shape}"
-            action = (
-                q_values.argmax().item()
-            )  # Choose action with highest expected Q-value
-            assert isinstance(
-                action, int
-            ), f"Selected action is not an integer: {action}"
-            assert (
-                0 <= action < self.num_actions
-            ), f"Selected action ({action}) is out of bounds [0, {self.num_actions})"
+            action = q_values.argmax().item()  # Choose action with highest expected Q-value
+            assert isinstance(action, int), f"Selected action is not an integer: {action}"
+            assert 0 <= action < self.num_actions, f"Selected action ({action}) is out of bounds [0, {self.num_actions})"
         # Switch back to train mode if necessary (depends if eval() affects Noisy Layers - typically it doesn't disable noise generation)
         if self.training_mode:
             self.network.train()
@@ -284,9 +259,7 @@ class RainbowDQNAgent:
                 - next_state_tn (tuple): (market_data_{t+n}, account_state_{t+n}) observed n steps later.
                 - done_tn (bool): Done flag from n steps later.
         """
-        assert (
-            len(self.n_step_buffer) == self.n_steps
-        ), "N-step buffer size mismatch for calculation"
+        assert len(self.n_step_buffer) == self.n_steps, "N-step buffer size mismatch for calculation"
 
         # State and action from the *first* transition in the buffer (t)
         market_data_t, account_state_t, action_t, _, _, _, _ = self.n_step_buffer[0]
@@ -312,9 +285,7 @@ class RainbowDQNAgent:
                 break
 
         # --- Start: Assert return types and shapes ---
-        assert (
-            isinstance(state_t, tuple) and len(state_t) == 2
-        ), "state_t is not a 2-tuple"
+        assert isinstance(state_t, tuple) and len(state_t) == 2, "state_t is not a 2-tuple"
         assert isinstance(state_t[0], np.ndarray) and state_t[0].shape == (
             self.window_size,
             self.n_features,
@@ -323,12 +294,8 @@ class RainbowDQNAgent:
             ACCOUNT_STATE_DIM,
         ), "state_t[1] (account_state) has wrong type/shape"
         assert isinstance(action_t, (int, np.integer)), "action_t is not an integer"
-        assert isinstance(
-            n_step_reward, (float, np.float32, np.float64)
-        ), "n_step_reward is not a float"
-        assert (
-            isinstance(next_state_tn, tuple) and len(next_state_tn) == 2
-        ), "next_state_tn is not a 2-tuple"
+        assert isinstance(n_step_reward, (float, np.float32, np.float64)), "n_step_reward is not a float"
+        assert isinstance(next_state_tn, tuple) and len(next_state_tn) == 2, "next_state_tn is not a 2-tuple"
         assert isinstance(next_state_tn[0], np.ndarray) and next_state_tn[0].shape == (
             self.window_size,
             self.n_features,
@@ -344,40 +311,24 @@ class RainbowDQNAgent:
     def store_transition(self, obs, action, reward, next_obs, done):
         """Stores experience in N-step buffer and potentially transfers to PER."""
         # --- Start: Assert input types and shapes for store_transition ---
-        assert (
-            isinstance(obs, dict) and "market_data" in obs and "account_state" in obs
-        ), "Invalid current observation format"
-        assert (
-            isinstance(next_obs, dict)
-            and "market_data" in next_obs
-            and "account_state" in next_obs
-        ), "Invalid next observation format"
-        assert isinstance(obs["market_data"], np.ndarray) and obs[
-            "market_data"
-        ].shape == (
+        assert isinstance(obs, dict) and "market_data" in obs and "account_state" in obs, "Invalid current observation format"
+        assert isinstance(next_obs, dict) and "market_data" in next_obs and "account_state" in next_obs, "Invalid next observation format"
+        assert isinstance(obs["market_data"], np.ndarray) and obs["market_data"].shape == (
             self.window_size,
             self.n_features,
         ), f"Invalid obs market data shape {obs['market_data'].shape}"
-        assert isinstance(obs["account_state"], np.ndarray) and obs[
-            "account_state"
-        ].shape == (
+        assert isinstance(obs["account_state"], np.ndarray) and obs["account_state"].shape == (
             ACCOUNT_STATE_DIM,
         ), f"Invalid obs account state shape {obs['account_state'].shape}"
-        assert isinstance(next_obs["market_data"], np.ndarray) and next_obs[
-            "market_data"
-        ].shape == (
+        assert isinstance(next_obs["market_data"], np.ndarray) and next_obs["market_data"].shape == (
             self.window_size,
             self.n_features,
         ), f"Invalid next_obs market data shape {next_obs['market_data'].shape}"
-        assert isinstance(next_obs["account_state"], np.ndarray) and next_obs[
-            "account_state"
-        ].shape == (
+        assert isinstance(next_obs["account_state"], np.ndarray) and next_obs["account_state"].shape == (
             ACCOUNT_STATE_DIM,
         ), f"Invalid next_obs account state shape {next_obs['account_state'].shape}"
         assert isinstance(action, (int, np.integer)), "Action must be an integer"
-        assert isinstance(
-            reward, (float, np.float32, np.float64)
-        ), "Reward must be a float"
+        assert isinstance(reward, (float, np.float32, np.float64)), "Reward must be a float"
         assert isinstance(done, (bool, np.bool_)), "Done flag must be boolean"
         # --- End: Assert input types and shapes ---
 
@@ -396,9 +347,7 @@ class RainbowDQNAgent:
 
         # If buffer has enough steps, calculate N-step return and store in PER
         if len(self.n_step_buffer) >= self.n_steps:
-            state_t, action_t, n_step_reward, next_state_tn, done_tn = (
-                self._get_n_step_info()
-            )
+            state_t, action_t, n_step_reward, next_state_tn, done_tn = self._get_n_step_info()
             # --- REMOVED: Single reward log ---
             # logger.info(f"Calculated n_step_reward: {n_step_reward}")
             # --- END REMOVED ---
@@ -416,29 +365,19 @@ class RainbowDQNAgent:
                 self.window_size,
                 self.n_features,
             ), "Invalid market_data_t for PER store"
-            assert isinstance(
-                account_state_t, np.ndarray
-            ) and account_state_t.shape == (
+            assert isinstance(account_state_t, np.ndarray) and account_state_t.shape == (
                 ACCOUNT_STATE_DIM,
             ), "Invalid account_state_t for PER store"
-            assert isinstance(
-                action_t, (int, np.integer)
-            ), "Invalid action_t for PER store"
-            assert isinstance(
-                n_step_reward, (float, np.float32, np.float64)
-            ), "Invalid n_step_reward for PER store"
+            assert isinstance(action_t, (int, np.integer)), "Invalid action_t for PER store"
+            assert isinstance(n_step_reward, (float, np.float32, np.float64)), "Invalid n_step_reward for PER store"
             assert isinstance(next_market_tn, np.ndarray) and next_market_tn.shape == (
                 self.window_size,
                 self.n_features,
             ), "Invalid next_market_tn for PER store"
-            assert isinstance(
-                next_account_tn, np.ndarray
-            ) and next_account_tn.shape == (
+            assert isinstance(next_account_tn, np.ndarray) and next_account_tn.shape == (
                 ACCOUNT_STATE_DIM,
             ), "Invalid next_account_tn for PER store"
-            assert isinstance(
-                done_tn, (bool, np.bool_)
-            ), "Invalid done_tn flag for PER store"
+            assert isinstance(done_tn, (bool, np.bool_)), "Invalid done_tn flag for PER store"
             # --- End: Assert types before storing ---
 
             # Store the calculated N-step transition in the main prioritized buffer
@@ -453,9 +392,7 @@ class RainbowDQNAgent:
                 done_tn,
             )
 
-    def _project_target_distribution(
-        self, next_market_data_batch, next_account_state_batch, rewards, dones
-    ):
+    def _project_target_distribution(self, next_market_data_batch, next_account_state_batch, rewards, dones):
         """
         Computes the projected target distribution for the C51 algorithm.
         Applies the Bellman update for n-steps and projects the resulting
@@ -472,35 +409,25 @@ class RainbowDQNAgent:
         """
         with torch.no_grad():
             # Double DQN: Use online network to select best next action's index at state s_{t+n}
-            next_q_values = self.network.get_q_values(
-                next_market_data_batch, next_account_state_batch
-            )
+            next_q_values = self.network.get_q_values(next_market_data_batch, next_account_state_batch)
             assert next_q_values.shape == (
                 self.batch_size,
                 self.num_actions,
             ), "Next Q-values shape mismatch"
             next_actions = next_q_values.argmax(dim=1)  # [batch_size]
-            assert next_actions.shape == (
-                self.batch_size,
-            ), "Next actions shape mismatch"
+            assert next_actions.shape == (self.batch_size,), "Next actions shape mismatch"
 
             # Get next state's distribution Z(s_{t+n}, a*) from target network for selected actions a*
-            next_log_dist = self.target_network(
-                next_market_data_batch, next_account_state_batch
-            )  # [B, num_actions, num_atoms]
+            next_log_dist = self.target_network(next_market_data_batch, next_account_state_batch)  # [B, num_actions, num_atoms]
             assert next_log_dist.shape == (
                 self.batch_size,
                 self.num_actions,
                 self.num_atoms,
             ), "Next log distribution shape mismatch"
-            assert (
-                next_actions.max() < self.num_actions and next_actions.min() >= 0
-            ), "Invalid next_action indices"
+            assert next_actions.max() < self.num_actions and next_actions.min() >= 0, "Invalid next_action indices"
 
             # Get the probability distribution for the chosen actions: p(s_{t+n}, a*)
-            next_dist = torch.exp(
-                next_log_dist[range(self.batch_size), next_actions]
-            )  # [B, num_atoms]
+            next_dist = torch.exp(next_log_dist[range(self.batch_size), next_actions])  # [B, num_atoms]
             assert next_dist.shape == (
                 self.batch_size,
                 self.num_atoms,
@@ -509,9 +436,7 @@ class RainbowDQNAgent:
             # Compute the projected Bellman target T_z = G_t^(n) + gamma^n * Z(s_{t+n}, a*)
             # Rewards are [B, 1], dones are [B, 1], support is [num_atoms]
             # Broadcasting applies correctly.
-            Tz = (
-                rewards + (1 - dones) * (self.gamma**self.n_steps) * self.support
-            )  # [B, num_atoms]
+            Tz = rewards + (1 - dones) * (self.gamma**self.n_steps) * self.support  # [B, num_atoms]
             assert Tz.shape == (
                 self.batch_size,
                 self.num_atoms,
@@ -519,9 +444,7 @@ class RainbowDQNAgent:
             Tz = Tz.clamp(min=self.v_min, max=self.v_max)
 
             # Compute projection indices and weights
-            b = (
-                Tz - self.v_min
-            ) / self.delta_z  # Normalized position on support axis [B, num_atoms]
+            b = (Tz - self.v_min) / self.delta_z  # Normalized position on support axis [B, num_atoms]
             assert b.shape == (
                 self.batch_size,
                 self.num_atoms,
@@ -535,9 +458,7 @@ class RainbowDQNAgent:
             # Distribute probability
             m = torch.zeros_like(next_dist)
             offset = (
-                torch.linspace(
-                    0, (self.batch_size - 1) * self.num_atoms, self.batch_size
-                )
+                torch.linspace(0, (self.batch_size - 1) * self.num_atoms, self.batch_size)
                 .long()
                 .unsqueeze(1)
                 .expand(self.batch_size, self.num_atoms)
@@ -568,9 +489,7 @@ class RainbowDQNAgent:
             if self.debug_mode:
                 sums = m.sum(dim=1)
                 if not torch.allclose(sums, torch.ones_like(sums), atol=1e-4):
-                    logger.warning(
-                        f"Target distribution M does not sum to 1. Sums: {sums}. Min sum: {sums.min()}, Max sum: {sums.max()}"
-                    )
+                    logger.warning(f"Target distribution M does not sum to 1. Sums: {sums}. Min sum: {sums.min()}, Max sum: {sums.max()}")
                     # It might not sum *exactly* to 1 due to floating point, clamping, and edge cases.
                     # A small tolerance is usually acceptable.
 
@@ -618,13 +537,9 @@ class RainbowDQNAgent:
         next_market_data_batch = torch.FloatTensor(next_market_data).to(self.device)
         next_account_state_batch = torch.FloatTensor(next_account_state).to(self.device)
         actions_batch = torch.LongTensor(actions).to(self.device)  # Action indices [B]
-        rewards_batch = (
-            torch.FloatTensor(rewards).unsqueeze(1).to(self.device)
-        )  # [B, 1]
+        rewards_batch = torch.FloatTensor(rewards).unsqueeze(1).to(self.device)  # [B, 1]
         dones_batch = torch.FloatTensor(dones).unsqueeze(1).to(self.device)  # [B, 1]
-        weights_batch = (
-            torch.FloatTensor(weights).unsqueeze(1).to(self.device)
-        )  # [B, 1]
+        weights_batch = torch.FloatTensor(weights).unsqueeze(1).to(self.device)  # [B, 1]
 
         # --- Start: Assert tensor shapes after conversion ---
         assert market_data_batch.shape == (
@@ -645,9 +560,7 @@ class RainbowDQNAgent:
             self.batch_size,
             ACCOUNT_STATE_DIM,
         ), "Tensor next_account_state_batch shape mismatch"
-        assert actions_batch.shape == (
-            self.batch_size,
-        ), "Tensor actions_batch shape mismatch"
+        assert actions_batch.shape == (self.batch_size,), "Tensor actions_batch shape mismatch"
         assert rewards_batch.shape == (
             self.batch_size,
             1,
@@ -675,9 +588,7 @@ class RainbowDQNAgent:
 
         # --- Calculate Online Distribution and Loss --- #
         # Get log probabilities Z(s_t, a) from the online network
-        log_ps = self.network(
-            market_data_batch, account_state_batch
-        )  # [B, num_actions, num_atoms]
+        log_ps = self.network(market_data_batch, account_state_batch)  # [B, num_actions, num_atoms]
         assert log_ps.shape == (
             self.batch_size,
             self.num_actions,
@@ -686,9 +597,7 @@ class RainbowDQNAgent:
 
         # Gather the log-probabilities for the actions actually taken: log Z(s_t, a_t)
         # We need to select the log probabilities corresponding to actions_batch
-        actions_indices = actions_batch.view(self.batch_size, 1, 1).expand(
-            self.batch_size, 1, self.num_atoms
-        )
+        actions_indices = actions_batch.view(self.batch_size, 1, 1).expand(self.batch_size, 1, self.num_atoms)
         log_ps_a = log_ps.gather(1, actions_indices).squeeze(1)  # [B, num_atoms]
         assert log_ps_a.shape == (
             self.batch_size,
@@ -699,36 +608,24 @@ class RainbowDQNAgent:
         # Loss = -sum_i [ target_distribution_i * log(online_distribution_i) ]
         # Target distribution is detached as it acts as the label.
         loss_elementwise = -(target_distribution.detach() * log_ps_a).sum(dim=1)  # [B]
-        assert loss_elementwise.shape == (
-            self.batch_size,
-        ), "Per-sample loss shape mismatch"
+        assert loss_elementwise.shape == (self.batch_size,), "Per-sample loss shape mismatch"
 
         # Apply Importance Sampling weights and calculate mean loss
         loss = (loss_elementwise * weights_batch.squeeze(1).detach()).mean()  # Scalar
         assert loss.ndim == 0, "Final loss is not a scalar"
-        assert torch.isfinite(
-            loss
-        ), f"Loss calculation resulted in NaN or Inf: {loss.item()}"
+        assert torch.isfinite(loss), f"Loss calculation resulted in NaN or Inf: {loss.item()}"
         # ----------------------------------------- #
 
         # --- Calculate TD errors for PER update --- #
         # TD error is | E[Target Distribution] - E[Online Distribution for a_t] |
         # Calculate expected Q-values E[Z(s_t, a_t)] from the online distribution for the action taken
-        q_values_online = (torch.exp(log_ps_a) * self.support.unsqueeze(0)).sum(
-            dim=1
-        )  # [B]
+        q_values_online = (torch.exp(log_ps_a) * self.support.unsqueeze(0)).sum(dim=1)  # [B]
         # Calculate expected target Q-values E[Projected Target Distribution]
-        q_values_target = (target_distribution * self.support.unsqueeze(0)).sum(
-            dim=1
-        )  # [B]
+        q_values_target = (target_distribution * self.support.unsqueeze(0)).sum(dim=1)  # [B]
         # TD error = |Target Q - Online Q|
         td_errors_tensor = (q_values_target.detach() - q_values_online.detach()).abs()
-        assert td_errors_tensor.shape == (
-            self.batch_size,
-        ), "TD errors tensor shape mismatch"
-        assert torch.isfinite(
-            td_errors_tensor
-        ).all(), "NaN or Inf found in TD errors tensor"
+        assert td_errors_tensor.shape == (self.batch_size,), "TD errors tensor shape mismatch"
+        assert torch.isfinite(td_errors_tensor).all(), "NaN or Inf found in TD errors tensor"
         # ----------------------------------------- #
 
         return loss, td_errors_tensor
@@ -742,9 +639,7 @@ class RainbowDQNAgent:
         # Update beta (annealing) based on total steps *before* sampling
         self.buffer.update_beta(self.total_steps)
         beta = self.buffer.beta  # Get current beta for logging
-        batch_tuple, tree_indices, weights = self.buffer.sample(
-            self.batch_size
-        )  # Sample returns tree_indices now
+        batch_tuple, tree_indices, weights = self.buffer.sample(self.batch_size)  # Sample returns tree_indices now
 
         if batch_tuple is None:
             logger.warning("PER sample returned None.")
@@ -752,17 +647,13 @@ class RainbowDQNAgent:
 
         # Compute loss and TD errors (TD errors are tensors)
         loss, td_errors_tensor = self._compute_loss(batch_tuple, weights)
-        assert (
-            isinstance(loss, torch.Tensor) and loss.ndim == 0
-        ), "Loss from _compute_loss is not a scalar tensor"
-        assert isinstance(
-            td_errors_tensor, torch.Tensor
-        ) and td_errors_tensor.shape == (
+        assert isinstance(loss, torch.Tensor) and loss.ndim == 0, "Loss from _compute_loss is not a scalar tensor"
+        assert isinstance(td_errors_tensor, torch.Tensor) and td_errors_tensor.shape == (
             self.batch_size,
         ), "TD errors tensor from _compute_loss has wrong shape/type"
 
         # Check if AMP is enabled (scaler exists)
-        amp_enabled = self.scaler is not None and self.device == 'cuda'
+        amp_enabled = self.scaler is not None and self.device == "cuda"
 
         # Optimize the model
         self.optimizer.zero_grad()
@@ -777,21 +668,15 @@ class RainbowDQNAgent:
         if self.debug_mode:
             for p in self.network.parameters():
                 if p.grad is not None and not torch.isfinite(p.grad).all():
-                    logger.error(
-                        f"NaN or Inf detected in gradients BEFORE clipping for parameter: {p.shape}"
-                    )
+                    logger.error(f"NaN or Inf detected in gradients BEFORE clipping for parameter: {p.shape}")
 
         # Clip gradients
         if amp_enabled:
             # Unscale gradients before clipping
             self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                self.network.parameters(), max_norm=self.grad_clip_norm
-            )
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=self.grad_clip_norm)
         else:
-            torch.nn.utils.clip_grad_norm_(
-                self.network.parameters(), max_norm=self.grad_clip_norm
-            )
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=self.grad_clip_norm)
 
         if self.debug_mode:
             for p in self.network.parameters():
@@ -826,12 +711,8 @@ class RainbowDQNAgent:
         # Update priorities in PER using the TD errors (ensure they are positive)
         # Add a small epsilon to prevent priorities of 0
         priorities = td_errors_tensor.cpu().numpy() + 1e-6
-        assert np.isfinite(
-            priorities
-        ).all(), "Non-finite priorities calculated for PER update"
-        self.buffer.update_priorities(
-            tree_indices, td_errors_tensor
-        )  # Pass tree_indices and the original tensor
+        assert np.isfinite(priorities).all(), "Non-finite priorities calculated for PER update"
+        self.buffer.update_priorities(tree_indices, td_errors_tensor)  # Pass tree_indices and the original tensor
 
         # Reset noise in Noisy Linear layers (important!)
         self.network.reset_noise()
@@ -844,16 +725,10 @@ class RainbowDQNAgent:
             logger.info(f"Step {self.total_steps}: Target network updated.")
 
         loss_item = loss.item()
-        assert (
-            isinstance(loss_item, float)
-            and not np.isnan(loss_item)
-            and not np.isinf(loss_item)
-        ), "Final loss item is not a valid float"
+        assert isinstance(loss_item, float) and not np.isnan(loss_item) and not np.isinf(loss_item), "Final loss item is not a valid float"
 
         # Log loss and PER beta
-        logger.debug(
-            f"Step: {self.total_steps}, Loss: {loss_item:.4f}, PER Beta: {beta:.4f}"
-        )
+        logger.debug(f"Step: {self.total_steps}, Loss: {loss_item:.4f}, PER Beta: {beta:.4f}")
 
         # --- ADDED: Log min/max of n-step reward window periodically ---
         # Log every 60 agent learning steps if the window has data
@@ -873,11 +748,13 @@ class RainbowDQNAgent:
         """Steps the learning rate scheduler if it's ReduceLROnPlateau and a metric is provided."""
         if self.scheduler and self.lr_scheduler_enabled and isinstance(self.scheduler, lr_scheduler.ReduceLROnPlateau):
             try:
-                current_lr = self.optimizer.param_groups[0]['lr']
+                current_lr = self.optimizer.param_groups[0]["lr"]
                 self.scheduler.step(metric)
-                new_lr = self.optimizer.param_groups[0]['lr']
+                new_lr = self.optimizer.param_groups[0]["lr"]
                 if new_lr < current_lr:
-                    logger.info(f"LR scheduler 'ReduceLROnPlateau' stepped. LR reduced from {current_lr} to {new_lr} based on metric: {metric:.4f}")
+                    logger.info(
+                        f"LR scheduler 'ReduceLROnPlateau' stepped. LR reduced from {current_lr} to {new_lr} based on metric: {metric:.4f}"
+                    )
                 else:
                     logger.debug(f"LR scheduler 'ReduceLROnPlateau' stepped with metric: {metric:.4f}. LR unchanged: {current_lr}")
             except Exception as e:
@@ -898,41 +775,43 @@ class RainbowDQNAgent:
 
         # Ensure path_prefix ends with something to distinguish components if needed
         # For example, if path_prefix is "model_checkpoint", files will be "model_checkpoint_network.pth", etc.
-        
+
         # --- Create a unified checkpoint dictionary ---
         checkpoint = {
-            'network_state_dict': self.network.state_dict(),
-            'target_network_state_dict': self.target_network.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'total_steps': self.total_steps, # Save total steps for resuming
-            'config': self.config, # Save the agent's config
-            'scaler_state_dict': self.scaler.state_dict() if self.scaler else None, # Save scaler state
+            "network_state_dict": self.network.state_dict(),
+            "target_network_state_dict": self.target_network.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "total_steps": self.total_steps,  # Save total steps for resuming
+            "config": self.config,  # Save the agent's config
+            "scaler_state_dict": (self.scaler.state_dict() if self.scaler else None),  # Save scaler state
         }
         if self.scheduler and self.lr_scheduler_enabled:
-            checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
+            checkpoint["scheduler_state_dict"] = self.scheduler.state_dict()
 
         # Save the unified checkpoint
         # Path prefix here should ideally be the full path including filename, e.g., "models/my_agent_checkpoint.pt"
-        # If path_prefix is just a directory + base name like "models/rainbow_agent", 
+        # If path_prefix is just a directory + base name like "models/rainbow_agent",
         # we might append "_checkpoint.pt" or similar.
         # For now, assuming path_prefix is a full path like "models/rainbow_transformer_best_XYZ.pt"
-        
+
         try:
             # The path_prefix now includes date, episode, and score, making it unique.
             # So, we directly save to this path.
-            final_save_path = f"{path_prefix}_agent_checkpoint.pt" # Distinguish agent chkpt
-            
+            final_save_path = f"{path_prefix}_agent_checkpoint.pt"  # Distinguish agent chkpt
+
             # If path_prefix already contains ".pt", we might want to adjust
             if path_prefix.endswith(".pt"):
-                 base_name = path_prefix[:-3] # Remove .pt
-                 final_save_path = f"{base_name}_agent_state.pt" # Use a more descriptive suffix
+                base_name = path_prefix[:-3]  # Remove .pt
+                final_save_path = f"{base_name}_agent_state.pt"  # Use a more descriptive suffix
             else:
-                 # If it's just a prefix like "models/rainbow_transformer_best"
-                 final_save_path = f"{path_prefix}_agent_state.pt"
+                # If it's just a prefix like "models/rainbow_transformer_best"
+                final_save_path = f"{path_prefix}_agent_state.pt"
 
             torch.save(checkpoint, final_save_path)
             logger.info(f"Unified agent checkpoint saved to {final_save_path}")
-            logger.info(f"  Includes: Network, Target Network, Optimizer, Scaler (if applicable), Scheduler (if applicable), Total Steps, Config")
+            logger.info(
+                "  Includes: Network, Target Network, Optimizer, Scaler (if applicable), Scheduler (if applicable), Total Steps, Config"
+            )
 
         except Exception as e:
             logger.error(f"Error saving unified agent checkpoint to {final_save_path}: {e}", exc_info=True)
@@ -946,27 +825,27 @@ class RainbowDQNAgent:
             base_name = path_prefix[:-3]
             checkpoint_path = f"{base_name}_agent_state.pt"
         else:
-            checkpoint_path = f"{path_prefix}_agent_state.pt" # Fallback if not ending with .pt
+            checkpoint_path = f"{path_prefix}_agent_state.pt"  # Fallback if not ending with .pt
 
         if not os.path.exists(checkpoint_path):
             logger.error(f"Unified agent checkpoint file not found at {checkpoint_path}. Cannot load model.")
-            return False # Indicate failure
+            return False  # Indicate failure
 
         try:
             logger.info(f"Attempting to load unified agent checkpoint from: {checkpoint_path}")
             # Ensure map_location is correctly set, especially if loading a CUDA-trained model on CPU
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
-            
+
             # Load network and target network
-            if 'network_state_dict' in checkpoint and self.network:
-                self.network.load_state_dict(checkpoint['network_state_dict'])
+            if "network_state_dict" in checkpoint and self.network:
+                self.network.load_state_dict(checkpoint["network_state_dict"])
                 logger.info("Network state loaded.")
             else:
                 logger.warning("Network state_dict not found in checkpoint or network not initialized.")
                 return False
 
-            if 'target_network_state_dict' in checkpoint and self.target_network:
-                self.target_network.load_state_dict(checkpoint['target_network_state_dict'])
+            if "target_network_state_dict" in checkpoint and self.target_network:
+                self.target_network.load_state_dict(checkpoint["target_network_state_dict"])
                 logger.info("Target network state loaded.")
             else:
                 logger.warning("Target network state_dict not found in checkpoint or target_network not initialized.")
@@ -974,44 +853,46 @@ class RainbowDQNAgent:
                 # but for full resume, it's better to have it.
 
             # Load optimizer state
-            if 'optimizer_state_dict' in checkpoint and self.optimizer:
-                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            if "optimizer_state_dict" in checkpoint and self.optimizer:
+                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
                 logger.info("Optimizer state loaded.")
             else:
                 logger.warning("Optimizer state_dict not found in checkpoint or optimizer not initialized.")
                 # Not returning False here, as sometimes one might want to load just weights with a new optimizer
 
             # Load total steps
-            if 'total_steps' in checkpoint:
-                self.total_steps = checkpoint['total_steps']
+            if "total_steps" in checkpoint:
+                self.total_steps = checkpoint["total_steps"]
                 logger.info(f"Total steps loaded: {self.total_steps}")
             else:
                 logger.warning("Total steps not found in checkpoint. Resetting to 0.")
-                self.total_steps = 0 # Or handle as error depending on requirements
+                self.total_steps = 0  # Or handle as error depending on requirements
 
             # Load scaler state
-            if 'scaler_state_dict' in checkpoint and self.scaler:
-                self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            if "scaler_state_dict" in checkpoint and self.scaler:
+                self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
                 logger.info("GradScaler state loaded.")
-            elif self.scaler is None and 'scaler_state_dict' in checkpoint and checkpoint['scaler_state_dict'] is not None:
+            elif self.scaler is None and "scaler_state_dict" in checkpoint and checkpoint["scaler_state_dict"] is not None:
                 logger.warning("Scaler state found in checkpoint, but agent's scaler is None. Scaler state not loaded.")
-            elif self.scaler and 'scaler_state_dict' not in checkpoint:
-                 logger.warning("Agent has a scaler, but no scaler state found in checkpoint.")
+            elif self.scaler and "scaler_state_dict" not in checkpoint:
+                logger.warning("Agent has a scaler, but no scaler state found in checkpoint.")
 
             # Load scheduler state
-            if 'scheduler_state_dict' in checkpoint and self.scheduler and self.lr_scheduler_enabled:
+            if "scheduler_state_dict" in checkpoint and self.scheduler and self.lr_scheduler_enabled:
                 try:
-                    self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                    self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
                     logger.info("LR Scheduler state loaded.")
                 except Exception as e:
-                    logger.error(f"Error loading LR scheduler state: {e}. Scheduler may not resume correctly.", exc_info=True)
-            elif self.scheduler and self.lr_scheduler_enabled and 'scheduler_state_dict' not in checkpoint:
+                    logger.error(
+                        f"Error loading LR scheduler state: {e}. Scheduler may not resume correctly.",
+                        exc_info=True,
+                    )
+            elif self.scheduler and self.lr_scheduler_enabled and "scheduler_state_dict" not in checkpoint:
                 logger.warning("LR Scheduler is enabled but its state was not found in the checkpoint. Scheduler will start fresh.")
-            
+
             # Optionally, compare or restore config (self.config vs checkpoint['config'])
-            if 'config' in checkpoint:
-                loaded_config = checkpoint['config']
-                # Basic check: e.g., if loaded_config['lr'] != self.config['lr'], log a warning or error.
+            if "config" in checkpoint:
+                # Basic check: e.g., if checkpoint['config']['lr'] != self.config['lr'], log a warning or error.
                 # For now, just log that config was present.
                 logger.info("Agent config found in checkpoint. Consider validating compatibility.")
             else:
@@ -1022,7 +903,7 @@ class RainbowDQNAgent:
             self.target_network.to(self.device)
             # Ensure optimizer state is also on the correct device after loading
             # This is generally handled by PyTorch, but good to be mindful of.
-            return True # Indicate success
+            return True  # Indicate success
 
         except FileNotFoundError:
             logger.error(f"Checkpoint file not found at {checkpoint_path}")
@@ -1038,9 +919,9 @@ class RainbowDQNAgent:
 
         Args:
             agent_state_dict (dict): A dictionary containing the agent's state.
-                                     Expected keys: 'network_state_dict', 
-                                                    'target_network_state_dict', 
-                                                    'optimizer_state_dict', 
+                                     Expected keys: 'network_state_dict',
+                                                    'target_network_state_dict',
+                                                    'optimizer_state_dict',
                                                     'total_steps',
                                                     'scaler_state_dict' (optional),
                                                     'scheduler_state_dict' (optional).
@@ -1056,23 +937,23 @@ class RainbowDQNAgent:
         successful_load = True
 
         # Load network state
-        if 'network_state_dict' in agent_state_dict and self.network:
+        if "network_state_dict" in agent_state_dict and self.network:
             try:
-                self.network.load_state_dict(agent_state_dict['network_state_dict'])
-                self.network.to(self.device) # Ensure model is on the correct device
+                self.network.load_state_dict(agent_state_dict["network_state_dict"])
+                self.network.to(self.device)  # Ensure model is on the correct device
                 logger.info("Network state loaded from dictionary.")
             except Exception as e:
                 logger.error(f"Error loading network state_dict from dictionary: {e}", exc_info=True)
                 successful_load = False
         else:
             logger.warning("Network state_dict not found in provided dictionary or agent.network is None.")
-            successful_load = False # Critical component
+            successful_load = False  # Critical component
 
         # Load target network state
-        if 'target_network_state_dict' in agent_state_dict and self.target_network:
+        if "target_network_state_dict" in agent_state_dict and self.target_network:
             try:
-                self.target_network.load_state_dict(agent_state_dict['target_network_state_dict'])
-                self.target_network.to(self.device) # Ensure model is on the correct device
+                self.target_network.load_state_dict(agent_state_dict["target_network_state_dict"])
+                self.target_network.to(self.device)  # Ensure model is on the correct device
                 logger.info("Target network state loaded from dictionary.")
             except Exception as e:
                 logger.error(f"Error loading target_network state_dict from dictionary: {e}", exc_info=True)
@@ -1082,9 +963,9 @@ class RainbowDQNAgent:
             # successful_load = False
 
         # Load optimizer state
-        if 'optimizer_state_dict' in agent_state_dict and self.optimizer:
+        if "optimizer_state_dict" in agent_state_dict and self.optimizer:
             try:
-                self.optimizer.load_state_dict(agent_state_dict['optimizer_state_dict'])
+                self.optimizer.load_state_dict(agent_state_dict["optimizer_state_dict"])
                 # Ensure optimizer's state is on the correct device if parameters were moved
                 # This is usually handled by PyTorch loading mechanism if map_location was used or model params are already on device.
                 logger.info("Optimizer state loaded from dictionary.")
@@ -1096,42 +977,54 @@ class RainbowDQNAgent:
             # successful_load = False
 
         # Load total steps
-        if 'total_steps' in agent_state_dict:
-            self.total_steps = agent_state_dict['total_steps']
+        if "total_steps" in agent_state_dict:
+            self.total_steps = agent_state_dict["total_steps"]
             logger.info(f"Total steps loaded from dictionary: {self.total_steps}")
         else:
             logger.warning("Total steps not found in provided dictionary. Agent's total_steps not updated.")
             # Consider if this should be an error or if agent's current total_steps is acceptable.
 
         # Load scaler state
-        if 'scaler_state_dict' in agent_state_dict and agent_state_dict['scaler_state_dict'] is not None and self.scaler:
+        if "scaler_state_dict" in agent_state_dict and agent_state_dict["scaler_state_dict"] is not None and self.scaler:
             try:
-                self.scaler.load_state_dict(agent_state_dict['scaler_state_dict'])
+                self.scaler.load_state_dict(agent_state_dict["scaler_state_dict"])
                 logger.info("GradScaler state loaded from dictionary.")
             except Exception as e:
                 logger.error(f"Error loading GradScaler state_dict from dictionary: {e}", exc_info=True)
-        elif self.scaler is None and 'scaler_state_dict' in agent_state_dict and agent_state_dict['scaler_state_dict'] is not None:
+        elif self.scaler is None and "scaler_state_dict" in agent_state_dict and agent_state_dict["scaler_state_dict"] is not None:
             logger.warning("Scaler state found in dictionary, but agent's scaler is None. Scaler state not loaded.")
-        elif self.scaler and ('scaler_state_dict' not in agent_state_dict or agent_state_dict.get('scaler_state_dict') is None):
+        elif self.scaler and ("scaler_state_dict" not in agent_state_dict or agent_state_dict.get("scaler_state_dict") is None):
             logger.warning("Agent has a scaler, but no scaler state found in dictionary. Scaler state not loaded.")
 
         # Load scheduler state
-        if 'scheduler_state_dict' in agent_state_dict and agent_state_dict['scheduler_state_dict'] is not None and self.scheduler and self.lr_scheduler_enabled:
+        if (
+            "scheduler_state_dict" in agent_state_dict
+            and agent_state_dict["scheduler_state_dict"] is not None
+            and self.scheduler
+            and self.lr_scheduler_enabled
+        ):
             try:
-                self.scheduler.load_state_dict(agent_state_dict['scheduler_state_dict'])
+                self.scheduler.load_state_dict(agent_state_dict["scheduler_state_dict"])
                 logger.info("LR Scheduler state loaded from dictionary.")
             except Exception as e:
-                logger.error(f"Error loading LR scheduler state_dict from dictionary: {e}. Scheduler may not resume correctly.", exc_info=True)
-        elif self.scheduler and self.lr_scheduler_enabled and ('scheduler_state_dict' not in agent_state_dict or agent_state_dict.get('scheduler_state_dict') is None):
+                logger.error(
+                    f"Error loading LR scheduler state_dict from dictionary: {e}. Scheduler may not resume correctly.",
+                    exc_info=True,
+                )
+        elif (
+            self.scheduler
+            and self.lr_scheduler_enabled
+            and ("scheduler_state_dict" not in agent_state_dict or agent_state_dict.get("scheduler_state_dict") is None)
+        ):
             logger.warning("LR Scheduler is enabled but its state was not found in the dictionary. Scheduler will start fresh.")
-        
+
         # Agent config compatibility check could also be done here if agent_config is part of agent_state_dict
 
         if successful_load:
             logger.info("Agent state loaded successfully from dictionary.")
         else:
             logger.error("One or more critical components failed to load from the agent state dictionary.")
-            
+
         return successful_load
 
     def set_training_mode(self, training=True):

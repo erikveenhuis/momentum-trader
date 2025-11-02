@@ -1,22 +1,24 @@
-import pandas as pd
-from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor
 import logging
+
 # Add multiprocessing queue and logging handlers
 import logging.handlers
+import re
+import sys
+from concurrent.futures import ProcessPoolExecutor
+
 # Use Manager Queue for better cross-platform compatibility
 from multiprocessing import Manager
-import re
-import yaml
-import sys
-# Add os for file deletion
-import os
+from pathlib import Path
+
 # Import Any for type hinting queues
-from typing import Optional, Tuple, Any, List
+from typing import Any, List, Optional, Tuple
+
+import pandas as pd
+import yaml
 
 # Import logging configuration
 try:
-    from momentum_train.logging_config import setup_logging, get_logger
+    from momentum_train.logging_config import get_logger, setup_logging
 except ImportError:
     logging.basicConfig(
         level=logging.INFO,
@@ -29,13 +31,19 @@ except ImportError:
 # Import shared functions/constants
 try:
     # Import detect_anomalies and PRICE_COLS
-    from .data_utils import clear_directory, detect_anomalies, detect_ohlc_range_anomalies, PRICE_COLS
+    from .data_utils import (
+        PRICE_COLS,
+        clear_directory,
+        detect_anomalies,
+        detect_ohlc_range_anomalies,
+    )
 except ImportError:
     logging.error("Could not import utility functions from data_utils. Ensure the file exists in the same directory.")
     sys.exit(1)
 
 # Get logger instance for the main process (used before multiprocessing starts)
 logger = get_logger("ExtractRawData")
+
 
 # Worker process logging setup function
 def worker_log_setup(queue: Any, worker_logger_name: str):
@@ -48,7 +56,7 @@ def worker_log_setup(queue: Any, worker_logger_name: str):
     worker_logger.addHandler(q_handler)
     # Set level high enough to capture desired messages (INFO, DEBUG etc.)
     # The listener in the main process respects the main config levels
-    worker_logger.setLevel(logging.DEBUG) # Or logging.INFO based on needs
+    worker_logger.setLevel(logging.DEBUG)  # Or logging.INFO based on needs
 
 
 def extract_gz_and_split_by_ticker(
@@ -65,7 +73,7 @@ def extract_gz_and_split_by_ticker(
     ohlc_range_anomaly_threshold: float,
     ohlc_range_anomaly_occurrence_threshold: int,
     # Add exclude_tickers list parameter
-    exclude_tickers: List[str]
+    exclude_tickers: List[str],
 ) -> Tuple[int, int, int, int, int, int, int]:
     """
     Reads a compressed CSV, cleans tickers, optionally filters USD pairs,
@@ -86,27 +94,27 @@ def extract_gz_and_split_by_ticker(
         exclude_tickers (List[str]): List of tickers to exclude.
 
     Returns:
-        Tuple[int, int, int, int, int, int, int]: 
-            saved_count, 
-            total_skipped_in_file, 
-            skipped_incomplete_count, 
-            skipped_non_usd_count, 
+        Tuple[int, int, int, int, int, int, int]:
+            saved_count,
+            total_skipped_in_file,
+            skipped_incomplete_count,
+            skipped_non_usd_count,
             skipped_anomalous_count,
             save_error_skips,
             skipped_excluded_ticker_count
     """
     # Configure logging for this worker process to use the queue
-    worker_logger_name = "ExtractRawData" # Use the same name as the main logger
+    worker_logger_name = "ExtractRawData"  # Use the same name as the main logger
     worker_log_setup(log_queue, worker_logger_name)
     # Get the logger configured by worker_log_setup
     logger = logging.getLogger(worker_logger_name)
 
     saved_count = 0
-    save_error_skips = 0 # Counter for save errors specifically
+    save_error_skips = 0  # Counter for save errors specifically
     skipped_incomplete_count = 0
     skipped_non_usd_count = 0
     skipped_anomalous_count = 0
-    skipped_excluded_ticker_count = 0 # Initialize new counter
+    skipped_excluded_ticker_count = 0  # Initialize new counter
 
     try:
         df = pd.read_csv(input_gz_path, compression="gzip")
@@ -114,7 +122,7 @@ def extract_gz_and_split_by_ticker(
         if "ticker" not in df.columns or "window_start" not in df.columns:
             logger.warning(f"[{input_gz_path.name}] Skipping: Missing 'ticker' or 'window_start' column.")
             # Estimate skipped count based on unique tickers if present
-            initial_unique_tickers = df['ticker'].nunique() if 'ticker' in df.columns else 0
+            initial_unique_tickers = df["ticker"].nunique() if "ticker" in df.columns else 0
             return 0, initial_unique_tickers, 0, 0, 0, 0, 0
 
         # --- Clean Ticker Names ---
@@ -123,20 +131,20 @@ def extract_gz_and_split_by_ticker(
         cleaned_tickers_set = set(df["ticker"].unique())
         changed_tickers = initial_tickers_set - cleaned_tickers_set
         if changed_tickers:
-             logger.debug(f"[{input_gz_path.name}] Removed 'X:' prefix from {len(changed_tickers)} tickers.")
+            logger.debug(f"[{input_gz_path.name}] Removed 'X:' prefix from {len(changed_tickers)} tickers.")
         if df["ticker"].isnull().any():
-             logger.warning(f"[{input_gz_path.name}] Found null tickers after cleaning. Removing affected rows.")
-             df = df.dropna(subset=["ticker"])
-             if df.empty:
-                  logger.warning(f"[{input_gz_path.name}] Skipping: DataFrame empty after removing null tickers.")
-                  # All original tickers potentially skipped
-                  return 0, 0, 0, 0, 0, 0, 0
+            logger.warning(f"[{input_gz_path.name}] Found null tickers after cleaning. Removing affected rows.")
+            df = df.dropna(subset=["ticker"])
+            if df.empty:
+                logger.warning(f"[{input_gz_path.name}] Skipping: DataFrame empty after removing null tickers.")
+                # All original tickers potentially skipped
+                return 0, 0, 0, 0, 0, 0, 0
 
         # --- Convert Timestamp and Extract Date ---
         try:
             # Ensure correct unit based on data source (ns for Polygon)
             df["window_start"] = pd.to_datetime(df["window_start"], unit="ns")
-            df["date"] = df["window_start"].dt.date # Extract date for grouping/filtering
+            df["date"] = df["window_start"].dt.date  # Extract date for grouping/filtering
         except Exception as e:
             logger.error(f"[{input_gz_path.name}] Error converting timestamp or extracting date: {e}. Skipping file.")
             # Estimate skipped tickers
@@ -144,19 +152,19 @@ def extract_gz_and_split_by_ticker(
 
         # Calculate initial number of unique day-ticker combinations
         # We'll use a set to keep track of combinations to keep
-        all_day_ticker_indices = set(df.set_index(['date', 'ticker']).index)
-        indices_to_keep = all_day_ticker_indices.copy() # Start assuming we keep all
-        skipped_reasons = {} # Dictionary to store reason for skipping: (date, ticker) -> reason_str
+        all_day_ticker_indices = set(df.set_index(["date", "ticker"]).index)
+        indices_to_keep = all_day_ticker_indices.copy()  # Start assuming we keep all
+        skipped_reasons = {}  # Dictionary to store reason for skipping: (date, ticker) -> reason_str
 
         # --- Filter for Complete Days (Optional) ---
         if filter_complete_days:
-            daily_counts = df.groupby(['date', 'ticker']).size()
+            daily_counts = df.groupby(["date", "ticker"]).size()
             incomplete_indices = set(daily_counts[daily_counts != exact_datapoints].index)
             for idx in incomplete_indices:
                 if idx in indices_to_keep:
                     indices_to_keep.remove(idx)
                     skipped_reasons[idx] = f"Incomplete (found {daily_counts.loc[idx]}, expected {exact_datapoints})"
-                    skipped_incomplete_count += 1 # Increment counter
+                    skipped_incomplete_count += 1  # Increment counter
             # Keep debug log for marking, main count logged at end
             if incomplete_indices:
                 logger.debug(f"[{input_gz_path.name}] Marked {len(incomplete_indices)} combos as incomplete.")
@@ -175,12 +183,12 @@ def extract_gz_and_split_by_ticker(
                     # Don't overwrite skip reason if already skipped for completeness
                     if idx not in skipped_reasons:
                         skipped_reasons[idx] = "Non-USD"
-                        skipped_non_usd_count += 1 # Increment counter only if this is the primary reason
+                        skipped_non_usd_count += 1  # Increment counter only if this is the primary reason
                     # If already skipped for another reason, still potentially non-usd, but don't double count primary skip reason
 
             # Keep debug log for marking
             if non_usd_indices:
-                 logger.debug(f"[{input_gz_path.name}] Marked {len(non_usd_indices)} combos as non-USD.")
+                logger.debug(f"[{input_gz_path.name}] Marked {len(non_usd_indices)} combos as non-USD.")
 
         # --- Filter Excluded Tickers (Optional) ---
         if exclude_tickers:
@@ -191,13 +199,13 @@ def extract_gz_and_split_by_ticker(
             for date_idx, ticker_idx in indices_to_keep:
                 if ticker_idx not in valid_cleaned_tickers:
                     excluded_ticker_indices.add((date_idx, ticker_idx))
-            
+
             for idx in excluded_ticker_indices:
-                 if idx in indices_to_keep:
-                     indices_to_keep.remove(idx)
-                     if idx not in skipped_reasons:
-                         skipped_reasons[idx] = "Excluded ticker"
-                         skipped_excluded_ticker_count += 1 # Increment new counter
+                if idx in indices_to_keep:
+                    indices_to_keep.remove(idx)
+                    if idx not in skipped_reasons:
+                        skipped_reasons[idx] = "Excluded ticker"
+                        skipped_excluded_ticker_count += 1  # Increment new counter
 
             if excluded_ticker_indices:
                 logger.debug(f"[{input_gz_path.name}] Marked {len(excluded_ticker_indices)} combos as explicitly excluded.")
@@ -206,18 +214,20 @@ def extract_gz_and_split_by_ticker(
         if filter_anomalies:
             anomalous_indices = set()
             if not all(col in df.columns for col in PRICE_COLS):
-                logger.warning(f"[{input_gz_path.name}] Cannot perform anomaly check: Missing required columns ({PRICE_COLS}). Skipping anomaly filter for this file.")
+                logger.warning(
+                    f"[{input_gz_path.name}] Cannot perform anomaly check: Missing required columns ({PRICE_COLS}). Skipping anomaly filter for this file."
+                )
             else:
                 # Group by the original dataframe BUT only check groups we intend to keep
-                grouped = df[df.set_index(['date', 'ticker']).index.isin(indices_to_keep)].groupby(['date', 'ticker'])
+                grouped = df[df.set_index(["date", "ticker"]).index.isin(indices_to_keep)].groupby(["date", "ticker"])
                 for index, group_df in grouped:
                     is_anomalous_zscore = detect_anomalies(group_df, anomaly_threshold)
                     is_anomalous_ohlc_range = detect_ohlc_range_anomalies(
-                        group_df, 
-                        ohlc_range_anomaly_threshold, 
-                        ohlc_range_anomaly_occurrence_threshold
+                        group_df,
+                        ohlc_range_anomaly_threshold,
+                        ohlc_range_anomaly_occurrence_threshold,
                     )
-                    
+
                     if is_anomalous_zscore or is_anomalous_ohlc_range:
                         anomalous_indices.add(index)
                         # Log which filter caught it for better debugging
@@ -225,22 +235,24 @@ def extract_gz_and_split_by_ticker(
                         if is_anomalous_zscore:
                             reason_parts.append(f"Z-score (std_dev>{anomaly_threshold})")
                         if is_anomalous_ohlc_range:
-                            reason_parts.append(f"OHLC range (range>{ohlc_range_anomaly_threshold*100}% in >{ohlc_range_anomaly_occurrence_threshold} candles)")
+                            reason_parts.append(
+                                f"OHLC range (range>{ohlc_range_anomaly_threshold*100}% in >{ohlc_range_anomaly_occurrence_threshold} candles)"
+                            )
                         skipped_reasons[index] = f"Anomaly ({'; '.join(reason_parts)})"
                         # The skipped_anomalous_count will be incremented later if this is the primary skip reason
 
                 for idx in anomalous_indices:
                     if idx in indices_to_keep:
                         indices_to_keep.remove(idx)
-                        if idx not in skipped_reasons: # Should have been added above with details
+                        if idx not in skipped_reasons:  # Should have been added above with details
                             # This case might not be strictly necessary if skipped_reasons is always populated above
-                            skipped_reasons[idx] = f"Anomaly (mixed criteria)" 
-                        skipped_anomalous_count += 1 # Increment counter only if this is primary reason
+                            skipped_reasons[idx] = "Anomaly (mixed criteria)"
+                        skipped_anomalous_count += 1  # Increment counter only if this is primary reason
                 # Keep debug log for marking
                 if anomalous_indices:
                     logger.debug(f"[{input_gz_path.name}] Marked {len(anomalous_indices)} combos as anomalous.")
 
-        # --- Log individual skipped files (DEBUG Level) --- 
+        # --- Log individual skipped files (DEBUG Level) ---
         skipped_indices = all_day_ticker_indices - indices_to_keep
         if skipped_indices:
             # Remove the INFO level summary logs per GZ file
@@ -254,7 +266,7 @@ def extract_gz_and_split_by_ticker(
             sorted_skips = sorted(list(skipped_indices))
             for idx in sorted_skips:
                 reason = skipped_reasons.get(idx, "Unknown reason")
-                date_str = idx[0].strftime('%Y-%m-%d')
+                date_str = idx[0].strftime("%Y-%m-%d")
                 ticker_str = idx[1]
                 logger.info(f"    - Skipped: {date_str}_{ticker_str}.csv | Reason: {reason}")
 
@@ -263,31 +275,39 @@ def extract_gz_and_split_by_ticker(
             logger.info(f"[{input_gz_path.name}] No day-ticker combinations remaining after all filters.")
             total_filter_skips = len(skipped_indices)
             # Return counts for this file, including new counter
-            return 0, total_filter_skips, skipped_incomplete_count, skipped_non_usd_count, skipped_anomalous_count, save_error_skips, skipped_excluded_ticker_count
+            return (
+                0,
+                total_filter_skips,
+                skipped_incomplete_count,
+                skipped_non_usd_count,
+                skipped_anomalous_count,
+                save_error_skips,
+                skipped_excluded_ticker_count,
+            )
 
         # Filter the dataframe down to only the rows that should be kept
-        df_filtered = df[df.set_index(['date', 'ticker']).index.isin(indices_to_keep)]
+        df_filtered = df[df.set_index(["date", "ticker"]).index.isin(indices_to_keep)]
 
         # --- Group by Ticker and Date, then Save ---
-        for (file_date, ticker_name), ticker_day_df in df_filtered.groupby(['date', 'ticker']):
+        for (file_date, ticker_name), ticker_day_df in df_filtered.groupby(["date", "ticker"]):
             # Groupby might yield empty groups if indices_to_keep logic had issues, add safety check
             if ticker_day_df.empty:
                 continue
 
             try:
                 date_str = file_date.strftime("%Y-%m-%d")
-                safe_ticker = re.sub(r'[\\\\/*?"<>|]', "_", ticker_name) # Clean ticker for filename
+                safe_ticker = re.sub(r'[\\\\/*?"<>|]', "_", ticker_name)  # Clean ticker for filename
                 output_file = output_dir / f"{date_str}_{safe_ticker}.csv"
 
                 # Save the filtered, non-anomalous raw data
-                ticker_day_df.drop(columns=['date']).sort_values("window_start").to_csv(output_file, index=False)
+                ticker_day_df.drop(columns=["date"]).sort_values("window_start").to_csv(output_file, index=False)
                 saved_count += 1
                 # logger.debug(f"[{input_gz_path.name}] Saved extracted file: {output_file.name}")
 
             except Exception as e:
                 # Log remains ERROR, clearly indicates a save failure skip
                 logger.error(f"[{input_gz_path.name}] Skipped (Save Error): Ticker {ticker_name} for date {date_str}. Reason: {e}")
-                save_error_skips += 1 # Use the dedicated counter
+                save_error_skips += 1  # Use the dedicated counter
 
         # Calculate total skips for this file
         total_filter_skips = len(skipped_indices)
@@ -300,7 +320,15 @@ def extract_gz_and_split_by_ticker(
         logger.debug(f"[{input_gz_path.name}] GZ summary - Saved: {saved_count}, Total Skipped: {total_skipped_in_file}")
 
         # Return detailed counts, including new counter
-        return saved_count, total_skipped_in_file, skipped_incomplete_count, skipped_non_usd_count, skipped_anomalous_count, save_error_skips, skipped_excluded_ticker_count
+        return (
+            saved_count,
+            total_skipped_in_file,
+            skipped_incomplete_count,
+            skipped_non_usd_count,
+            skipped_anomalous_count,
+            save_error_skips,
+            skipped_excluded_ticker_count,
+        )
 
     except pd.errors.EmptyDataError:
         logger.warning(f"[{input_gz_path.name}] Skipping: Input GZ file is empty.")
@@ -365,7 +393,7 @@ def run_extraction(
     if clear_output:
         clear_directory(extracted_path)
     else:
-        extracted_path.mkdir(parents=True, exist_ok=True) # Ensure exists
+        extracted_path.mkdir(parents=True, exist_ok=True)  # Ensure exists
 
     # --- File Discovery ---
     files_to_process = []
@@ -376,10 +404,10 @@ def run_extraction(
             logger.info(f"Filtering for files from year: {year_filter}")
             search_path = year_dir
         else:
-            logger.warning(f"Year directory '{year_filter}' not found in {raw_path}, searching base raw directory.") # Changed to warning
+            logger.warning(f"Year directory '{year_filter}' not found in {raw_path}, searching base raw directory.")  # Changed to warning
 
     logger.info(f"Searching for *.csv.gz files in {search_path} and its subdirectories...")
-    files_to_process = sorted(list(search_path.rglob('*.csv.gz'))) # Use rglob for recursive search
+    files_to_process = sorted(list(search_path.rglob("*.csv.gz")))  # Use rglob for recursive search
 
     if not files_to_process:
         # Changed to warning as it might be expected if year filter is specific
@@ -388,11 +416,11 @@ def run_extraction(
 
     logger.info(f"Found {len(files_to_process)} raw files to process.")
 
-    # --- Set up Logging Queue and Listener --- 
+    # --- Set up Logging Queue and Listener ---
     # Use a Manager to create a shared queue
     with Manager() as manager:
         log_queue = manager.Queue(-1)
-        
+
         root_logger = logging.getLogger()
         handlers = root_logger.handlers[:]
         if not handlers:
@@ -410,7 +438,7 @@ def run_extraction(
         total_skipped_non_usd = 0
         total_skipped_anomalous = 0
         total_save_errors = 0
-        total_skipped_excluded = 0 # Initialize new total counter
+        total_skipped_excluded = 0  # Initialize new total counter
         processed_files_count = 0
 
         try:
@@ -418,7 +446,7 @@ def run_extraction(
                 futures = {
                     executor.submit(
                         extract_gz_and_split_by_ticker,
-                        log_queue, # Pass the manager queue
+                        log_queue,  # Pass the manager queue
                         file,
                         extracted_path,
                         filter_usd_only,
@@ -428,7 +456,7 @@ def run_extraction(
                         anomaly_threshold,
                         ohlc_range_anomaly_threshold,
                         ohlc_range_anomaly_occurrence_threshold,
-                        exclude_tickers # Pass the exclude list
+                        exclude_tickers,  # Pass the exclude list
                     ): file
                     for file in files_to_process
                 }
@@ -446,36 +474,36 @@ def run_extraction(
                         total_skipped_non_usd += non_usd
                         total_skipped_anomalous += anomalous
                         total_save_errors += save_err
-                        total_skipped_excluded += excluded_err # Aggregate new count
-                        
+                        total_skipped_excluded += excluded_err  # Aggregate new count
+
                         # Update progress log to include cumulative reason counts
                         if processed_files_count % 100 == 0 or (saved > 0 or skipped > 0):
                             skip_summary = (
                                 f"TOTALS - Saved: {total_saved}, Skipped: {total_skipped} | "
                                 f"Incomplete: {total_skipped_incomplete}, NonUSD: {total_skipped_non_usd}, "
-                                f"Anomaly: {total_skipped_anomalous}, SaveErr: {total_save_errors}, " # Added comma
-                                f"Excluded Ticker: {total_skipped_excluded}" # Added new count
+                                f"Anomaly: {total_skipped_anomalous}, SaveErr: {total_save_errors}, "  # Added comma
+                                f"Excluded Ticker: {total_skipped_excluded}"  # Added new count
                             )
                             logger.info(f"Processed GZ {processed_files_count}/{len(files_to_process)} ({gz_file.name}) -> {skip_summary}")
 
                     except Exception as exc:
-                         logger.error(f"Error getting result for GZ file {gz_file.name}: {exc}", exc_info=True)
+                        logger.error(f"Error getting result for GZ file {gz_file.name}: {exc}", exc_info=True)
 
         finally:
-            # --- Stop the Logging Listener --- 
+            # --- Stop the Logging Listener ---
             # Ensure listener stops even if errors occur in the pool
             listener.stop()
             logger.info("Log listener stopped.")
 
     # Final summary log with cumulative breakdown
-    logger.info(f"Extraction complete.")
+    logger.info("Extraction complete.")
     logger.info(f"  TOTAL Files Saved: {total_saved}")
     logger.info(f"  TOTAL Combinations Skipped: {total_skipped}")
     logger.info(f"    - Reason Incomplete: {total_skipped_incomplete}")
     logger.info(f"    - Reason Non-USD: {total_skipped_non_usd}")
     logger.info(f"    - Reason Anomaly: {total_skipped_anomalous}")
     logger.info(f"    - Reason Save Error: {total_save_errors}")
-    logger.info(f"    - Reason Excluded Ticker: {total_skipped_excluded}") # Added new summary line
+    logger.info(f"    - Reason Excluded Ticker: {total_skipped_excluded}")  # Added new summary line
     logger.info(f"Extracted data saved to: {extracted_path}")
 
 
@@ -486,9 +514,9 @@ if __name__ == "__main__":
         log_file_path=log_file,
         root_level=logging.INFO,
         level_overrides={
-            "ExtractRawData": logging.INFO, 
+            "ExtractRawData": logging.INFO,
         },
-        console_level=logging.INFO # Ensure console shows INFO
+        console_level=logging.INFO,  # Ensure console shows INFO
     )
     # ---------------------
 
@@ -499,25 +527,28 @@ if __name__ == "__main__":
     config = {}
     try:
         if config_path.exists():
-            with open(config_path, 'r') as f:
-                 config = yaml.safe_load(f)
-            if config is None: config = {} # Handle empty config file
+            with open(config_path, "r") as f:
+                config = yaml.safe_load(f)
+            if config is None:
+                config = {}  # Handle empty config file
             logger.info(f"Loaded configuration from {config_path}")
         else:
             logger.error(f"Configuration file {config_path} not found. Create 'config/extract_raw_config.yaml'.")
             # Provide a more complete example including new params
-            logger.info("Example `extract_raw_config.yaml`:\n"
-                        "raw_dir: data/polygon/stocks_raw # Or polygon/crypto_raw etc.\n"
-                        "extracted_dir: data/extracted\n"
-                        "max_workers: 4\n"
-                        "clear_output: true\n"
-                        "filter_usd_only: true\n"
-                        "filter_complete_days: true\n"
-                        "expected_daily_datapoints: 1440 # Example for minute data\n"
-                        "filter_anomalies: true             # Added\n"
-                        "anomaly_std_dev_threshold: 4.0   # Added\n"
-                        "year_filter: null # Optional: e.g., '2023' to process only that year\n"
-                        "exclude_tickers: [] # Optional: List of tickers to exclude, e.g., ['SHIB-USD', 'DOGE-USD']") # Added example
+            logger.info(
+                "Example `extract_raw_config.yaml`:\n"
+                "raw_dir: data/polygon/stocks_raw # Or polygon/crypto_raw etc.\n"
+                "extracted_dir: data/extracted\n"
+                "max_workers: 4\n"
+                "clear_output: true\n"
+                "filter_usd_only: true\n"
+                "filter_complete_days: true\n"
+                "exact_datapoints: 1440 # Example for minute data\n"
+                "filter_anomalies: true             # Added\n"
+                "anomaly_std_dev_threshold: 4.0   # Added\n"
+                "year_filter: null # Optional: e.g., '2023' to process only that year\n"
+                "exclude_tickers: [] # Optional: List of tickers to exclude, e.g., ['SHIB-USD', 'DOGE-USD']"
+            )  # Added example
             sys.exit(1)
     except ImportError:
         logger.error("PyYAML library not found. Install with `pip install pyyaml`.")
@@ -533,21 +564,16 @@ if __name__ == "__main__":
         raw_dir_rel = config["raw_dir"]
         extracted_dir_rel = config["extracted_dir"]
         max_workers = config["max_workers"]
-        clear_output = config.get("clear_output", True) # Default to True
-        filter_usd_only = config.get("filter_usd_only", True) # Default to True
-        filter_complete_days = config.get("filter_complete_days", True) # Default to True
-        # Use a different name in config for clarity vs internal var
-        exact_datapoints = config.get("expected_daily_datapoints", 1440) # Default for minute data
-        # Load anomaly parameters
-        filter_anomalies = config.get("filter_anomalies", True) # Default to True
-        anomaly_threshold = config.get("anomaly_std_dev_threshold", 4.0) # Default threshold
-        # Load optional year filter
-        year_filter = config.get("year_filter", None) # Default to None
-        # Load optional exclude_tickers list
-        exclude_tickers = config.get("exclude_tickers", []) # Default to empty list
-        # Load new parameters
-        ohlc_range_anomaly_threshold = config.get("ohlc_range_anomaly_threshold", 0.1)
-        ohlc_range_anomaly_occurrence_threshold = config.get("ohlc_range_anomaly_occurrence_threshold", 3)
+        clear_output = config["clear_output"]
+        filter_usd_only = config["filter_usd_only"]
+        filter_complete_days = config["filter_complete_days"]
+        exact_datapoints = config["exact_datapoints"]
+        filter_anomalies = config["filter_anomalies"]
+        anomaly_threshold = config["anomaly_std_dev_threshold"]
+        year_filter = config["year_filter"]
+        exclude_tickers = config["exclude_tickers"]
+        ohlc_range_anomaly_threshold = config["ohlc_range_anomaly_threshold"]
+        ohlc_range_anomaly_occurrence_threshold = config["ohlc_range_anomaly_occurrence_threshold"]
 
     except KeyError as e:
         logger.error(f"Missing required configuration parameter in {config_path}: {e}")
@@ -560,9 +586,13 @@ if __name__ == "__main__":
     # -------------------------
 
     logger.info(f"Starting raw data extraction. Raw dir: {raw_dir}, Extracted dir: {extracted_dir}")
-    logger.info(f"Settings: USD Only={filter_usd_only}, Complete Days={filter_complete_days} ({exact_datapoints} points), Filter Anomalies={filter_anomalies} (threshold {anomaly_threshold}), Year={year_filter or 'All'}")
+    logger.info(
+        f"Settings: USD Only={filter_usd_only}, Complete Days={filter_complete_days} ({exact_datapoints} points), Filter Anomalies={filter_anomalies} (threshold {anomaly_threshold}), Year={year_filter or 'All'}"
+    )
     if exclude_tickers:
-        logger.info(f"Excluding {len(exclude_tickers)} tickers: {', '.join(exclude_tickers[:10])}{'...' if len(exclude_tickers) > 10 else ''}") # Log excluded tickers
+        logger.info(
+            f"Excluding {len(exclude_tickers)} tickers: {', '.join(exclude_tickers[:10])}{'...' if len(exclude_tickers) > 10 else ''}"
+        )  # Log excluded tickers
 
     run_extraction(
         raw_dir=str(raw_dir),
@@ -575,9 +605,9 @@ if __name__ == "__main__":
         filter_anomalies=filter_anomalies,
         anomaly_threshold=anomaly_threshold,
         year_filter=year_filter,
-        exclude_tickers=exclude_tickers, # Pass the exclude list
+        exclude_tickers=exclude_tickers,  # Pass the exclude list
         ohlc_range_anomaly_threshold=ohlc_range_anomaly_threshold,
         ohlc_range_anomaly_occurrence_threshold=ohlc_range_anomaly_occurrence_threshold,
     )
 
-    logger.info("Extraction script finished.") 
+    logger.info("Extraction script finished.")

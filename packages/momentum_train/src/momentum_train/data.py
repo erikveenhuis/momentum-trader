@@ -1,7 +1,7 @@
+import random
 from pathlib import Path
 from typing import List
-import logging
-import random
+
 from .utils.logging_config import get_logger
 
 # Get logger instance
@@ -28,14 +28,10 @@ class DataManager:
 
         if processed_path_direct.is_dir():
             self.processed_dir = processed_path_direct
-            logger.info(
-                f"Found processed data directly under base: {self.processed_dir}"
-            )
+            logger.info(f"Found processed data directly under base: {self.processed_dir}")
         elif processed_path_nested.is_dir():
             self.processed_dir = processed_path_nested
-            logger.info(
-                f"Found processed data nested under base/data: {self.processed_dir}"
-            )
+            logger.info(f"Found processed data nested under base/data: {self.processed_dir}")
         else:
             # Raise error if neither is found
             err_msg = (
@@ -53,9 +49,7 @@ class DataManager:
         self.val_dir = self.processed_dir / "validation"
         self.test_dir = self.processed_dir / "test"
 
-        logger.info(
-            f"DataManager initialized with base directory: {self.base_dir.resolve()}"
-        )
+        logger.info(f"DataManager initialized with base directory: {self.base_dir.resolve()}")
         logger.info(f"  Processed data directory: {self.processed_dir.resolve()}")
         logger.info(f"  Train directory: {self.train_dir.resolve()}")
         logger.info(f"  Validation directory: {self.val_dir.resolve()}")
@@ -75,15 +69,9 @@ class DataManager:
         logger.info("Loading file lists from pre-split directories...")
 
         # Check if directories exist
-        assert (
-            self.train_dir.is_dir()
-        ), f"Train directory not found or is not a directory: {self.train_dir}"
-        assert (
-            self.val_dir.is_dir()
-        ), f"Validation directory not found or is not a directory: {self.val_dir}"
-        assert (
-            self.test_dir.is_dir()
-        ), f"Test directory not found or is not a directory: {self.test_dir}"
+        assert self.train_dir.is_dir(), f"Train directory not found or is not a directory: {self.train_dir}"
+        assert self.val_dir.is_dir(), f"Validation directory not found or is not a directory: {self.val_dir}"
+        assert self.test_dir.is_dir(), f"Test directory not found or is not a directory: {self.test_dir}"
 
         try:
             # Load and sort files from each directory by filename (assumes YYYY-MM-DD format)
@@ -92,12 +80,8 @@ class DataManager:
             self.test_files = sorted(list(self.test_dir.glob("*.csv")))
 
             # Assert that files were actually found if the directories exist
-            assert (
-                len(self.train_files) > 0
-            ), f"No training CSV files found in {self.train_dir}"
-            assert (
-                len(self.val_files) > 0
-            ), f"No validation CSV files found in {self.val_dir}"
+            assert len(self.train_files) > 0, f"No training CSV files found in {self.train_dir}"
+            assert len(self.val_files) > 0, f"No validation CSV files found in {self.val_dir}"
             # Test files might be optional, so only warn if missing
             if len(self.test_files) == 0:
                 logger.warning(f"No test CSV files found in {self.test_dir}")
@@ -109,9 +93,7 @@ class DataManager:
             self._data_organized = True  # Mark as organized
 
         except Exception as e:
-            logger.error(
-                f"Error organizing data from subdirectories: {e}", exc_info=True
-            )
+            logger.error(f"Error organizing data from subdirectories: {e}", exc_info=True)
             self.train_files, self.val_files, self.test_files = [], [], []
             self._data_organized = False
             raise  # Re-raise the exception
@@ -145,12 +127,8 @@ class DataManager:
         self._ensure_organized()
         num_files = len(self.train_files)
         logger.debug(f"[DataManager] Choosing random file from {num_files} training files.")
-        assert (
-            num_files > 0
-        ), "Cannot get random file: No training files available."
+        assert num_files > 0, "Cannot get random file: No training files available."
         random_file = random.choice(self.train_files)
         logger.debug(f"[DataManager] Selected file: {random_file.name}")
-        assert (
-            random_file.exists()
-        ), f"Chosen random training file does not exist: {random_file}"
+        assert random_file.exists(), f"Chosen random training file does not exist: {random_file}"
         return random_file

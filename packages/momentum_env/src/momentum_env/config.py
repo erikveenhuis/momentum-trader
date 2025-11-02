@@ -1,27 +1,29 @@
 """Configuration management for the trading environment."""
+
+import os
 from dataclasses import dataclass
 from typing import Literal, Optional
-import os
+
 
 @dataclass
 class TradingEnvConfig:
     """Configuration for the trading environment."""
-    
+
     # Data configuration
     data_path: str
     window_size: int = 60
-    
+
     # Trading parameters
     initial_balance: float = 1000.0
     transaction_fee: float = 0.001  # 0.1% fee
-    
+
     # Reward parameters
     reward_scale: float = 10.0
     invalid_action_penalty: float = -1.0
-    
+
     # Environment parameters
     render_mode: Optional[Literal["human", "terminal"]] = None
-    
+
     def __post_init__(self) -> None:
         """Validate configuration parameters."""
         if not os.path.exists(self.data_path):

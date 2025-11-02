@@ -17,4 +17,4 @@ source =
     */site-packages
 
 [html]
-directory = htmlcov 
+directory = htmlcov

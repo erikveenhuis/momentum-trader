@@ -1,9 +1,7 @@
-from pathlib import Path
 from types import SimpleNamespace
 
-import torch
 import pytest
-
+import torch
 from momentum_train.trainer import RainbowTrainerModule
 
 
@@ -61,4 +59,3 @@ def test_save_checkpoint_persists_expected_keys(tmp_path):
 
     best_files = list(tmp_path.glob("best_checkpoint_*_ep10_score_0.8000.pt"))
     assert best_files, "Best checkpoint file was not created"
-

@@ -1,8 +1,9 @@
-import torch
-import numpy as np
-from collections import deque, namedtuple
 import random
-import logging
+from collections import deque, namedtuple
+
+import numpy as np
+import torch
+
 from .utils.logging_config import get_logger
 
 # Get logger instance
@@ -31,12 +32,8 @@ class SumTree:
 
     def __init__(self, capacity: int):
         self.capacity = capacity
-        self.tree = np.zeros(
-            2 * capacity - 1
-        )  # Stores priorities (internal nodes are sums)
-        self.data_indices = np.zeros(
-            capacity, dtype=int
-        )  # Maps tree leaf index to data index in buffer
+        self.tree = np.zeros(2 * capacity - 1)  # Stores priorities (internal nodes are sums)
+        self.data_indices = np.zeros(capacity, dtype=int)  # Maps tree leaf index to data index in buffer
         self.size = 0  # Current number of items stored
 
     def _propagate(self, idx: int, change: float):
@@ -63,9 +60,7 @@ class SumTree:
 
     def add(self, p: float, data_idx: int):
         """Stores priority p and associated data index."""
-        tree_idx = (
-            self.write + self.capacity - 1
-        )  # Map write pointer to tree leaf index
+        tree_idx = self.write + self.capacity - 1  # Map write pointer to tree leaf index
         self.data_indices[self.write] = data_idx  # Store mapping
         self.update(tree_idx, p)
         self.write += 1
@@ -82,13 +77,9 @@ class SumTree:
 
     def get(self, s: float) -> tuple[int, float, int]:
         """Samples a leaf node based on cumulative priority s."""
-        assert (
-            s >= 0.0 and s <= self.total() + 1e-6
-        ), f"Sample value {s} out of range [0, {self.total()}]"
+        assert s >= 0.0 and s <= self.total() + 1e-6, f"Sample value {s} out of range [0, {self.total()}]"
         idx = self._retrieve(0, s)
-        data_idx_ptr = (
-            idx - self.capacity + 1
-        )  # Map tree leaf index back to data index pointer (0 to capacity-1)
+        data_idx_ptr = idx - self.capacity + 1  # Map tree leaf index back to data index pointer (0 to capacity-1)
         return (idx, self.tree[idx], self.data_indices[data_idx_ptr])
 
     def __len__(self) -> int:
@@ -169,12 +160,8 @@ class PrioritizedReplayBuffer:
         assert max_weight > 1e-9, f"Max IS weight is zero or negative ({max_weight})"
         weights /= max_weight  # Normalize for stability
         weights = np.array(weights, dtype=np.float32)
-        assert weights.shape == (
-            batch_size,
-        ), f"IS weights shape mismatch. Expected ({batch_size},), got {weights.shape}"
-        assert np.all(weights >= 0) and np.all(
-            weights <= 1.0 + 1e-6
-        ), "IS weights are outside [0, 1] range"  # Allow small tolerance
+        assert weights.shape == (batch_size,), f"IS weights shape mismatch. Expected ({batch_size},), got {weights.shape}"
+        assert np.all(weights >= 0) and np.all(weights <= 1.0 + 1e-6), "IS weights are outside [0, 1] range"  # Allow small tolerance
 
         # Unzip samples
         (
@@ -189,31 +176,17 @@ class PrioritizedReplayBuffer:
 
         # --- Start: Add assertions for sampled data types and basic structure ---
         assert len(market_data) == batch_size, "Incorrect number of market_data samples"
-        assert (
-            len(account_state) == batch_size
-        ), "Incorrect number of account_state samples"
+        assert len(account_state) == batch_size, "Incorrect number of account_state samples"
         assert len(actions) == batch_size, "Incorrect number of action samples"
         assert len(rewards) == batch_size, "Incorrect number of reward samples"
-        assert (
-            len(next_market_data) == batch_size
-        ), "Incorrect number of next_market_data samples"
-        assert (
-            len(next_account_state) == batch_size
-        ), "Incorrect number of next_account_state samples"
+        assert len(next_market_data) == batch_size, "Incorrect number of next_market_data samples"
+        assert len(next_account_state) == batch_size, "Incorrect number of next_account_state samples"
         assert len(dones) == batch_size, "Incorrect number of done samples"
         # Check types (assuming they are stored as numpy arrays originally)
-        assert all(
-            isinstance(x, np.ndarray) for x in market_data
-        ), "Market data samples are not all numpy arrays"
-        assert all(
-            isinstance(x, np.ndarray) for x in account_state
-        ), "Account state samples are not all numpy arrays"
-        assert all(
-            isinstance(x, np.ndarray) for x in next_market_data
-        ), "Next market data samples are not all numpy arrays"
-        assert all(
-            isinstance(x, np.ndarray) for x in next_account_state
-        ), "Next account state samples are not all numpy arrays"
+        assert all(isinstance(x, np.ndarray) for x in market_data), "Market data samples are not all numpy arrays"
+        assert all(isinstance(x, np.ndarray) for x in account_state), "Account state samples are not all numpy arrays"
+        assert all(isinstance(x, np.ndarray) for x in next_market_data), "Next market data samples are not all numpy arrays"
+        assert all(isinstance(x, np.ndarray) for x in next_account_state), "Next account state samples are not all numpy arrays"
         # --- End: Add assertions for sampled data types and basic structure ---
 
         return (
@@ -232,19 +205,13 @@ class PrioritizedReplayBuffer:
 
     def update_priorities(self, tree_indices, batch_priorities_tensor):
         """Updates priorities of sampled transitions using a tensor of priorities."""
-        assert isinstance(
-            batch_priorities_tensor, torch.Tensor
-        ), "batch_priorities must be a tensor"
-        assert len(tree_indices) == len(
-            batch_priorities_tensor
-        ), "Indices and priorities length mismatch in update_priorities"
+        assert isinstance(batch_priorities_tensor, torch.Tensor), "batch_priorities must be a tensor"
+        assert len(tree_indices) == len(batch_priorities_tensor), "Indices and priorities length mismatch in update_priorities"
 
         td_errors = batch_priorities_tensor.detach().cpu().numpy()
         # Calculate new priorities: |TD_error|**alpha + epsilon
         new_priorities = (np.abs(td_errors) + self.epsilon) ** self.alpha
-        assert np.all(
-            new_priorities > 0
-        ), f"New priority calculated is non-positive: min={new_priorities.min()}"
+        assert np.all(new_priorities > 0), f"New priority calculated is non-positive: min={new_priorities.min()}"
 
         # Update priorities in the deque
         for tree_idx, priority in zip(tree_indices, new_priorities):
@@ -259,57 +226,67 @@ class PrioritizedReplayBuffer:
     def state_dict(self):
         """Returns the state of the buffer for saving."""
         return {
-            'buffer': list(self.buffer), # Convert deque to list for saving
-            'tree_state': {
-                'tree': self.tree.tree,
-                'data_indices': self.tree.data_indices,
-                'write': self.tree.write,
-                'size': self.tree.size,
+            "buffer": list(self.buffer),  # Convert deque to list for saving
+            "tree_state": {
+                "tree": self.tree.tree,
+                "data_indices": self.tree.data_indices,
+                "write": self.tree.write,
+                "size": self.tree.size,
             },
-            'buffer_write_idx': self.buffer_write_idx,
-            'max_priority': self.max_priority,
-            'alpha': self.alpha,
-            'beta': self.beta,
-            'beta_start': self.beta_start,
-            'beta_frames': self.beta_frames,
-            'epsilon': self.epsilon,
-            'capacity': self.capacity
+            "buffer_write_idx": self.buffer_write_idx,
+            "max_priority": self.max_priority,
+            "alpha": self.alpha,
+            "beta": self.beta,
+            "beta_start": self.beta_start,
+            "beta_frames": self.beta_frames,
+            "epsilon": self.epsilon,
+            "capacity": self.capacity,
         }
 
     def load_state_dict(self, state_dict):
         """Loads the buffer state from a state dictionary."""
         # Basic validation
-        required_keys = ['buffer', 'tree_state', 'buffer_write_idx', 'max_priority',
-                         'alpha', 'beta', 'beta_start', 'beta_frames', 'epsilon', 'capacity']
+        required_keys = [
+            "buffer",
+            "tree_state",
+            "buffer_write_idx",
+            "max_priority",
+            "alpha",
+            "beta",
+            "beta_start",
+            "beta_frames",
+            "epsilon",
+            "capacity",
+        ]
         for key in required_keys:
             if key not in state_dict:
                 raise ValueError(f"Missing key in buffer state_dict: {key}")
-        if state_dict['capacity'] != self.capacity:
+        if state_dict["capacity"] != self.capacity:
             # Maybe allow resizing later, but for now require capacity match
             raise ValueError(f"Capacity mismatch: state_dict has {state_dict['capacity']}, buffer has {self.capacity}")
-        tree_state = state_dict['tree_state']
-        required_tree_keys = ['tree', 'data_indices', 'write', 'size']
+        tree_state = state_dict["tree_state"]
+        required_tree_keys = ["tree", "data_indices", "write", "size"]
         for key in required_tree_keys:
             if key not in tree_state:
                 raise ValueError(f"Missing key in buffer tree_state: {key}")
 
         # Restore buffer deque from list
-        self.buffer = deque(state_dict['buffer'], maxlen=self.capacity)
+        self.buffer = deque(state_dict["buffer"], maxlen=self.capacity)
 
         # Restore SumTree state
-        self.tree.tree = tree_state['tree']
-        self.tree.data_indices = tree_state['data_indices']
-        self.tree.write = tree_state['write']
-        self.tree.size = tree_state['size']
+        self.tree.tree = tree_state["tree"]
+        self.tree.data_indices = tree_state["data_indices"]
+        self.tree.write = tree_state["write"]
+        self.tree.size = tree_state["size"]
 
         # Restore other attributes
-        self.buffer_write_idx = state_dict['buffer_write_idx']
-        self.max_priority = state_dict['max_priority']
-        self.alpha = state_dict['alpha']
-        self.beta = state_dict['beta']
-        self.beta_start = state_dict['beta_start']
-        self.beta_frames = state_dict['beta_frames']
-        self.epsilon = state_dict['epsilon']
+        self.buffer_write_idx = state_dict["buffer_write_idx"]
+        self.max_priority = state_dict["max_priority"]
+        self.alpha = state_dict["alpha"]
+        self.beta = state_dict["beta"]
+        self.beta_start = state_dict["beta_start"]
+        self.beta_frames = state_dict["beta_frames"]
+        self.epsilon = state_dict["epsilon"]
         # self.capacity is checked above
 
         # Sanity check after loading

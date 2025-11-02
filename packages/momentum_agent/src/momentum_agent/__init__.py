@@ -3,7 +3,7 @@
 __version__ = "0.1.6"
 
 from .agent import RainbowDQNAgent
-from .model import RainbowNetwork
 from .buffer import PrioritizedReplayBuffer
+from .model import RainbowNetwork
 
 __all__ = ["RainbowDQNAgent", "RainbowNetwork", "PrioritizedReplayBuffer"]

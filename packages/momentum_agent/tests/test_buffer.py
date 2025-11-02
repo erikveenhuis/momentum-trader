@@ -1,15 +1,15 @@
-import pytest
 import numpy as np
-import sys
+import pytest
 import torch
+
+# Direct import from src package
+from momentum_agent.buffer import Experience, PrioritizedReplayBuffer, SumTree
 
 # Remove sys.path manipulation
 # src_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../src'))
 # if src_path not in sys.path:
 #     sys.path.insert(0, src_path)
 
-# Direct import from src package
-from momentum_agent.buffer import PrioritizedReplayBuffer, Experience, SumTree
 
 # --- Constants for Dummy Data --- #
 BUFFER_CAPACITY = 100
@@ -29,9 +29,7 @@ def create_dummy_experience(i=0):
         account_state=np.random.rand(ACCOUNT_STATE_DIM).astype(np.float32) + i,
         action=np.random.randint(0, 5),
         reward=np.random.rand() * 10 - 5,
-        next_market_data=np.random.rand(WINDOW_SIZE, N_FEATURES).astype(np.float32)
-        + i
-        + 1,
+        next_market_data=np.random.rand(WINDOW_SIZE, N_FEATURES).astype(np.float32) + i + 1,
         next_account_state=np.random.rand(ACCOUNT_STATE_DIM).astype(np.float32) + i + 1,
         done=bool(np.random.rand() > 0.95),
     )
@@ -110,10 +108,8 @@ def test_buffer_store_exceed_capacity(per_buffer):
         per_buffer.store(*exp)
     assert len(per_buffer) == BUFFER_CAPACITY
     assert len(per_buffer.buffer) == BUFFER_CAPACITY
-    # Check if the oldest items were overwritten (by checking a field like action)
+    # Check if the oldest items were overwritten
     # The items remaining should be from i=20 to i=BUFFER_CAPACITY+19
-    first_remaining_exp_action = create_dummy_experience(20).action
-    last_remaining_exp_action = create_dummy_experience(BUFFER_CAPACITY + 19).action
     # This check is tricky because deque overwrites, let's check buffer_write_idx
     assert per_buffer.buffer_write_idx == 20
 
@@ -155,9 +151,7 @@ def test_buffer_sample_sufficient(per_buffer):
     # Check batch structure and types
     assert isinstance(batch, tuple)
     assert len(batch) == 7  # Number of fields in Experience
-    market_data, account_state, actions, rewards, next_market, next_account, dones = (
-        batch
-    )
+    market_data, account_state, actions, rewards, next_market, next_account, dones = batch
     assert isinstance(market_data, np.ndarray)
     assert isinstance(account_state, np.ndarray)
     assert isinstance(actions, np.ndarray)

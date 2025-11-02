@@ -176,6 +176,15 @@ Set `mode: eval` in config and specify `eval_model_prefix`.
 - WandB logging support
 - Validation on separate data splits
 
+### Visualization
+- Enable real-time charts by setting `environment.render_mode` to `human` (or `terminal`) in `config/training_config.yaml`.
+- Turn on rendering for specific loops with the new trainer flags:
+  - `render_training`
+  - `render_validation`
+  - `render_evaluation`
+- Control how often frames update using the corresponding `*_every_n_steps` options and optionally draw the first frame after each `env.reset()` with `render_on_reset`.
+- For a quick demo, run the random agent script: `python -m momentum_env.random_agent --skip-env-check`.
+
 ## 🧪 Running Tests
 
 ```bash

@@ -58,5 +58,3 @@ ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**.py" = ["F841", "E501"]
-
-

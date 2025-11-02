@@ -7,17 +7,18 @@ from pathlib import Path
 LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(exist_ok=True)
 
+
 def setup_logging(
     log_file_path: Path | None = None,
     root_level: int = logging.INFO,
     level_overrides: dict[str, int] | None = None,
     max_bytes: int = 1 * 1024 * 1024,  # 1MB
     backup_count: int = 10,
-    console_level: int = logging.INFO
+    console_level: int = logging.INFO,
 ) -> None:
     """
     Setup global logging configuration that can be used across all Python files.
-    
+
     Args:
         log_file_path: Path to the log file. If None, only console logging is used.
         root_level: Root logger level (default: INFO)
@@ -35,9 +36,7 @@ def setup_logging(
         handler.close()
 
     # Define formatter
-    formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
     # Create Console Handler
     console_handler = logging.StreamHandler(sys.stdout)
@@ -49,17 +48,13 @@ def setup_logging(
     if log_file_path:
         # Ensure log directory exists
         log_file_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         # Create Rotating File Handler
-        file_handler = logging.handlers.RotatingFileHandler(
-            log_file_path,
-            maxBytes=max_bytes,
-            backupCount=backup_count
-        )
+        file_handler = logging.handlers.RotatingFileHandler(log_file_path, maxBytes=max_bytes, backupCount=backup_count)
         file_handler.setFormatter(formatter)
         file_handler.setLevel(root_level)
         root_logger.addHandler(file_handler)
-        
+
         logging.info(f"Logging to file: {log_file_path} (max: {max_bytes//(1024*1024)}MB, backups: {backup_count})")
 
     # Apply specific level overrides
@@ -69,15 +64,16 @@ def setup_logging(
             specific_logger.setLevel(level)
             logging.info(f"Setting logger '{name}' level to {logging.getLevelName(level)}")
 
+
 def get_logger(name: str) -> logging.Logger:
     """
     Get a logger instance with the given name.
     This should be used in all Python files to get their logger.
-    
+
     Args:
         name: Name of the logger (usually __name__)
-        
+
     Returns:
         logging.Logger: Configured logger instance
     """
-    return logging.getLogger(name) 
+    return logging.getLogger(name)

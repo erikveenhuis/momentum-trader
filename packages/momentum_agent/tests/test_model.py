@@ -2,8 +2,9 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import os
-import sys
+
+# Use absolute imports from src
+from momentum_agent.model import NoisyLinear, PositionalEncoding, RainbowNetwork
 
 # Remove sys.path manipulation
 # src_path = os.path.abspath(
@@ -12,11 +13,10 @@ import sys
 # if src_path not in sys.path:
 #     sys.path.insert(0, src_path)
 
-# Use absolute imports from src
-from momentum_agent.model import NoisyLinear, PositionalEncoding, RainbowNetwork
 
 # TODO: Add tests for src/model.py
 # Consider merging/reviewing with tests/test_networks.py
+
 
 @pytest.mark.unittest
 def test_placeholder_model():
@@ -62,6 +62,7 @@ def device():
 
 # --- Test NoisyLinear --- #
 
+
 @pytest.mark.unittest
 def test_noisy_linear_init():
     layer = NoisyLinear(in_features=10, out_features=5)
@@ -95,7 +96,7 @@ def test_noisy_linear_forward_train(device):
     output = layer(dummy_input)
 
     assert output.shape == (batch_size, out_features)
-    assert output.device == device
+    assert output.device.type == device.type
 
     # Check that noise was used (output != mu-only output)
     with torch.no_grad():
@@ -125,7 +126,7 @@ def test_noisy_linear_forward_eval(device):
     output = layer(dummy_input)
 
     assert output.shape == (batch_size, out_features)
-    assert output.device == device
+    assert output.device.type == device.type
 
     # Check that noise was NOT used (output == mu-only output)
     with torch.no_grad():
@@ -156,6 +157,7 @@ def test_noisy_linear_reset_noise(device):
 
 # --- Test PositionalEncoding --- #
 
+
 @pytest.mark.unittest
 def test_positional_encoding_init():
     d_model = 64
@@ -176,14 +178,12 @@ def test_positional_encoding_forward(device):
     output = pe(dummy_input)
 
     assert output.shape == (batch_size, seq_len, d_model)
-    assert output.device == device
+    assert output.device.type == device.type
     # Check that output is different from input (encoding was added)
     assert not torch.allclose(output, dummy_input)
 
     # Check with dropout disabled
-    pe_no_dropout = PositionalEncoding(d_model=d_model, dropout=0.0, max_len=50).to(
-        device
-    )
+    pe_no_dropout = PositionalEncoding(d_model=d_model, dropout=0.0, max_len=50).to(device)
     output_no_dropout = pe_no_dropout(dummy_input)
     # Calculate expected output without dropout
     expected_output = dummy_input.permute(1, 0, 2) + pe_no_dropout.pe[:seq_len]
@@ -192,6 +192,7 @@ def test_positional_encoding_forward(device):
 
 
 # --- Test RainbowNetwork --- #
+
 
 @pytest.fixture(scope="module")
 def network(default_config, device):
@@ -207,19 +208,15 @@ def network(default_config, device):
 @pytest.mark.unittest
 def test_rainbow_network_init(network, default_config, device):
     assert network is not None
-    assert network.device == device
+    assert network.device.type == device.type
     assert network.window_size == default_config["window_size"]
     assert network.n_features == default_config["n_features"]
     assert network.hidden_dim == default_config["hidden_dim"]
     assert network.num_actions == default_config["num_actions"]
     assert network.num_atoms == default_config["num_atoms"]
     assert network.support.shape == (default_config["num_atoms"],)
-    assert torch.isclose(
-        network.support[0], torch.tensor(float(default_config["v_min"]))
-    )
-    assert torch.isclose(
-        network.support[-1], torch.tensor(float(default_config["v_max"]))
-    )
+    assert torch.isclose(network.support[0], torch.tensor(float(default_config["v_min"])))
+    assert torch.isclose(network.support[-1], torch.tensor(float(default_config["v_max"])))
 
     # Check submodules exist
     assert hasattr(network, "feature_embedding")
@@ -251,7 +248,7 @@ def test_rainbow_network_forward_pass(network, default_config, device):
     log_probs = network(market_data, account_state)
 
     assert log_probs.shape == (batch_size, num_actions, num_atoms)
-    assert log_probs.device == device
+    assert log_probs.device.type == device.type
     assert not torch.isnan(log_probs).any()
     assert not torch.isinf(log_probs).any()
 
@@ -277,7 +274,7 @@ def test_rainbow_network_get_q_values(network, default_config, device):
     q_values = network.get_q_values(market_data, account_state)
 
     assert q_values.shape == (batch_size, num_actions)
-    assert q_values.device == device
+    assert q_values.device.type == device.type
     assert not torch.isnan(q_values).any()
     assert not torch.isinf(q_values).any()
 
@@ -318,28 +315,18 @@ def test_rainbow_network_train_eval_modes(network, default_config, device):
     # Eval mode (default from fixture)
     network.eval()
     assert not network.training
-    assert not any(
-        m.training
-        for m in network.modules()
-        if isinstance(m, (nn.Dropout, NoisyLinear))
-    )
+    assert not any(m.training for m in network.modules() if isinstance(m, (nn.Dropout, NoisyLinear)))
     q_values_eval = network.get_q_values(market_data, account_state)
 
     # Train mode
     network.train()
     assert network.training
-    assert any(
-        m.training
-        for m in network.modules()
-        if isinstance(m, (nn.Dropout, NoisyLinear))
-    )
+    assert any(m.training for m in network.modules() if isinstance(m, (nn.Dropout, NoisyLinear)))
     # In train mode, NoisyLinear uses noise, so Q values should differ (unless noise is zero)
     q_values_train = network.get_q_values(market_data, account_state)
 
     # Check that Q-values differ between train and eval modes due to NoisyNet
-    assert not torch.allclose(
-        q_values_eval, q_values_train
-    ), "Q-values should differ between train and eval modes"
+    assert not torch.allclose(q_values_eval, q_values_train), "Q-values should differ between train and eval modes"
 
     network.eval()  # Reset to eval mode
 

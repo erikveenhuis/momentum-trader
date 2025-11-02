@@ -1,9 +1,7 @@
 from types import SimpleNamespace
-from pathlib import Path
-
-import pytest
 
 import momentum_train.run_training as run_training_module
+import pytest
 from momentum_train.data import DataManager
 
 
@@ -104,7 +102,7 @@ def test_run_training_resume_uses_trainer_steps(monkeypatch, tmp_path):
     train_dir.mkdir(parents=True)
     val_dir.mkdir(parents=True)
     test_dir.mkdir(parents=True)
-    
+
     # Move sample file to train directory
     train_file = train_dir / "sample.csv"
     train_file.write_text("ticker,price\n")

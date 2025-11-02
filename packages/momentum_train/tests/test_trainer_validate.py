@@ -3,7 +3,6 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-
 from momentum_train.trainer import RainbowTrainerModule
 
 
@@ -79,9 +78,7 @@ def test_validate_aggregates_metrics_and_writes_results(tmp_path, monkeypatch):
 
     trainer._check_early_stopping = record_early_stopping
 
-    should_stop, validation_score, avg_metrics = trainer.validate(
-        [Path("file1.csv"), Path("file2.csv")]
-    )
+    should_stop, validation_score, avg_metrics = trainer.validate([Path("file1.csv"), Path("file2.csv")])
 
     assert not should_stop
     assert validation_score == pytest.approx(np.mean(episode_scores))
@@ -104,7 +101,7 @@ def test_handle_validation_and_checkpointing_triggers_best_checkpoint(tmp_path):
 
     save_calls = []
 
-    def capture_save(episode, total_steps, is_best, validation_score):
+    def capture_save(self, episode, total_steps, is_best, validation_score=None):
         save_calls.append(
             {
                 "episode": episode,
@@ -117,6 +114,8 @@ def test_handle_validation_and_checkpointing_triggers_best_checkpoint(tmp_path):
     trainer._save_checkpoint = capture_save.__get__(trainer, RainbowTrainerModule)
 
     def fake_validate(self, val_files):
+        # Update best_validation_metric to simulate the real validate() behavior
+        trainer.best_validation_metric = 0.5
         return False, 0.5, {"avg_reward": 1.0}
 
     def record_early_stopping(score):
