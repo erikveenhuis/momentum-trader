@@ -3,23 +3,22 @@ import os
 from collections import deque  # Keep deque for performance_tracker
 from datetime import datetime  # Added datetime back
 from pathlib import Path
-from typing import List, Set, Tuple  # Added Set for render tracking
+from typing import Dict, List, Set, Tuple  # Added Dict for cached envs
 
 import numpy as np
 import torch
+from momentum_agent import RainbowDQNAgent  # Updated import path
+from momentum_agent.constants import ACCOUNT_STATE_DIM  # Import constant
+from momentum_core.logging import get_logger
 from momentum_env import TradingEnv, TradingEnvConfig  # Use installed package
 from torch.cuda.amp import GradScaler
 from torch.utils.tensorboard import SummaryWriter
-
-from momentum_agent import RainbowDQNAgent  # Updated import path
-from momentum_agent.constants import ACCOUNT_STATE_DIM  # Import constant
 
 from .data import DataManager  # Use relative import
 from .metrics import (  # Use relative import
     PerformanceTracker,
     calculate_episode_score,
 )
-from .utils.logging_config import get_logger
 
 # Get logger instance
 logger = get_logger("Trainer")
@@ -78,6 +77,7 @@ class RainbowTrainerModule:
         # Extract run parameters
         self.model_dir = self.run_config.get("model_dir", "models")
         os.makedirs(self.model_dir, exist_ok=True)
+        self._validation_env_cache: Dict[str, TradingEnv] = {}
 
     def should_stop_early(self, validation_metrics: List[dict]) -> bool:
         """Check if training should stop early based on validation performance."""
@@ -345,7 +345,13 @@ class RainbowTrainerModule:
 
         # Step environment
         try:
-            next_obs, reward, done, _, info = env.step(action)
+            next_obs, reward, terminated, truncated, info = env.step(action)
+            terminated_flag = bool(terminated)
+            truncated_flag = bool(truncated)
+            done = terminated_flag or truncated_flag
+            if isinstance(info, dict):
+                info.setdefault("terminated", terminated_flag)
+                info.setdefault("truncated", truncated_flag)
             # Basic validation of step outputs
             if not isinstance(next_obs, dict):
                 logger.error(f"next_obs is not a dict: {type(next_obs)}")
@@ -363,14 +369,25 @@ class RainbowTrainerModule:
             assert isinstance(done, (bool, np.bool_))
             assert isinstance(info, dict)
         except Exception as e:
-            logger.error(
-                f"Error during env.step at step {steps_in_episode} in episode {episode}: {e}",
-                exc_info=True,
-            )
-            done = True
-            reward = -10.0
-            next_obs = obs
-            info = self._get_fallback_info(obs, info if "info" in locals() else {})
+            if isinstance(e, RuntimeError) and "Episode is done, call reset() first" in str(e):
+                logger.debug("Environment reported completion before step; treating as natural episode termination")
+                done = True
+                reward = 0.0
+                next_obs = obs
+                info = self._get_fallback_info(obs, info if "info" in locals() else {})
+                info.setdefault("terminated", info.get("terminated", False))
+                info.setdefault("truncated", True)
+                info.setdefault("invalid_action", False)
+                info["episode_already_done"] = True
+            else:
+                logger.error(
+                    f"Error during env.step at step {steps_in_episode} in episode {episode}: {e}",
+                    exc_info=True,
+                )
+                done = True
+                reward = -10.0
+                next_obs = obs
+                info = self._get_fallback_info(obs, info if "info" in locals() else {})
 
         # Store transition
         self.agent.store_transition(obs, action, reward, next_obs, done)
@@ -661,6 +678,8 @@ class RainbowTrainerModule:
             # Log best training reward if available (not currently tracked across episodes)
             # logger.info(f"Best average reward during training: {best_train_reward:.2f}")
 
+        self.close_cached_environments()
+
     # --- END Refactored Helper Methods ---
 
     # --- Added Evaluation Step Helper ---
@@ -668,7 +687,8 @@ class RainbowTrainerModule:
         """Performs a single step of evaluation in the environment. Returns (next_obs, reward, done, info, action, error_occurred)."""
         try:
             action = self.agent.select_action(obs)
-            next_obs, reward, done, _, info = env.step(action)
+            next_obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
 
             # --- ADDED: Check for non-numeric reward --- #
             error_occurred = False  # Initialize error flag for this check
@@ -709,7 +729,9 @@ class RainbowTrainerModule:
 
     # --- End Evaluation Step Helper ---
 
-    def _run_single_evaluation_episode(self, env: TradingEnv, context: str = "validation") -> Tuple[float, dict, dict]:
+    def _run_single_evaluation_episode(
+        self, env: TradingEnv, context: str = "validation", *, close_env: bool = True
+    ) -> Tuple[float, dict, dict]:
         """Evaluate the agent for one episode on a given environment instance."""
         # Removed assert isinstance(env, TradingEnv) because it fails when TradingEnv is patched in tests
         # assert isinstance(
@@ -803,11 +825,12 @@ class RainbowTrainerModule:
                 final_info,
             )  # Return initialized final_info or an empty dict if preferred
         finally:
-            # Ensure env is closed even if errors occurred
-            try:
-                env.close()
-            except Exception as close_e:
-                logger.error(f"Error closing validation environment: {close_e}")
+            # Ensure env is closed even if errors occurred when requested
+            if close_env:
+                try:
+                    env.close()
+                except Exception as close_e:
+                    logger.error(f"Error closing validation environment: {close_e}")
             # Restore agent training mode
             self.agent.set_training_mode(was_training)
 
@@ -818,39 +841,49 @@ class RainbowTrainerModule:
     def _validate_single_file(self, val_file: Path) -> dict | None:
         """Runs validation on a single file and returns collected metrics/results."""
         logger.info(f"--- VALIDATING ON FILE: {val_file.name} ---")
-        try:
-            # Update env_config with the validation file path
-            self.env_config["data_path"] = str(val_file)
+        env_key = str(val_file)
+        env = self._validation_env_cache.get(env_key)
+        created_env = False
 
-            # Create a TradingEnvConfig object
-            env_config_obj = TradingEnvConfig(**self.env_config)
+        if env is None:
+            try:
+                # Update env_config with the validation file path
+                self.env_config["data_path"] = env_key
 
-            env = TradingEnv(config=env_config_obj)
-        except Exception as env_e:
-            logger.error(f"Error creating environment for {val_file.name}: {env_e}", exc_info=True)
-            return None  # Indicate failure for this file
+                # Create a TradingEnvConfig object
+                env_config_obj = TradingEnvConfig(**self.env_config)
+
+                env = TradingEnv(config=env_config_obj)
+                self._validation_env_cache[env_key] = env
+                created_env = True
+            except Exception as env_e:
+                logger.error(f"Error creating environment for {val_file.name}: {env_e}", exc_info=True)
+                return None  # Indicate failure for this file
 
         try:
             logger.debug(f"Calling _run_single_evaluation_episode for {val_file.name}")
-            reward, file_metrics, final_info = self._run_single_evaluation_episode(env, context="validation")
+            reward, file_metrics, final_info = self._run_single_evaluation_episode(
+                env,
+                context="validation",
+                close_env=False,
+            )
         except Exception as run_e:
             logger.error(
                 f"Error during _run_single_evaluation_episode for {val_file.name}: {run_e}",
                 exc_info=True,
             )
-            # Ensure env is closed if run fails mid-way
+            # Ensure env is closed if run fails mid-way and remove from cache
             try:
-                env.close()
-            except Exception as close_e:
-                logger.error(f"Error closing env after run failure for {val_file.name}: {close_e}")
-            return None  # Indicate failure, cannot calculate score
-        finally:
-            # Ensure env is always closed if run completed (or failed after successful env creation)
-            try:
-                if "env" in locals() and env is not None:  # Check if env was successfully created
+                if env is not None:
                     env.close()
             except Exception as close_e:
-                logger.error(f"Error closing env after run for {val_file.name}: {close_e}")
+                logger.error(f"Error closing env after run failure for {val_file.name}: {close_e}")
+            finally:
+                self._validation_env_cache.pop(env_key, None)
+            return None  # Indicate failure, cannot calculate score
+
+        if created_env:
+            logger.debug(f"Cached validation environment for {val_file.name}")
 
         # --- Enhanced per-file logging (BEFORE score calculation) ---
         # Check if metrics are valid before logging
@@ -924,6 +957,15 @@ class RainbowTrainerModule:
             "detailed_result": detailed_result,  # For saving to JSON
             "episode_score": episode_score,  # Return 0.0 if calculation failed
         }
+
+    def close_cached_environments(self) -> None:
+        """Close any cached validation/test environments."""
+        for env_key, env in list(self._validation_env_cache.items()):
+            try:
+                env.close()
+            except Exception as exc:  # pragma: no cover - best effort cleanup
+                logger.warning(f"Failed to close cached environment {env_key}: {exc}")
+        self._validation_env_cache.clear()
 
     def _calculate_average_validation_metrics(self, all_file_metrics: List[dict]) -> dict:
         """Calculates average metrics across all validation files."""
@@ -1077,6 +1119,9 @@ class RainbowTrainerModule:
             "position": last_info.get("position", 0.0),
             "portfolio_value": fallback_portfolio_value,  # Ensure valid value
             "step_transaction_cost": last_info.get("step_transaction_cost", 0.0),
+            "invalid_action": last_info.get("invalid_action", False),
+            "terminated": last_info.get("terminated", False),
+            "truncated": last_info.get("truncated", False),
             "error": "Environment step failed",
         }
 

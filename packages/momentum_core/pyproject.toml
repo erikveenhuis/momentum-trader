@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "momentum-core"
+version = "0.1.0"
+description = "Core utilities for momentum trader"
+authors = [
+    {name = "Momentum Trader Team"}
+]
+dependencies = []
+requires-python = ">=3.8"
+readme = "README.md"
+
+[project.optional-dependencies]
+dev = ["pytest", "black", "isort", "flake8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 100
+target-version = ["py38"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.flake8]
+max-line-length = 100
+extend-ignore = ["E203", "W503"]

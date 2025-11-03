@@ -5,10 +5,10 @@ window_size: 60
 agent:
   # Core RL params
   gamma: 0.99
-  lr: 0.001 # Learning rate
-  batch_size: 256
+  lr: 0.0003 # Learning rate (reduced for stability with transformer backbone)
+  batch_size: 1024
   replay_buffer_size: 500000
-  target_update_freq: 2500 # Steps to update target network
+  target_update_freq: 600 # Learner steps per target sync (~1-2 trading days)
 
   # Network architecture
   window_size: 60 # Window size for the agent same as the environment
@@ -25,11 +25,11 @@ agent:
   # Rainbow specific params
   n_steps: 3          # Multi-step returns
   num_atoms: 51       # Distributional RL atoms
-  v_min: -1.0        # Distributional RL support min value (Adjusted for new reward scale)
-  v_max: 1.0         # Distributional RL support max value (Adjusted for new reward scale)
+  v_min: -10.0       # Distributional RL support min value (wider to cover scaled rewards)
+  v_max: 10.0        # Distributional RL support max value (wider to cover scaled rewards)
   alpha: 0.6          # PER priority exponent
-  beta_start: 0.5     # PER importance sampling exponent (initial)
-  beta_frames: 1000000 # PER beta annealing frames (steps)
+  beta_start: 0.3     # PER importance sampling exponent (initial)
+  beta_frames: 400000 # PER beta annealing frames (steps)
 
   # Learning rate scheduler params
   lr_scheduler_enabled: true # Enable/disable LR scheduler
@@ -49,13 +49,13 @@ environment:
   window_size: 60 # Window size for the environment same as the agent
   initial_balance: 1000.0
   transaction_fee: 0.001 # Percentage fee
-  reward_scale: 200.0 # Scale factor for PnL component of reward (if used)
+  reward_scale: 50.0  # Scale factor for PnL component of reward
   invalid_action_penalty: -0.05 # Penalty for invalid actions
-  render_mode: 'human' # Set to 'human' or 'terminal' to enable visualization
+  render_mode:  # Set to 'human' or 'terminal' to enable visualization
 
 trainer:
   seed: 42
-  warmup_steps: 150000     # Steps with random actions before training
+  warmup_steps: 50000     # Steps with random actions before training
   update_freq: 4          # Agent learning update frequency (steps)
   log_freq: 60            # Logging frequency (steps)
   validation_freq: 100     # Validation frequency (episodes)

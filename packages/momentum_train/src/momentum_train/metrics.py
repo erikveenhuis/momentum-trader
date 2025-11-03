@@ -1,8 +1,7 @@
 from typing import Dict, List
 
 import numpy as np
-
-from .utils.logging_config import get_logger
+from momentum_core.logging import get_logger
 
 # Get logger instance
 logger = get_logger("Metrics")
@@ -97,9 +96,17 @@ def calculate_episode_score(metrics: Dict[str, float]) -> float:
     k_sharpe = 10.0  # Scaling factor for Sharpe Ratio
     k_return = 30.0  # Scaling factor for Total Return
 
+    # Clip values to prevent overflow in exp() function
+    # For numerical stability, limit the argument to exp() to reasonable bounds
+    # exp(-700) ≈ 0 (underflow), exp(700) ≈ inf (overflow)
+    max_exp_arg = 700.0
+
+    sharpe_arg = np.clip(-k_sharpe * sharpe, -max_exp_arg, max_exp_arg)
+    return_arg = np.clip(-k_return * total_return_pct, -max_exp_arg, max_exp_arg)
+
     # Maps values to (0, 1). 0 -> 0.5, positive -> >0.5, negative -> <0.5
-    normalized_sharpe = 1.0 / (1.0 + np.exp(-k_sharpe * sharpe))
-    normalized_total_return = 1.0 / (1.0 + np.exp(-k_return * total_return_pct))
+    normalized_sharpe = 1.0 / (1.0 + np.exp(sharpe_arg))
+    normalized_total_return = 1.0 / (1.0 + np.exp(return_arg))
     # (1 - max_drawdown) is already effectively normalized in [0, 1]
     normalized_drawdown_complement = 1.0 - max_drawdown
 

@@ -21,6 +21,9 @@ class StubTrainer:
         self.collected_metrics = metrics
         return self._expected_metrics_call
 
+    def close_cached_environments(self):
+        pass
+
 
 @pytest.mark.unittest
 def test_evaluate_on_test_data_writes_results(tmp_path):

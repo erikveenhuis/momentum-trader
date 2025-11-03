@@ -1,9 +1,40 @@
 import argparse
+import logging
 import os
+from typing import Optional
 
-# import matplotlib.pyplot as plt # No longer directly used for plotting
 import mplfinance as mpf  # For financial plotting
 import pandas as pd
+
+try:
+    from momentum_core.logging import get_logger, setup_package_logging
+except ImportError:  # pragma: no cover - fallback when runtime package missing
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=[logging.StreamHandler()],
+    )
+    logging.warning("Could not find momentum_core.logging, using basic config.")
+    get_logger = logging.getLogger
+
+logger = get_logger("scripts.plot_csv")
+
+
+def configure_logging(log_level: Optional[str] = None) -> None:
+    """Configure logging for the plot_csv utility."""
+
+    if "setup_package_logging" not in globals():
+        return
+
+    setup_package_logging(
+        "scripts.plot_csv",
+        log_filename="plot_csv.log",
+        root_level=log_level if log_level is not None else logging.INFO,
+        console_level=log_level if log_level is not None else logging.INFO,
+        level_overrides={
+            "scripts.plot_csv": logging.INFO,
+        },
+    )
 
 
 def find_file_in_dir(filename_to_find, search_dir):
@@ -26,13 +57,13 @@ def visualize_csv(csv_filename):
     full_file_path = find_file_in_dir(csv_filename, search_path)
 
     if full_file_path is None:
-        print(f"Error: File '{csv_filename}' not found within '{search_path}' or its subdirectories.")
+        logger.error("File '%s' not found within '%s' or its subdirectories.", csv_filename, search_path)
         return
 
     try:
         # Load the CSV file
         df = pd.read_csv(full_file_path)
-        print(f"Successfully loaded: {full_file_path}")
+        logger.info("Successfully loaded CSV: %s", full_file_path)
 
         file_name_for_title = csv_filename.replace(".csv", "")
 
@@ -40,8 +71,10 @@ def visualize_csv(csv_filename):
         required_ohlc_cols = ["open", "high", "low", "close"]
         if not all(col in df.columns for col in required_ohlc_cols):
             missing_cols = [col for col in required_ohlc_cols if col not in df.columns]
-            print(
-                f"Error: Missing one or more required OHLC columns ({', '.join(missing_cols)}) in {full_file_path}. Cannot plot candlestick chart."
+            logger.error(
+                "Missing one or more required OHLC columns (%s) in %s. Cannot plot candlestick chart.",
+                ", ".join(missing_cols),
+                full_file_path,
             )
             return
 
@@ -51,12 +84,13 @@ def visualize_csv(csv_filename):
                 df["window_start"] = pd.to_datetime(df["window_start"])
                 df.set_index("window_start", inplace=True)
             except Exception as e:
-                print(
-                    f"Warning: Could not convert 'window_start' to DatetimeIndex or set it as index: {e}. Plotting may not work as expected."
+                logger.warning(
+                    "Could not convert 'window_start' to DatetimeIndex or set it as index: %s. Plotting may not work as expected.",
+                    e,
                 )
         elif not isinstance(df.index, pd.DatetimeIndex):
-            print(
-                "Warning: DataFrame index is not a DatetimeIndex and 'window_start' column is not available or couldn't be converted. Time axis may not be displayed correctly."
+            logger.warning(
+                "DataFrame index is not a DatetimeIndex and 'window_start' column is not available or couldn't be converted. Time axis may not be displayed correctly."
             )
 
         # --- Plotting with mplfinance ---
@@ -73,16 +107,16 @@ def visualize_csv(csv_filename):
             plot_kwargs["volume"] = True
             plot_kwargs["ylabel_lower"] = "Volume"
         else:
-            print(f"Warning: 'volume' column not found in {full_file_path}. Plotting without volume.")
+            logger.warning("'volume' column not found in %s. Plotting without volume.", full_file_path)
 
         mpf.plot(df, **plot_kwargs)
 
     except FileNotFoundError:  # Should be caught by the check above, but good for robustness
-        print(f"Error: File not found at {full_file_path}")
+        logger.error("File not found at %s", full_file_path)
     except pd.errors.EmptyDataError:
-        print(f"Error: The file {full_file_path} is empty.")
+        logger.error("The file %s is empty.", full_file_path)
     except Exception as e:
-        print(f"An error occurred while processing {full_file_path}: {e}")
+        logger.exception("An error occurred while processing %s: %s", full_file_path, e)
 
 
 if __name__ == "__main__":
@@ -94,6 +128,13 @@ if __name__ == "__main__":
         type=str,
         help="Filename of the CSV (e.g., '2021-05-31_ETC-USD.csv'). The script will search for it in 'data/processed/' and its subdirectories.",
     )
+    parser.add_argument(
+        "--log-level",
+        default=None,
+        help="Logging level (e.g. DEBUG, INFO, WARNING). Overrides MOMENTUM_LOG_LEVEL* environment variables.",
+    )
 
     args = parser.parse_args()
+    configure_logging(args.log_level)
+    logger.info("Starting visualization for %s", args.filename)
     visualize_csv(args.filename)

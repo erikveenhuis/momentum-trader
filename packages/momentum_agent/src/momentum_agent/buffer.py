@@ -3,8 +3,7 @@ from collections import deque, namedtuple
 
 import numpy as np
 import torch
-
-from .utils.logging_config import get_logger
+from momentum_core.logging import get_logger
 
 # Get logger instance
 logger = get_logger("Buffer")

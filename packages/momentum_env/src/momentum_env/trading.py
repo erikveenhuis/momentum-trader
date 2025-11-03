@@ -191,18 +191,23 @@ class TradingLogic:
     def calculate_reward(
         self,
         prev_portfolio_value: float,
-        cur_portfolio_value: float,
+        pre_trade_portfolio_value: float,
+        post_trade_portfolio_value: float,
         is_valid: bool,
     ) -> float:
-        """Calculate reward based on portfolio value percentage change."""
+        """Calculate reward separating market movement from trade impact."""
         if not is_valid:
             return self.invalid_action_penalty
 
-        # Avoid division by zero or extreme values
-        if prev_portfolio_value <= 1e-9 or cur_portfolio_value <= 1e-9:
-            return 0.0
+        if prev_portfolio_value > 1e-9 and pre_trade_portfolio_value > 1e-9:
+            market_return = (pre_trade_portfolio_value - prev_portfolio_value) / prev_portfolio_value
+        else:
+            market_return = 0.0
 
-        step_return = (cur_portfolio_value - prev_portfolio_value) / prev_portfolio_value
-        reward = step_return * self.reward_scale
+        if pre_trade_portfolio_value > 1e-9 and post_trade_portfolio_value > 1e-9:
+            trade_return = (post_trade_portfolio_value - pre_trade_portfolio_value) / pre_trade_portfolio_value
+        else:
+            trade_return = 0.0
 
+        reward = self.reward_scale * (market_return + trade_return)
         return reward

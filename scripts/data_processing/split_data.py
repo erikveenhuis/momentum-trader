@@ -8,7 +8,16 @@ from typing import List, Tuple
 import yaml
 
 # Import logging configuration
-from momentum_train.utils.logging_config import get_logger, setup_logging
+try:
+    from momentum_core.logging import get_logger, setup_package_logging
+except ImportError:  # pragma: no cover - fallback when package missing
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    logging.warning("Could not find momentum_core.logging, using basic config.")
+    get_logger = logging.getLogger
 
 # Add src directory to Python path to allow imports from src
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
@@ -25,7 +34,25 @@ except ImportError:
     sys.exit(1)
 
 # Get logger instance
-logger = get_logger("SplitData")
+logger = get_logger("data_processing.split_data")
+
+
+def configure_logging(log_level: str | None = None) -> None:
+    """Configure logging for the split_data script."""
+
+    if "setup_package_logging" not in globals():
+        return
+
+    setup_package_logging(
+        "data_processing.split_data",
+        log_filename="split_data.log",
+        root_level=log_level if log_level is not None else logging.INFO,
+        console_level=log_level if log_level is not None else logging.INFO,
+        level_overrides={
+            "data_processing.split_data": logging.INFO,
+            "DataManager": logging.INFO,
+        },
+    )
 
 
 def perform_train_val_test_split(
@@ -282,12 +309,7 @@ def run_split(
 
 if __name__ == "__main__":
     # --- Logging Setup ---
-    log_file = Path("logs") / "split_data.log"
-    setup_logging(
-        log_file_path=log_file,
-        root_level=logging.INFO,
-        level_overrides={"SplitData": logging.INFO, "DataManager": logging.INFO},
-    )
+    configure_logging()
     # ---------------------
 
     # --- Configuration Loading ---

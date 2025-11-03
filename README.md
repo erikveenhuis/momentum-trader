@@ -200,6 +200,20 @@ pytest tests/momentum_train/
 pytest --cov=momentum_env --cov=momentum_agent --cov=momentum_train
 ```
 
+## ✅ Enforce Tests Before Commit
+
+We ship a Git pre-commit hook in `githooks/pre-commit` that runs the entire test suite (`pytest`). To enable it, point Git to the repository hooks directory:
+
+```bash
+git config core.hooksPath githooks
+```
+
+From then on, every `git commit` will automatically run `pytest`. Commits are blocked when tests fail, ensuring the main branch only receives changes that keep the test suite green.
+
+If you need to skip the hook temporarily (for example, when working offline), you can use `git commit --no-verify`, but please re-run the tests manually before pushing.
+
+If you are on Windows, ensure that `python` is available on your `PATH`; Git for Windows will use the shebang in the hook (`#!/usr/bin/env python3`).
+
 ## 📝 Development
 
 ### Making Changes

@@ -103,14 +103,20 @@ def test_run_training_resume_uses_trainer_steps(monkeypatch, tmp_path):
     val_dir.mkdir(parents=True)
     test_dir.mkdir(parents=True)
 
-    # Move sample file to train directory
+    # Move sample file to train directory and create corresponding validation/test samples
     train_file = train_dir / "sample.csv"
     train_file.write_text("ticker,price\n")
+
+    val_file = val_dir / "sample.csv"
+    val_file.write_text("ticker,price\n")
+
+    test_file = test_dir / "sample.csv"
+    test_file.write_text("ticker,price\n")
 
     class StubDataManager(DataManager):
         def __init__(self):
             DataManager.__init__(self, base_dir=str(tmp_path))
-            self._data_organized = True  # Mark as organized to skip real organize
+            self.organize_data()
 
     def fake_find_latest(model_dir, prefix):
         return str(checkpoint_path)

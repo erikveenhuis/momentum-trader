@@ -295,14 +295,16 @@ def test_episode_termination(trading_env):
     """Test episode termination conditions."""
     trading_env.reset()
 
-    # Run until termination
+    # Run until portfolio depletion or dataset exhaustion
     terminated = False
+    truncated = False
     step_count = 0
-    while not terminated and step_count < 1000:
+    while not (terminated or truncated) and step_count < 1000:
         _, _, terminated, truncated, _ = trading_env.step(0)  # Hold action
         step_count += 1
 
-    assert terminated  # Episode should terminate eventually
+    assert truncated  # Dataset exhaustion should trigger truncation
+    assert not terminated  # No portfolio depletion when continuously holding
 
 
 def test_invalid_buy_actions(invalid_buy_trading_env):

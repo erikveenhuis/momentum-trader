@@ -17,25 +17,26 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "torch==2.8.0",
-    "numpy==2.3.3",
-    "pandas==2.2.3",
-    "scikit-learn",
-    "PyYAML==6.0.2",
+    "torch==2.9.0",
+    "numpy==2.3.4",
+    "pandas==2.3.3",
+    "scikit-learn==1.7.2",
+    "PyYAML==6.0.3",
     "momentum_agent==0.1.6",
     "momentum_env==0.1.6",
-    "tensorboard",
-    "wandb",
+    "momentum-core==0.1.0",
+    "tensorboard==2.20.0",
+    "wandb==0.22.3",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "black==25.1.0",
-    "flake8==7.2.0",
-    "isort==6.0.1",
-    "mypy==1.15.0",
-    "pytest==8.3.5",
-    "pytest-cov>=5.0.0",
+    "black==25.9.0",
+    "flake8==7.3.0",
+    "isort==7.0.0",
+    "mypy==1.18.2",
+    "pytest==8.4.2",
+    "pytest-cov>=7.0.0",
 ]
 
 [tool.setuptools.packages.find]
@@ -53,6 +54,10 @@ multi_line_output = 3
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-ra -q"
+markers = [
+    "integration: marks tests as integration tests",
+    "unittest: marks tests as unit tests",
+]
 
 [tool.ruff]
 line-length = 128

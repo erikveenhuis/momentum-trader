@@ -151,6 +151,7 @@ class TradingEnv(gym.Env):
 
         # Store old portfolio state for transaction cost info calculation
         old_portfolio_state = self.portfolio_state
+        pre_trade_portfolio_value = old_portfolio_state.portfolio_value(current_price)
 
         # Map action to type and value
         if action == 0:  # Hold
@@ -175,20 +176,21 @@ class TradingEnv(gym.Env):
         self.portfolio_state = new_portfolio_state
 
         # Calculate current portfolio value (after action, using current price)
-        cur_portfolio_value = self.portfolio_state.portfolio_value(current_price)
+        post_trade_portfolio_value = self.portfolio_state.portfolio_value(current_price)
 
-        # Calculate reward using previous and current portfolio values and the validity flag
+        # Calculate reward using previous, pre-trade, and post-trade portfolio values
         reward = float(
             self.trading_logic.calculate_reward(
                 prev_portfolio_value=self.prev_portfolio_value,
-                cur_portfolio_value=cur_portfolio_value,
+                pre_trade_portfolio_value=pre_trade_portfolio_value,
+                post_trade_portfolio_value=post_trade_portfolio_value,
                 is_valid=is_valid,
             )
         )
 
         # Determine next step index and done flags
         next_step = self.state["current_step"] + 1
-        terminated, truncated = self._check_termination(cur_portfolio_value, next_step)
+        terminated, truncated = self._check_termination(post_trade_portfolio_value, next_step)
 
         # Build next observation and info from the upcoming step (clamped if beyond data end)
         observation = self._get_observation(step_override=next_step)
@@ -204,7 +206,7 @@ class TradingEnv(gym.Env):
             self.state["current_step"] = next_step
 
         # Update previous portfolio value for the next step
-        self.prev_portfolio_value = cur_portfolio_value
+        self.prev_portfolio_value = post_trade_portfolio_value
 
         return observation, reward, terminated, truncated, info
 
@@ -227,8 +229,8 @@ class TradingEnv(gym.Env):
         data_finished = next_step >= self.market_data.data_length
         portfolio_depleted = current_portfolio_value < self.config.initial_balance * 0.01
 
-        terminated = portfolio_depleted or data_finished
-        truncated = data_finished and not portfolio_depleted
+        terminated = bool(portfolio_depleted)
+        truncated = bool(data_finished and not terminated)
 
         return terminated, truncated
 

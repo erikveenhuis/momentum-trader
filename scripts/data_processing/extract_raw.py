@@ -18,14 +18,14 @@ import yaml
 
 # Import logging configuration
 try:
-    from momentum_train.logging_config import get_logger, setup_logging
+    from momentum_core.logging import get_logger, setup_package_logging
 except ImportError:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
-    logging.warning("Could not find logging_config, using basic config.")
+    logging.warning("Could not find momentum_core.logging, using basic config.")
     get_logger = logging.getLogger
 
 # Import shared functions/constants
@@ -42,7 +42,24 @@ except ImportError:
     sys.exit(1)
 
 # Get logger instance for the main process (used before multiprocessing starts)
-logger = get_logger("ExtractRawData")
+logger = get_logger("data_processing.extract_raw")
+
+
+def configure_logging(log_level: Optional[str] = None) -> None:
+    """Configure logging for the extract_raw script."""
+
+    if "setup_package_logging" not in globals():
+        return
+
+    setup_package_logging(
+        "data_processing.extract_raw",
+        log_filename="extract_raw_data.log",
+        root_level=log_level if log_level is not None else logging.INFO,
+        console_level=log_level if log_level is not None else logging.INFO,
+        level_overrides={
+            "data_processing.extract_raw": logging.INFO,
+        },
+    )
 
 
 # Worker process logging setup function
@@ -509,15 +526,7 @@ def run_extraction(
 
 if __name__ == "__main__":
     # --- Logging Setup ---
-    log_file = Path("logs") / "extract_raw_data.log"
-    setup_logging(
-        log_file_path=log_file,
-        root_level=logging.INFO,
-        level_overrides={
-            "ExtractRawData": logging.INFO,
-        },
-        console_level=logging.INFO,  # Ensure console shows INFO
-    )
+    configure_logging()
     # ---------------------
 
     # --- Configuration Loading ---

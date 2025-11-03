@@ -6,12 +6,13 @@ import numpy as np
 import torch
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
+from momentum_core.logging import get_logger
+from torch.amp import autocast
 from torch.cuda.amp import GradScaler
 
 from .buffer import PrioritizedReplayBuffer
 from .constants import ACCOUNT_STATE_DIM  # Import constant
 from .model import RainbowNetwork
-from .utils.logging_config import get_logger
 
 # Get logger instance
 logger = get_logger("Agent")
@@ -63,15 +64,18 @@ class RainbowDQNAgent:
         self.beta_start = config["beta_start"]
         self.beta_frames = config["beta_frames"]
         self.grad_clip_norm = config["grad_clip_norm"]
+        self.store_partial_n_step = self.config.get("store_partial_n_step", False)
         # Optional flags can still use .get()
         self.debug_mode = config.get("debug", False)
         self.scaler = scaler  # Store the scaler instance
+        self._n_step_needs_reset = False
 
         # Setup seeds
         np.random.seed(self.seed)
         random.seed(self.seed)
         torch.manual_seed(self.seed)
         if self.device == "cuda" and torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
             torch.cuda.manual_seed(self.seed)
             torch.cuda.manual_seed_all(self.seed)  # for multi-GPU
             logger.info(f"CUDA seed set. AMP Enabled: {self.scaler is not None}")
@@ -194,143 +198,192 @@ class RainbowDQNAgent:
         self.n_step_reward_window = deque(maxlen=60)
         # --- END ADDED ---
         # --- ADDED: List for comprehensive N-step reward history ---
-        self.observed_n_step_rewards_history = []
+        self.observed_n_step_rewards_history = [] if self.debug_mode else None
         # --- END ADDED ---
 
         self.training_mode = True  # Start in training mode by default
+        self._network_mode_training: bool | None = None
+        self._apply_network_mode(self.training_mode)
+        self._non_blocking_copy = self.device == "cuda" and torch.cuda.is_available()
+        self._market_tensor = torch.zeros((1, self.window_size, self.n_features), device=self.device, dtype=torch.float32)
+        self._account_tensor = torch.zeros((1, ACCOUNT_STATE_DIM), device=self.device, dtype=torch.float32)
         self.total_steps = 0  # Track total steps for target network updates and beta annealing
 
     def select_action(self, obs):
         """Selects action based on the current Q-value estimates using Noisy Nets."""
-        assert isinstance(obs, dict), "Observation must be a dictionary"
-        assert "market_data" in obs and "account_state" in obs, "Observation missing required keys"
-        assert isinstance(obs["market_data"], np.ndarray), "obs['market_data'] must be a numpy array"
-        assert isinstance(obs["account_state"], np.ndarray), "obs['account_state'] must be a numpy array"
-        # Check shapes (before adding batch dimension)
-        assert obs["market_data"].shape == (
-            self.window_size,
-            self.n_features,
-        ), f"Input market_data shape mismatch. Expected {(self.window_size, self.n_features)}, got {obs['market_data'].shape}"
-        assert obs["account_state"].shape == (
-            ACCOUNT_STATE_DIM,
-        ), f"Input account_state shape mismatch. Expected ({ACCOUNT_STATE_DIM},), got {obs['account_state'].shape}"
+        if self.debug_mode:
+            assert isinstance(obs, dict), "Observation must be a dictionary"
+            assert "market_data" in obs and "account_state" in obs, "Observation missing required keys"
+            assert isinstance(obs["market_data"], np.ndarray), "obs['market_data'] must be a numpy array"
+            assert isinstance(obs["account_state"], np.ndarray), "obs['account_state'] must be a numpy array"
+            # Check shapes (before adding batch dimension)
+            assert obs["market_data"].shape == (
+                self.window_size,
+                self.n_features,
+            ), f"Input market_data shape mismatch. Expected {(self.window_size, self.n_features)}, got {obs['market_data'].shape}"
+            assert obs["account_state"].shape == (
+                ACCOUNT_STATE_DIM,
+            ), f"Input account_state shape mismatch. Expected ({ACCOUNT_STATE_DIM},), got {obs['account_state'].shape}"
 
-        # Convert observation to tensors
-        market_data = torch.FloatTensor(obs["market_data"]).unsqueeze(0).to(self.device)
-        account_state = torch.FloatTensor(obs["account_state"]).unsqueeze(0).to(self.device)
-        assert market_data.shape == (
-            1,
-            self.window_size,
-            self.n_features,
-        ), "Tensor market_data shape mismatch"
-        assert account_state.shape == (
-            1,
-            ACCOUNT_STATE_DIM,
-        ), "Tensor account_state shape mismatch"
+        # Convert observation to tensors using preallocated buffers
+        market_source = torch.from_numpy(obs["market_data"]).to(dtype=self._market_tensor.dtype)
+        account_source = torch.from_numpy(obs["account_state"]).to(dtype=self._account_tensor.dtype)
+
+        self._market_tensor[0].copy_(market_source, non_blocking=self._non_blocking_copy)
+        self._account_tensor[0].copy_(account_source, non_blocking=self._non_blocking_copy)
+
+        market_data = self._market_tensor
+        account_state = self._account_tensor
+        if self.debug_mode:
+            assert market_data.shape == (
+                1,
+                self.window_size,
+                self.n_features,
+            ), "Tensor market_data shape mismatch"
+            assert account_state.shape == (
+                1,
+                ACCOUNT_STATE_DIM,
+            ), "Tensor account_state shape mismatch"
 
         # Select action using the online network (with Noisy Layers for exploration)
-        self.network.eval()  # Ensure eval mode for action selection if using dropout/batchnorm (though NoisyNets handle exploration)
-        with torch.no_grad():
-            q_values = self.network.get_q_values(market_data, account_state)
-            assert q_values.shape == (
-                1,
-                self.num_actions,
-            ), f"Q-values shape mismatch. Expected (1, {self.num_actions}), got {q_values.shape}"
-            action = q_values.argmax().item()  # Choose action with highest expected Q-value
-            assert isinstance(action, int), f"Selected action is not an integer: {action}"
-            assert 0 <= action < self.num_actions, f"Selected action ({action}) is out of bounds [0, {self.num_actions})"
-        # Switch back to train mode if necessary (depends if eval() affects Noisy Layers - typically it doesn't disable noise generation)
-        if self.training_mode:
-            self.network.train()
+        if self.training_mode and hasattr(self.network, "reset_noise"):
+            self.network.reset_noise()
 
+        autocast_enabled = self.device == "cuda" and torch.cuda.is_available()
+
+        with torch.inference_mode():
+            with autocast("cuda", enabled=autocast_enabled):
+                q_values = self.network.get_q_values(market_data, account_state)
+            if self.debug_mode:
+                assert q_values.shape == (
+                    1,
+                    self.num_actions,
+                ), f"Q-values shape mismatch. Expected (1, {self.num_actions}), got {q_values.shape}"
+            action = q_values.argmax().item()  # Choose action with highest expected Q-value
+            if self.debug_mode:
+                assert isinstance(action, int), f"Selected action is not an integer: {action}"
+                assert 0 <= action < self.num_actions, f"Selected action ({action}) is out of bounds [0, {self.num_actions})"
         return action
 
-    def _get_n_step_info(self):
+    def _get_n_step_info(self, steps: int | None = None):
         """
-        Calculates the n-step return G_t^(n) and identifies the state s_{t+n}
-        and done flag d_{t+n} from the transition n steps later.
-        Uses the n-step buffer which contains (s_k, a_k, r_{k+1}, s_{k+1}, d_{k+1}).
+        Calculates the (truncated) n-step return using the oldest `steps` transitions
+        currently stored in the n-step buffer.
+
+        Args:
+            steps (int | None): Number of transitions to consider. Defaults to self.n_steps.
 
         Returns:
-            tuple: Contains:
-                - state_t (tuple): (market_data_t, account_state_t) from the start of the n steps.
-                - action_t (int): Action taken at state_t.
-                - n_step_reward (float): The accumulated discounted n-step return.
-                - next_state_tn (tuple): (market_data_{t+n}, account_state_{t+n}) observed n steps later.
-                - done_tn (bool): Done flag from n steps later.
+            tuple: Contains state_t, action_t, discounted reward, next_state_tn, done_tn.
         """
-        assert len(self.n_step_buffer) == self.n_steps, "N-step buffer size mismatch for calculation"
+        if steps is None:
+            steps = self.n_steps
 
-        # State and action from the *first* transition in the buffer (t)
-        market_data_t, account_state_t, action_t, _, _, _, _ = self.n_step_buffer[0]
+        if steps < 1:
+            raise ValueError("Steps for n-step calculation must be >= 1")
+        if len(self.n_step_buffer) < steps:
+            raise ValueError("Insufficient transitions in n-step buffer")
+
+        transitions = list(self.n_step_buffer)[:steps]
+
+        # State and action from the *first* transition in the slice (t)
+        market_data_t, account_state_t, action_t, _, _, _, _ = transitions[0]
         state_t = (market_data_t, account_state_t)
 
-        # Next state and done flag from the *last* transition in the buffer (t+n)
-        _, _, _, _, next_market_tn, next_account_tn, done_tn = self.n_step_buffer[-1]
+        # Next state and done flag from the *last* transition in the slice (t + steps - 1)
+        _, _, _, _, next_market_tn, next_account_tn, done_tn = transitions[-1]
         next_state_tn = (next_market_tn, next_account_tn)
 
-        # Calculate cumulative discounted reward G_t^(n)
+        # Calculate cumulative discounted reward G_t^(steps)
         n_step_reward = 0.0
         discount = 1.0
-        for i in range(self.n_steps):
-            # r_{t+i+1}, d_{t+i+1}
-            _, _, _, reward_iplus1, _, _, done_iplus1 = self.n_step_buffer[i]
-            n_step_reward += discount * reward_iplus1
-            discount *= self.gamma
-            if done_iplus1:
-                # If termination occurs at step t+i+1 (where i < n-1),
-                # the n-step return calculation stops here.
-                # The next_state and done used for the Bellman target are correctly
-                # s_{t+n} and d_{t+n} from the last transition.
+        for _, _, _, reward_i, _, _, done_i in transitions:
+            n_step_reward += discount * reward_i
+            if done_i:
                 break
+            discount *= self.gamma
 
-        # --- Start: Assert return types and shapes ---
-        assert isinstance(state_t, tuple) and len(state_t) == 2, "state_t is not a 2-tuple"
-        assert isinstance(state_t[0], np.ndarray) and state_t[0].shape == (
-            self.window_size,
-            self.n_features,
-        ), "state_t[0] (market_data) has wrong type/shape"
-        assert isinstance(state_t[1], np.ndarray) and state_t[1].shape == (
-            ACCOUNT_STATE_DIM,
-        ), "state_t[1] (account_state) has wrong type/shape"
-        assert isinstance(action_t, (int, np.integer)), "action_t is not an integer"
-        assert isinstance(n_step_reward, (float, np.float32, np.float64)), "n_step_reward is not a float"
-        assert isinstance(next_state_tn, tuple) and len(next_state_tn) == 2, "next_state_tn is not a 2-tuple"
-        assert isinstance(next_state_tn[0], np.ndarray) and next_state_tn[0].shape == (
-            self.window_size,
-            self.n_features,
-        ), "next_state_tn[0] (market_data) has wrong type/shape"
-        assert isinstance(next_state_tn[1], np.ndarray) and next_state_tn[1].shape == (
-            ACCOUNT_STATE_DIM,
-        ), "next_state_tn[1] (account_state) has wrong type/shape"
-        assert isinstance(done_tn, (bool, np.bool_)), "done_tn is not a boolean"
-        # --- End: Assert return types and shapes ---
+        if self.debug_mode:
+            # --- Start: Assert return types and shapes ---
+            assert isinstance(state_t, tuple) and len(state_t) == 2, "state_t is not a 2-tuple"
+            assert isinstance(state_t[0], np.ndarray) and state_t[0].shape == (
+                self.window_size,
+                self.n_features,
+            ), "state_t[0] (market_data) has wrong type/shape"
+            assert isinstance(state_t[1], np.ndarray) and state_t[1].shape == (
+                ACCOUNT_STATE_DIM,
+            ), "state_t[1] (account_state) has wrong type/shape"
+            assert isinstance(action_t, (int, np.integer)), "action_t is not an integer"
+            assert isinstance(n_step_reward, (float, np.float32, np.float64)), "n_step_reward is not a float"
+            assert isinstance(next_state_tn, tuple) and len(next_state_tn) == 2, "next_state_tn is not a 2-tuple"
+            assert isinstance(next_state_tn[0], np.ndarray) and next_state_tn[0].shape == (
+                self.window_size,
+                self.n_features,
+            ), "next_state_tn[0] (market_data) has wrong type/shape"
+            assert isinstance(next_state_tn[1], np.ndarray) and next_state_tn[1].shape == (
+                ACCOUNT_STATE_DIM,
+            ), "next_state_tn[1] (account_state) has wrong type/shape"
+            assert isinstance(done_tn, (bool, np.bool_)), "done_tn is not a boolean"
+            # --- End: Assert return types and shapes ---
 
         return state_t, action_t, n_step_reward, next_state_tn, done_tn
 
+    def _store_n_step_transition(self, steps: int, *, pop_after: bool) -> None:
+        """Helper to compute and store an n-step (or truncated) transition."""
+        state_t, action_t, n_step_reward, next_state_tn, done_tn = self._get_n_step_info(steps)
+        market_data_t, account_state_t = state_t
+        next_market_tn, next_account_tn = next_state_tn
+
+        # Track reward statistics
+        self.n_step_reward_window.append(n_step_reward)
+        if self.observed_n_step_rewards_history is not None:
+            self.observed_n_step_rewards_history.append(n_step_reward)
+
+        # Store transition in PER
+        self.buffer.store(
+            market_data_t,
+            account_state_t,
+            action_t,
+            n_step_reward,
+            next_market_tn,
+            next_account_tn,
+            done_tn,
+        )
+
+        # Advance buffer window when requested (e.g., during terminal flush)
+        if pop_after and len(self.n_step_buffer) > 0:
+            self.n_step_buffer.popleft()
+
     def store_transition(self, obs, action, reward, next_obs, done):
         """Stores experience in N-step buffer and potentially transfers to PER."""
-        # --- Start: Assert input types and shapes for store_transition ---
-        assert isinstance(obs, dict) and "market_data" in obs and "account_state" in obs, "Invalid current observation format"
-        assert isinstance(next_obs, dict) and "market_data" in next_obs and "account_state" in next_obs, "Invalid next observation format"
-        assert isinstance(obs["market_data"], np.ndarray) and obs["market_data"].shape == (
-            self.window_size,
-            self.n_features,
-        ), f"Invalid obs market data shape {obs['market_data'].shape}"
-        assert isinstance(obs["account_state"], np.ndarray) and obs["account_state"].shape == (
-            ACCOUNT_STATE_DIM,
-        ), f"Invalid obs account state shape {obs['account_state'].shape}"
-        assert isinstance(next_obs["market_data"], np.ndarray) and next_obs["market_data"].shape == (
-            self.window_size,
-            self.n_features,
-        ), f"Invalid next_obs market data shape {next_obs['market_data'].shape}"
-        assert isinstance(next_obs["account_state"], np.ndarray) and next_obs["account_state"].shape == (
-            ACCOUNT_STATE_DIM,
-        ), f"Invalid next_obs account state shape {next_obs['account_state'].shape}"
-        assert isinstance(action, (int, np.integer)), "Action must be an integer"
-        assert isinstance(reward, (float, np.float32, np.float64)), "Reward must be a float"
-        assert isinstance(done, (bool, np.bool_)), "Done flag must be boolean"
-        # --- End: Assert input types and shapes ---
+        if self._n_step_needs_reset:
+            self.n_step_buffer.clear()
+            self._n_step_needs_reset = False
+
+        if self.debug_mode:
+            # --- Start: Assert input types and shapes for store_transition ---
+            assert isinstance(obs, dict) and "market_data" in obs and "account_state" in obs, "Invalid current observation format"
+            assert (
+                isinstance(next_obs, dict) and "market_data" in next_obs and "account_state" in next_obs
+            ), "Invalid next observation format"
+            assert isinstance(obs["market_data"], np.ndarray) and obs["market_data"].shape == (
+                self.window_size,
+                self.n_features,
+            ), f"Invalid obs market data shape {obs['market_data'].shape}"
+            assert isinstance(obs["account_state"], np.ndarray) and obs["account_state"].shape == (
+                ACCOUNT_STATE_DIM,
+            ), f"Invalid obs account state shape {obs['account_state'].shape}"
+            assert isinstance(next_obs["market_data"], np.ndarray) and next_obs["market_data"].shape == (
+                self.window_size,
+                self.n_features,
+            ), f"Invalid next_obs market data shape {next_obs['market_data'].shape}"
+            assert isinstance(next_obs["account_state"], np.ndarray) and next_obs["account_state"].shape == (
+                ACCOUNT_STATE_DIM,
+            ), f"Invalid next_obs account state shape {next_obs['account_state'].shape}"
+            assert isinstance(action, (int, np.integer)), "Action must be an integer"
+            assert isinstance(reward, (float, np.float32, np.float64)), "Reward must be a float"
+            assert isinstance(done, (bool, np.bool_)), "Done flag must be boolean"
+            # --- End: Assert input types and shapes ---
 
         # Store raw single-step transition data needed for n-step calculation
         # (s_k, a_k, r_{k+1}, s_{k+1}_market, s_{k+1}_account, d_{k+1})
@@ -345,52 +398,28 @@ class RainbowDQNAgent:
         )
         self.n_step_buffer.append(transition)
 
-        # If buffer has enough steps, calculate N-step return and store in PER
-        if len(self.n_step_buffer) >= self.n_steps:
-            state_t, action_t, n_step_reward, next_state_tn, done_tn = self._get_n_step_info()
-            # --- REMOVED: Single reward log ---
-            # logger.info(f"Calculated n_step_reward: {n_step_reward}")
-            # --- END REMOVED ---
-            # --- ADDED: Append reward to window deque ---
-            self.n_step_reward_window.append(n_step_reward)
-            # --- END ADDED ---
-            # --- ADDED: Append reward to comprehensive history list ---
-            self.observed_n_step_rewards_history.append(n_step_reward)
-            # --- END ADDED ---
-            market_data_t, account_state_t = state_t
-            next_market_tn, next_account_tn = next_state_tn
+        buffer_full = len(self.n_step_buffer) == self.n_steps
 
-            # --- Start: Assert types before storing in PER buffer ---
-            assert isinstance(market_data_t, np.ndarray) and market_data_t.shape == (
-                self.window_size,
-                self.n_features,
-            ), "Invalid market_data_t for PER store"
-            assert isinstance(account_state_t, np.ndarray) and account_state_t.shape == (
-                ACCOUNT_STATE_DIM,
-            ), "Invalid account_state_t for PER store"
-            assert isinstance(action_t, (int, np.integer)), "Invalid action_t for PER store"
-            assert isinstance(n_step_reward, (float, np.float32, np.float64)), "Invalid n_step_reward for PER store"
-            assert isinstance(next_market_tn, np.ndarray) and next_market_tn.shape == (
-                self.window_size,
-                self.n_features,
-            ), "Invalid next_market_tn for PER store"
-            assert isinstance(next_account_tn, np.ndarray) and next_account_tn.shape == (
-                ACCOUNT_STATE_DIM,
-            ), "Invalid next_account_tn for PER store"
-            assert isinstance(done_tn, (bool, np.bool_)), "Invalid done_tn flag for PER store"
-            # --- End: Assert types before storing ---
+        # When buffer is full during ongoing episodes, store the rolling n-step transition
+        if buffer_full and not done:
+            self._store_n_step_transition(self.n_steps, pop_after=False)
 
-            # Store the calculated N-step transition in the main prioritized buffer
-            # Format: (s_t, a_t, G_t^(n), s_{t+n}, d_{t+n})
-            self.buffer.store(
-                market_data_t,
-                account_state_t,
-                action_t,
-                n_step_reward,
-                next_market_tn,
-                next_account_tn,
-                done_tn,
-            )
+        if done:
+            # Ensure the final n-step transition is captured once
+            if buffer_full:
+                self._store_n_step_transition(
+                    self.n_steps,
+                    pop_after=self.store_partial_n_step,
+                )
+
+            if self.store_partial_n_step:
+                # Optionally store truncated returns at episode end
+                while len(self.n_step_buffer) > 0:
+                    steps = len(self.n_step_buffer)
+                    self._store_n_step_transition(steps, pop_after=True)
+
+            # Defer clearing until the next transition to keep tests' expectations
+            self._n_step_needs_reset = True
 
     def _project_target_distribution(self, next_market_data_batch, next_account_state_batch, rewards, dones):
         """
@@ -410,45 +439,51 @@ class RainbowDQNAgent:
         with torch.no_grad():
             # Double DQN: Use online network to select best next action's index at state s_{t+n}
             next_q_values = self.network.get_q_values(next_market_data_batch, next_account_state_batch)
-            assert next_q_values.shape == (
-                self.batch_size,
-                self.num_actions,
-            ), "Next Q-values shape mismatch"
+            if self.debug_mode:
+                assert next_q_values.shape == (
+                    self.batch_size,
+                    self.num_actions,
+                ), "Next Q-values shape mismatch"
             next_actions = next_q_values.argmax(dim=1)  # [batch_size]
-            assert next_actions.shape == (self.batch_size,), "Next actions shape mismatch"
+            if self.debug_mode:
+                assert next_actions.shape == (self.batch_size,), "Next actions shape mismatch"
 
             # Get next state's distribution Z(s_{t+n}, a*) from target network for selected actions a*
             next_log_dist = self.target_network(next_market_data_batch, next_account_state_batch)  # [B, num_actions, num_atoms]
-            assert next_log_dist.shape == (
-                self.batch_size,
-                self.num_actions,
-                self.num_atoms,
-            ), "Next log distribution shape mismatch"
-            assert next_actions.max() < self.num_actions and next_actions.min() >= 0, "Invalid next_action indices"
+            if self.debug_mode:
+                assert next_log_dist.shape == (
+                    self.batch_size,
+                    self.num_actions,
+                    self.num_atoms,
+                ), "Next log distribution shape mismatch"
+                assert next_actions.max() < self.num_actions and next_actions.min() >= 0, "Invalid next_action indices"
 
             # Get the probability distribution for the chosen actions: p(s_{t+n}, a*)
             next_dist = torch.exp(next_log_dist[range(self.batch_size), next_actions])  # [B, num_atoms]
-            assert next_dist.shape == (
-                self.batch_size,
-                self.num_atoms,
-            ), "Next distribution shape mismatch"
+            if self.debug_mode:
+                assert next_dist.shape == (
+                    self.batch_size,
+                    self.num_atoms,
+                ), "Next distribution shape mismatch"
 
             # Compute the projected Bellman target T_z = G_t^(n) + gamma^n * Z(s_{t+n}, a*)
             # Rewards are [B, 1], dones are [B, 1], support is [num_atoms]
             # Broadcasting applies correctly.
             Tz = rewards + (1 - dones) * (self.gamma**self.n_steps) * self.support  # [B, num_atoms]
-            assert Tz.shape == (
-                self.batch_size,
-                self.num_atoms,
-            ), f"Projected Tz shape mismatch: {Tz.shape}"
+            if self.debug_mode:
+                assert Tz.shape == (
+                    self.batch_size,
+                    self.num_atoms,
+                ), f"Projected Tz shape mismatch: {Tz.shape}"
             Tz = Tz.clamp(min=self.v_min, max=self.v_max)
 
             # Compute projection indices and weights
             b = (Tz - self.v_min) / self.delta_z  # Normalized position on support axis [B, num_atoms]
-            assert b.shape == (
-                self.batch_size,
-                self.num_atoms,
-            ), f"Projection 'b' shape mismatch: {b.shape}"
+            if self.debug_mode:
+                assert b.shape == (
+                    self.batch_size,
+                    self.num_atoms,
+                ), f"Projection 'b' shape mismatch: {b.shape}"
             lower_atom_idx = b.floor().long()
             u = b.ceil().long()  # Upper atom index
             # Fix disappearing probability mass when l = b = u (b is int)
@@ -506,30 +541,31 @@ class RainbowDQNAgent:
             next_account_state,
             dones,
         ) = batch
-        # --- Start: Assert batch shapes and types ---
-        assert market_data.shape == (
-            self.batch_size,
-            self.window_size,
-            self.n_features,
-        ), "Batch market_data shape mismatch"
-        assert account_state.shape == (
-            self.batch_size,
-            ACCOUNT_STATE_DIM,
-        ), "Batch account_state shape mismatch"
-        assert actions.shape == (self.batch_size,), "Batch actions shape mismatch"
-        assert rewards.shape == (self.batch_size,), "Batch rewards shape mismatch"
-        assert next_market_data.shape == (
-            self.batch_size,
-            self.window_size,
-            self.n_features,
-        ), "Batch next_market_data shape mismatch"
-        assert next_account_state.shape == (
-            self.batch_size,
-            ACCOUNT_STATE_DIM,
-        ), "Batch next_account_state shape mismatch"
-        assert dones.shape == (self.batch_size,), "Batch dones shape mismatch"
-        assert weights.shape == (self.batch_size,), "Batch weights shape mismatch"
-        # --- End: Assert batch shapes and types ---
+        if self.debug_mode:
+            # --- Start: Assert batch shapes and types ---
+            assert market_data.shape == (
+                self.batch_size,
+                self.window_size,
+                self.n_features,
+            ), "Batch market_data shape mismatch"
+            assert account_state.shape == (
+                self.batch_size,
+                ACCOUNT_STATE_DIM,
+            ), "Batch account_state shape mismatch"
+            assert actions.shape == (self.batch_size,), "Batch actions shape mismatch"
+            assert rewards.shape == (self.batch_size,), "Batch rewards shape mismatch"
+            assert next_market_data.shape == (
+                self.batch_size,
+                self.window_size,
+                self.n_features,
+            ), "Batch next_market_data shape mismatch"
+            assert next_account_state.shape == (
+                self.batch_size,
+                ACCOUNT_STATE_DIM,
+            ), "Batch next_account_state shape mismatch"
+            assert dones.shape == (self.batch_size,), "Batch dones shape mismatch"
+            assert weights.shape == (self.batch_size,), "Batch weights shape mismatch"
+            # --- End: Assert batch shapes and types ---
 
         # Convert numpy arrays from buffer to tensors
         market_data_batch = torch.FloatTensor(market_data).to(self.device)
@@ -541,79 +577,86 @@ class RainbowDQNAgent:
         dones_batch = torch.FloatTensor(dones).unsqueeze(1).to(self.device)  # [B, 1]
         weights_batch = torch.FloatTensor(weights).unsqueeze(1).to(self.device)  # [B, 1]
 
-        # --- Start: Assert tensor shapes after conversion ---
-        assert market_data_batch.shape == (
-            self.batch_size,
-            self.window_size,
-            self.n_features,
-        ), "Tensor market_data_batch shape mismatch"
-        assert account_state_batch.shape == (
-            self.batch_size,
-            ACCOUNT_STATE_DIM,
-        ), "Tensor account_state_batch shape mismatch"
-        assert next_market_data_batch.shape == (
-            self.batch_size,
-            self.window_size,
-            self.n_features,
-        ), "Tensor next_market_data_batch shape mismatch"
-        assert next_account_state_batch.shape == (
-            self.batch_size,
-            ACCOUNT_STATE_DIM,
-        ), "Tensor next_account_state_batch shape mismatch"
-        assert actions_batch.shape == (self.batch_size,), "Tensor actions_batch shape mismatch"
-        assert rewards_batch.shape == (
-            self.batch_size,
-            1,
-        ), "Tensor rewards_batch shape mismatch"
-        assert dones_batch.shape == (
-            self.batch_size,
-            1,
-        ), "Tensor dones_batch shape mismatch"
-        assert weights_batch.shape == (
-            self.batch_size,
-            1,
-        ), "Tensor weights_batch shape mismatch"
-        # --- End: Assert tensor shapes ---
+        if self.debug_mode:
+            # --- Start: Assert tensor shapes after conversion ---
+            assert market_data_batch.shape == (
+                self.batch_size,
+                self.window_size,
+                self.n_features,
+            ), "Tensor market_data_batch shape mismatch"
+            assert account_state_batch.shape == (
+                self.batch_size,
+                ACCOUNT_STATE_DIM,
+            ), "Tensor account_state_batch shape mismatch"
+            assert next_market_data_batch.shape == (
+                self.batch_size,
+                self.window_size,
+                self.n_features,
+            ), "Tensor next_market_data_batch shape mismatch"
+            assert next_account_state_batch.shape == (
+                self.batch_size,
+                ACCOUNT_STATE_DIM,
+            ), "Tensor next_account_state_batch shape mismatch"
+            assert actions_batch.shape == (self.batch_size,), "Tensor actions_batch shape mismatch"
+            assert rewards_batch.shape == (
+                self.batch_size,
+                1,
+            ), "Tensor rewards_batch shape mismatch"
+            assert dones_batch.shape == (
+                self.batch_size,
+                1,
+            ), "Tensor dones_batch shape mismatch"
+            assert weights_batch.shape == (
+                self.batch_size,
+                1,
+            ), "Tensor weights_batch shape mismatch"
+            # --- End: Assert tensor shapes ---
 
         # --- Calculate Target Distribution (m) --- #
         # This is the projected distribution for the Bellman target Z(s_t, a_t)
         target_distribution = self._project_target_distribution(
             next_market_data_batch, next_account_state_batch, rewards_batch, dones_batch
         )
-        assert target_distribution.shape == (
-            self.batch_size,
-            self.num_atoms,
-        ), "Target distribution shape mismatch"
+        if self.debug_mode:
+            assert target_distribution.shape == (
+                self.batch_size,
+                self.num_atoms,
+            ), "Target distribution shape mismatch"
         # ---------------------------------------- #
 
         # --- Calculate Online Distribution and Loss --- #
         # Get log probabilities Z(s_t, a) from the online network
         log_ps = self.network(market_data_batch, account_state_batch)  # [B, num_actions, num_atoms]
-        assert log_ps.shape == (
-            self.batch_size,
-            self.num_actions,
-            self.num_atoms,
-        ), "Online log_ps shape mismatch"
+        if self.debug_mode:
+            assert log_ps.shape == (
+                self.batch_size,
+                self.num_actions,
+                self.num_atoms,
+            ), "Online log_ps shape mismatch"
 
         # Gather the log-probabilities for the actions actually taken: log Z(s_t, a_t)
         # We need to select the log probabilities corresponding to actions_batch
         actions_indices = actions_batch.view(self.batch_size, 1, 1).expand(self.batch_size, 1, self.num_atoms)
         log_ps_a = log_ps.gather(1, actions_indices).squeeze(1)  # [B, num_atoms]
-        assert log_ps_a.shape == (
-            self.batch_size,
-            self.num_atoms,
-        ), "Online log_ps_a shape mismatch"
+        if self.debug_mode:
+            assert log_ps_a.shape == (
+                self.batch_size,
+                self.num_atoms,
+            ), "Online log_ps_a shape mismatch"
 
         # Calculate cross-entropy loss between target and online distributions
         # Loss = -sum_i [ target_distribution_i * log(online_distribution_i) ]
         # Target distribution is detached as it acts as the label.
         loss_elementwise = -(target_distribution.detach() * log_ps_a).sum(dim=1)  # [B]
-        assert loss_elementwise.shape == (self.batch_size,), "Per-sample loss shape mismatch"
+        if self.debug_mode:
+            assert loss_elementwise.shape == (self.batch_size,), "Per-sample loss shape mismatch"
 
         # Apply Importance Sampling weights and calculate mean loss
         loss = (loss_elementwise * weights_batch.squeeze(1).detach()).mean()  # Scalar
-        assert loss.ndim == 0, "Final loss is not a scalar"
-        assert torch.isfinite(loss), f"Loss calculation resulted in NaN or Inf: {loss.item()}"
+        if loss.ndim != 0:
+            raise RuntimeError("Final loss is not a scalar")
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f"Loss calculation resulted in NaN or Inf: {loss.item()}")
         # ----------------------------------------- #
 
         # --- Calculate TD errors for PER update --- #
@@ -624,8 +667,9 @@ class RainbowDQNAgent:
         q_values_target = (target_distribution * self.support.unsqueeze(0)).sum(dim=1)  # [B]
         # TD error = |Target Q - Online Q|
         td_errors_tensor = (q_values_target.detach() - q_values_online.detach()).abs()
-        assert td_errors_tensor.shape == (self.batch_size,), "TD errors tensor shape mismatch"
-        assert torch.isfinite(td_errors_tensor).all(), "NaN or Inf found in TD errors tensor"
+        if self.debug_mode:
+            assert td_errors_tensor.shape == (self.batch_size,), "TD errors tensor shape mismatch"
+            assert torch.isfinite(td_errors_tensor).all(), "NaN or Inf found in TD errors tensor"
         # ----------------------------------------- #
 
         return loss, td_errors_tensor
@@ -647,10 +691,11 @@ class RainbowDQNAgent:
 
         # Compute loss and TD errors (TD errors are tensors)
         loss, td_errors_tensor = self._compute_loss(batch_tuple, weights)
-        assert isinstance(loss, torch.Tensor) and loss.ndim == 0, "Loss from _compute_loss is not a scalar tensor"
-        assert isinstance(td_errors_tensor, torch.Tensor) and td_errors_tensor.shape == (
-            self.batch_size,
-        ), "TD errors tensor from _compute_loss has wrong shape/type"
+        if self.debug_mode:
+            assert isinstance(loss, torch.Tensor) and loss.ndim == 0, "Loss from _compute_loss is not a scalar tensor"
+            assert isinstance(td_errors_tensor, torch.Tensor) and td_errors_tensor.shape == (
+                self.batch_size,
+            ), "TD errors tensor from _compute_loss has wrong shape/type"
 
         # Check if AMP is enabled (scaler exists)
         amp_enabled = self.scaler is not None and self.device == "cuda"
@@ -711,7 +756,8 @@ class RainbowDQNAgent:
         # Update priorities in PER using the TD errors (ensure they are positive)
         # Add a small epsilon to prevent priorities of 0
         priorities = td_errors_tensor.cpu().numpy() + 1e-6
-        assert np.isfinite(priorities).all(), "Non-finite priorities calculated for PER update"
+        if not np.isfinite(priorities).all():
+            raise FloatingPointError("Non-finite priorities calculated for PER update")
         self.buffer.update_priorities(tree_indices, td_errors_tensor)  # Pass tree_indices and the original tensor
 
         # Reset noise in Noisy Linear layers (important!)
@@ -725,7 +771,8 @@ class RainbowDQNAgent:
             logger.info(f"Step {self.total_steps}: Target network updated.")
 
         loss_item = loss.item()
-        assert isinstance(loss_item, float) and not np.isnan(loss_item) and not np.isinf(loss_item), "Final loss item is not a valid float"
+        if not isinstance(loss_item, float) or np.isnan(loss_item) or np.isinf(loss_item):
+            raise FloatingPointError("Final loss item is not a valid float")
 
         # Log loss and PER beta
         logger.debug(f"Step: {self.total_steps}, Loss: {loss_item:.4f}, PER Beta: {beta:.4f}")
@@ -901,6 +948,8 @@ class RainbowDQNAgent:
             logger.info(f"Agent model and associated states loaded successfully from {checkpoint_path}")
             self.network.to(self.device)
             self.target_network.to(self.device)
+            # Ensure target network is synchronised with the online network after loading
+            self._update_target_network()
             # Ensure optimizer state is also on the correct device after loading
             # This is generally handled by PyTorch, but good to be mindful of.
             return True  # Indicate success
@@ -1029,13 +1078,26 @@ class RainbowDQNAgent:
 
     def set_training_mode(self, training=True):
         """Sets the agent and network to training or evaluation mode."""
+        if training == self.training_mode:
+            return
+
         self.training_mode = training
+        self._apply_network_mode(training)
         mode = "TRAINING" if training else "EVALUATION"
         logger.info(f"Set agent to {mode} mode")
-        if self.network:
-            if training:
-                self.network.train()
-            else:
-                self.network.eval()
-                # Ensure target is also in eval mode (should be already, but safe)
+
+    def _apply_network_mode(self, training: bool) -> None:
+        if self.network is None:
+            return
+
+        if self._network_mode_training == training:
+            return
+
+        if training:
+            self.network.train()
+        else:
+            self.network.eval()
+            if self.target_network is not None:
                 self.target_network.eval()
+
+        self._network_mode_training = training

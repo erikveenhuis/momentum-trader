@@ -1,23 +1,105 @@
 @echo off
-REM Training shortcut for Momentum Trader - Resume Mode
-REM Double-click this file to resume training from the latest checkpoint
+REM Resume training shortcut for Momentum Trader
+REM Double-click this file to resume training from checkpoint
 
 REM Get the directory where this batch file is located
 cd /d "%~dp0"
 
-REM Check if virtual environment exists and activate it
-if exist "venv\Scripts\activate.bat" (
-    call venv\Scripts\activate.bat
-)
-
-REM Start training with resume flag
-echo Resuming training from latest checkpoint...
-echo.
-python -m momentum_train.run_training --config_path config/training_config.yaml --resume
-
-REM Keep window open if there's an error
-if errorlevel 1 (
+REM Check if virtual environment exists
+if not exist "venv\Scripts\activate.bat" (
+    echo ERROR: Virtual environment not found at venv\Scripts\activate.bat
+    echo Please run setup first or check your installation.
     echo.
-    echo Training ended with an error.
     pause
+    exit /b 1
 )
+
+REM Check if config file exists
+if not exist "config\training_config.yaml" (
+    echo ERROR: Training config file not found at config\training_config.yaml
+    echo Please ensure the config file exists.
+    echo.
+    pause
+    exit /b 1
+)
+
+REM Prevent PC from sleeping during training (monitor can sleep)
+echo Preventing system sleep during training (monitor can still sleep)...
+powercfg /change standby-timeout-ac 0 >nul 2>&1
+powercfg /change hibernate-timeout-ac 0 >nul 2>&1
+powercfg /change standby-timeout-dc 0 >nul 2>&1
+powercfg /change hibernate-timeout-dc 0 >nul 2>&1
+
+REM Check if virtual environment exists and activate it
+echo Activating virtual environment...
+call venv\Scripts\activate.bat
+if errorlevel 1 (
+    echo ERROR: Failed to activate virtual environment
+    echo Please check your virtual environment setup.
+    echo.
+    goto :cleanup_and_exit
+)
+
+REM Verify python is available and can import the module
+echo Checking if momentum_train module is available...
+python -c "import momentum_train.run_training" >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: Cannot import momentum_train.run_training module
+    echo Attempting to refresh editable packages automatically...
+    echo.
+    call refresh_packages.bat --no-pause
+    if errorlevel 1 (
+        echo ERROR: Automatic package refresh failed
+        echo Please run refresh_packages.bat manually and check for errors.
+        echo.
+        goto :cleanup_and_exit
+    )
+    echo.
+    echo Checking module import again after refresh...
+    python -c "import momentum_train.run_training" >nul 2>&1
+    if errorlevel 1 (
+        echo ERROR: Still cannot import momentum_train.run_training module after refresh
+        echo Please check the refresh logs above for errors.
+        echo.
+        goto :cleanup_and_exit
+    )
+    echo ✓ momentum_train module imported successfully after refresh
+)
+
+REM Start training with resume enabled in background
+echo.
+echo Resuming training from checkpoint in background...
+echo Training logs will be written to logs/training.log
+echo You can monitor progress by opening the "Momentum Trader Training (Resume)" window
+echo.
+start "Momentum Trader Training (Resume)" cmd /c "cd /d %~dp0 && call venv\Scripts\activate.bat && python -c \"import yaml; config = yaml.safe_load(open('config/training_config.yaml')); config['run']['resume'] = True; yaml.dump(config, open('config/training_config_resume.yaml', 'w'))\" && python -m momentum_train.run_training --config_path config/training_config_resume.yaml && echo. && echo Training completed successfully! && pause"
+
+REM Check if start command succeeded
+if errorlevel 1 (
+    echo ERROR: Failed to start training resume process
+    echo.
+    goto :cleanup_and_exit
+)
+
+REM Restore default power settings (monitor settings not changed)
+echo.
+echo Restoring default power settings...
+powercfg /change standby-timeout-ac 30 >nul 2>&1
+powercfg /change standby-timeout-dc 15 >nul 2>&1
+
+echo.
+echo SUCCESS: Training resumed in background!
+echo You can now close this window safely.
+echo.
+pause
+exit /b 0
+
+:cleanup_and_exit
+REM Restore default power settings on error
+echo Restoring default power settings...
+powercfg /change standby-timeout-ac 30 >nul 2>&1
+powercfg /change standby-timeout-dc 15 >nul 2>&1
+echo.
+echo Press any key to exit...
+pause >nul
+exit /b 1

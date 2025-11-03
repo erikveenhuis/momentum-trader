@@ -17,16 +17,19 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "momentum_agent==0.1.5",
-    "momentum_env==0.1.5",
+    "momentum_agent==0.1.6",
+    "momentum_env==0.1.6",
+    "momentum-core==0.1.0",
+    "alpaca-py>=0.14.0",
+    "numpy>=1.24",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "black==25.1.0",
-    "flake8==7.2.0",
-    "isort==6.0.1",
-    "pytest==8.3.5",
+    "black==25.9.0",
+    "flake8==7.3.0",
+    "isort==7.0.0",
+    "pytest==8.4.2",
 ]
 
 [tool.setuptools.packages.find]

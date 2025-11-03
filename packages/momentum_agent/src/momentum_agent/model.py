@@ -4,9 +4,9 @@ from typing import Any, Dict  # Added for type hinting
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from momentum_core.logging import get_logger
 
 from .constants import ACCOUNT_STATE_DIM
-from .utils.logging_config import get_logger
 
 # Get logger instance
 logger = get_logger("TransformerModel")
@@ -159,7 +159,8 @@ class RainbowNetwork(nn.Module):
 
         # --- Shared Feature Extractor (Similar to Actor/Critic start) ---
         self.feature_embedding = nn.Linear(self.n_features, self.hidden_dim)
-        self.pos_encoder = PositionalEncoding(self.hidden_dim, dropout=self.transformer_dropout, max_len=self.window_size)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.hidden_dim))
+        self.pos_encoder = PositionalEncoding(self.hidden_dim, dropout=self.transformer_dropout, max_len=self.window_size + 1)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.hidden_dim,
             nhead=self.nhead,  # Use config value
@@ -204,6 +205,7 @@ class RainbowNetwork(nn.Module):
                     nn.init.zeros_(m.bias)
             elif isinstance(m, NoisyLinear):
                 m.reset_parameters()
+        nn.init.zeros_(self.cls_token)
 
     def forward(self, market_data: torch.Tensor, account_state: torch.Tensor) -> torch.Tensor:
         # --- Input Asserts ---
@@ -227,19 +229,26 @@ class RainbowNetwork(nn.Module):
             self.window_size,
             self.hidden_dim,
         ), "market_emb shape mismatch"
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        market_emb = torch.cat([cls_tokens, market_emb], dim=1)
+        assert market_emb.shape == (
+            batch_size,
+            self.window_size + 1,
+            self.hidden_dim,
+        ), "market_emb shape with CLS token mismatch"
         market_emb = self.pos_encoder(market_emb)
         assert market_emb.shape == (
             batch_size,
-            self.window_size,
+            self.window_size + 1,
             self.hidden_dim,
         ), "market_emb shape after pos_encoder mismatch"
         market_features = self.transformer_encoder(market_emb)
         assert market_features.shape == (
             batch_size,
-            self.window_size,
+            self.window_size + 1,
             self.hidden_dim,
         ), "market_features shape mismatch"
-        market_agg = market_features[:, -1, :]
+        market_agg = market_features[:, 0, :]
         assert market_agg.shape == (
             batch_size,
             self.hidden_dim,

@@ -2,7 +2,7 @@ import random
 from pathlib import Path
 from typing import List
 
-from .utils.logging_config import get_logger
+from momentum_core.logging import get_logger
 
 # Get logger instance
 logger = get_logger("DataManager")

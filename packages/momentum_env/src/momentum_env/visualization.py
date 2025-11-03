@@ -1,11 +1,20 @@
 import time
+import warnings
 from typing import Any, Dict, List
 
 import matplotlib
+
+try:
+    matplotlib.use("TkAgg")  # Prefer TkAgg for interactive updates when available
+except Exception:  # pragma: no cover - backend availability depends on environment
+    warnings.warn(
+        "TkAgg backend not available; falling back to non-interactive 'Agg' backend for visualization.",
+        RuntimeWarning,
+    )
+    matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 import numpy as np
-
-matplotlib.use("TkAgg")  # Use TkAgg backend which is better for real-time updates
 
 
 class TradingVisualizer:
