@@ -72,7 +72,7 @@ echo Starting training in background...
 echo Training logs will be written to logs/training.log
 echo You can monitor progress by opening the "Momentum Trader Training" window
 echo.
-start "Momentum Trader Training" cmd /c "cd /d %~dp0 && call venv\Scripts\activate.bat && python -m momentum_train.run_training --config_path config/training_config.yaml && echo. && echo Training completed successfully! && pause"
+start "Momentum Trader Training" cmd /c "cd /d %~dp0 && call venv\Scripts\activate.bat && python -m momentum_train.run_training --config_path config/training_config.yaml && echo. && echo Training completed successfully! && echo Restoring default power settings... && powercfg /change standby-timeout-ac 30 >nul 2>&1 && powercfg /change standby-timeout-dc 15 >nul 2>&1 && echo Power settings restored. && pause"
 
 REM Check if start command succeeded
 if errorlevel 1 (
@@ -81,14 +81,9 @@ if errorlevel 1 (
     goto :cleanup_and_exit
 )
 
-REM Restore default power settings (monitor settings not changed)
 echo.
-echo Restoring default power settings...
-powercfg /change standby-timeout-ac 30 >nul 2>&1
-powercfg /change standby-timeout-dc 15 >nul 2>&1
-
-echo.
-echo SUCCESS: Training started in background!
+echo SUCCESS: Training started in background with sleep prevention enabled!
+echo Power settings will be restored when training completes.
 echo You can now close this window safely.
 echo.
 pause

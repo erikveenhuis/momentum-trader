@@ -2,11 +2,25 @@
 
 window_size: 60
 
+logging:
+  log_filename: training.log
+  root_level: INFO
+  console_level: INFO
+  file_level: INFO
+  level_overrides:
+    Trainer: INFO
+    Agent: INFO
+    DataManager: INFO
+    TransformerModel: INFO
+    Buffer: INFO
+    Metrics: INFO
+    Evaluation: INFO
+
 agent:
   # Core RL params
   gamma: 0.99
   lr: 0.0003 # Learning rate (reduced for stability with transformer backbone)
-  batch_size: 1024
+  batch_size: 2048
   replay_buffer_size: 500000
   target_update_freq: 600 # Learner steps per target sync (~1-2 trading days)
 
@@ -55,11 +69,11 @@ environment:
 
 trainer:
   seed: 42
-  warmup_steps: 50000     # Steps with random actions before training
-  update_freq: 4          # Agent learning update frequency (steps)
+  warmup_steps: 30000     # Steps with random actions before training
+  update_freq: 2          # Agent learning update frequency (steps)
   log_freq: 60            # Logging frequency (steps)
   validation_freq: 100     # Validation frequency (episodes)
-  checkpoint_save_freq: 100 # Checkpoint save frequency (episodes)
+  checkpoint_save_freq: 10 # Checkpoint save frequency (episodes)
   reward_window: 10       # Window for averaging episode rewards in logs
   early_stopping_patience: 15 # Episodes without validation improvement to stop
   min_validation_threshold: 0.0 # Minimum score change considered improvement

@@ -66,13 +66,47 @@ if errorlevel 1 (
     echo ✓ momentum_train module imported successfully after refresh
 )
 
+REM Check if checkpoint files exist for resuming
+echo Checking for available checkpoints...
+for %%f in ("models\checkpoint_trainer_*.pt") do (
+    goto :found_checkpoint
+)
+echo No checkpoint files found.
+goto :no_checkpoints
+
+:no_checkpoints
+    echo.
+    echo ====================================================
+    echo   ❌ NO CHECKPOINTS FOUND FOR RESUME
+    echo ====================================================
+    echo.
+    echo The resume feature requires checkpoint files to continue training.
+    echo Checkpoints are automatically saved during training based on:
+    echo   - checkpoint_save_freq setting in config/training_config.yaml
+    echo   - Currently set to save every 10 episodes
+    echo.
+    echo To create checkpoints for resuming:
+    echo   1. Start fresh training with start_training.bat
+    echo   2. Let it run for at least 10 episodes to save first checkpoint
+    echo   3. Interrupt training manually (Ctrl+C) to create resume point
+    echo   4. Then use start_training_resume.bat to continue
+    echo.
+    echo Alternatively, reduce checkpoint_save_freq in config/training_config.yaml
+    echo for more frequent saves during training.
+    echo.
+    goto :cleanup_and_exit
+
+:found_checkpoint
+goto :start_training
+
 REM Start training with resume enabled in background
+:start_training
 echo.
-echo Resuming training from checkpoint in background...
+echo Found checkpoint files! Resuming training from checkpoint in background...
 echo Training logs will be written to logs/training.log
 echo You can monitor progress by opening the "Momentum Trader Training (Resume)" window
 echo.
-start "Momentum Trader Training (Resume)" cmd /c "cd /d %~dp0 && call venv\Scripts\activate.bat && python -c \"import yaml; config = yaml.safe_load(open('config/training_config.yaml')); config['run']['resume'] = True; yaml.dump(config, open('config/training_config_resume.yaml', 'w'))\" && python -m momentum_train.run_training --config_path config/training_config_resume.yaml && echo. && echo Training completed successfully! && pause"
+start "Momentum Trader Training (Resume)" cmd /c "cd /d %~dp0 && call venv\Scripts\activate.bat && python -m momentum_train.run_training --config_path config/training_config.yaml --resume && echo. && echo Training completed successfully! && echo Restoring default power settings... && powercfg /change standby-timeout-ac 30 >nul 2>&1 && powercfg /change standby-timeout-dc 15 >nul 2>&1 && echo Power settings restored. && pause"
 
 REM Check if start command succeeded
 if errorlevel 1 (
@@ -81,21 +115,16 @@ if errorlevel 1 (
     goto :cleanup_and_exit
 )
 
-REM Restore default power settings (monitor settings not changed)
 echo.
-echo Restoring default power settings...
-powercfg /change standby-timeout-ac 30 >nul 2>&1
-powercfg /change standby-timeout-dc 15 >nul 2>&1
-
-echo.
-echo SUCCESS: Training resumed in background!
+echo SUCCESS: Training resumed in background with sleep prevention enabled!
+echo Power settings will be restored when training completes.
 echo You can now close this window safely.
 echo.
 pause
 exit /b 0
 
 :cleanup_and_exit
-REM Restore default power settings on error
+REM Restore default power settings on error (only if we changed them)
 echo Restoring default power settings...
 powercfg /change standby-timeout-ac 30 >nul 2>&1
 powercfg /change standby-timeout-dc 15 >nul 2>&1

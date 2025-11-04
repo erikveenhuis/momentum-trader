@@ -63,7 +63,6 @@ def test_end_to_end_training_validation_and_testing(tmp_path):
     TRAIN_EPISODES = 10
     VALIDATION_FILES = 5
     TEST_FILES = 3
-    MAX_ROWS_PER_FILE = 600
 
     processed_dir = tmp_path / "processed"
     train_dir = processed_dir / "train"
@@ -77,21 +76,18 @@ def test_end_to_end_training_validation_and_testing(tmp_path):
         train_dir,
         count=TRAIN_EPISODES,
         rng=rng,
-        max_rows=MAX_ROWS_PER_FILE,
     )
     _copy_random_files(
         production_processed_dir / "validation",
         val_dir,
         count=VALIDATION_FILES,
         rng=rng,
-        max_rows=MAX_ROWS_PER_FILE,
     )
     _copy_random_files(
         production_processed_dir / "test",
         test_dir,
         count=TEST_FILES,
         rng=rng,
-        max_rows=MAX_ROWS_PER_FILE,
     )
 
     data_manager = DataManager(base_dir=str(tmp_path))

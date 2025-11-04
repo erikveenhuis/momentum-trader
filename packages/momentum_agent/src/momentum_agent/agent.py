@@ -44,7 +44,7 @@ class RainbowDQNAgent:
             scaler (GradScaler | None): Optional GradScaler for AMP.
         """
         self.config = config
-        self.device = device
+        self.device = self._resolve_device(device)
         # Use direct access for mandatory parameters
         self.seed = config["seed"]
         self.gamma = config["gamma"]
@@ -74,20 +74,20 @@ class RainbowDQNAgent:
         np.random.seed(self.seed)
         random.seed(self.seed)
         torch.manual_seed(self.seed)
-        if self.device == "cuda" and torch.cuda.is_available():
+
+        if self.device.type == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.cuda.manual_seed(self.seed)
-            torch.cuda.manual_seed_all(self.seed)  # for multi-GPU
+            torch.cuda.manual_seed_all(self.seed)
             logger.info(f"CUDA seed set. AMP Enabled: {self.scaler is not None}")
-        elif self.device == "cuda":
-            logger.warning("CUDA device requested but not available. Using CPU.")
-            self.device = "cpu"
-            self.scaler = None  # Ensure scaler is None if not on CUDA
-            logger.info("Agent on CPU. AMP Disabled.")
         else:
+            if self.scaler is not None:
+                logger.info("GradScaler provided for non-CUDA device; disabling AMP.")
+                self.scaler = None
             logger.info("Agent on CPU. AMP Disabled.")
 
         logger.info(f"Initializing RainbowDQNAgent on {self.device}")
+        logger.info(f"Device type: {self.device.type}, CUDA available: {torch.cuda.is_available()}")
         logger.info(f"Config: {config}")  # Log the entire config
 
         # Distributional RL setup
@@ -123,12 +123,53 @@ class RainbowDQNAgent:
         self.target_network.load_state_dict(self.network.state_dict())
         self.target_network.eval()  # Target network is not trained directly
 
+        # Enable torch.compile for PyTorch 2.8+ with improved error handling
+        # if hasattr(torch, 'compile'):
+        #     logger.info("Attempting to apply torch.compile to network and target_network.")
+        #     compile_success = False
+
+        #     # Try different compilation modes in order of preference
+        #     compile_modes = ["default", "reduce-overhead", "max-autotune"]
+
+        #     for mode in compile_modes:
+        #         try:
+        #             logger.info(f"Trying torch.compile with mode='{mode}'...")
+        #             self.network = torch.compile(self.network, mode=mode)
+        #             self.target_network = torch.compile(self.target_network, mode=mode)
+
+        #             # Test compilation by running a small forward pass
+        #             with torch.no_grad():
+        #                 test_market = torch.zeros((1, self.window_size, self.n_features), device=self.device)
+        #                 test_account = torch.zeros((1, 2), device=self.device)
+        #                 _ = self.network(test_market, test_account)
+
+        #             logger.info(f"torch.compile applied successfully with mode='{mode}'.")
+        #             compile_success = True
+        #             break
+
+        #         except ImportError as imp_err:
+        #             logger.warning(f"torch.compile mode '{mode}' failed due to import issue: {imp_err}.")
+        #         except RuntimeError as runtime_err:
+        #             # Handle cases where compilation fails due to backend issues
+        #             if "Triton" in str(runtime_err) or "triton" in str(runtime_err).lower():
+        #                 logger.warning(f"torch.compile mode '{mode}' failed due to Triton backend issues: {runtime_err}. This is common on Windows.")
+        #             else:
+        #                 logger.warning(f"torch.compile mode '{mode}' failed with runtime error: {runtime_err}.")
+        #         except Exception as e:
+        #             logger.warning(f"torch.compile mode '{mode}' failed with unexpected error: {e}.")
+
+        #     if not compile_success:
+        #         logger.warning("All torch.compile modes failed. Proceeding without compilation. This is normal on some platforms (e.g., Windows without Triton).")
+        # else:
+        #     logger.warning("torch.compile not available in this PyTorch version.")
+
         # Optimizer
         self.optimizer = optim.Adam(self.network.parameters(), lr=self.lr)
 
         # Learning Rate Scheduler Initialization (moved after optimizer init)
         self.lr_scheduler_enabled = self.config.get("lr_scheduler_enabled", False)  # Get from self.config
         self.scheduler = None
+        self._scheduler_requires_metric = False
         if self.lr_scheduler_enabled:
             scheduler_type = self.config.get("lr_scheduler_type", "StepLR")
             scheduler_params = self.config.get("lr_scheduler_params", {})
@@ -144,6 +185,7 @@ class RainbowDQNAgent:
                         self.lr_scheduler_enabled = False
                     else:
                         self.scheduler = lr_scheduler.StepLR(self.optimizer, step_size=step_size, gamma=gamma)
+                        self._scheduler_requires_metric = False
                 elif scheduler_type == "CosineAnnealingLR":
                     t_max = scheduler_params.get("T_max")
                     eta_min = scheduler_params.get("min_lr", 0)  # min_lr maps to eta_min
@@ -152,6 +194,7 @@ class RainbowDQNAgent:
                         self.lr_scheduler_enabled = False
                     else:
                         self.scheduler = lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=t_max, eta_min=eta_min)
+                        self._scheduler_requires_metric = False
                 # Add other schedulers like ReduceLROnPlateau if needed, with similar param checks
                 elif scheduler_type == "ReduceLROnPlateau":
                     # Parameters for ReduceLROnPlateau
@@ -170,6 +213,7 @@ class RainbowDQNAgent:
                         min_lr=min_lr,
                     )
                     logger.info(f"Initialized ReduceLROnPlateau with mode='{mode}', factor={factor}, patience={patience}")
+                    self._scheduler_requires_metric = True
                 else:
                     logger.warning(f"Unsupported scheduler type: {scheduler_type}. No scheduler will be used.")
                     self.lr_scheduler_enabled = False
@@ -191,6 +235,7 @@ class RainbowDQNAgent:
             self.alpha,
             self.beta_start,
             self.beta_frames,
+            debug=self.debug_mode,
         )
         # For N-step returns
         self.n_step_buffer = deque(maxlen=self.n_steps)
@@ -204,10 +249,11 @@ class RainbowDQNAgent:
         self.training_mode = True  # Start in training mode by default
         self._network_mode_training: bool | None = None
         self._apply_network_mode(self.training_mode)
-        self._non_blocking_copy = self.device == "cuda" and torch.cuda.is_available()
+        self._non_blocking_copy = self.device.type == "cuda" and torch.cuda.is_available()
         self._market_tensor = torch.zeros((1, self.window_size, self.n_features), device=self.device, dtype=torch.float32)
         self._account_tensor = torch.zeros((1, ACCOUNT_STATE_DIM), device=self.device, dtype=torch.float32)
         self.total_steps = 0  # Track total steps for target network updates and beta annealing
+        self.last_td_error_stats: dict[str, float] | None = None
 
     def select_action(self, obs):
         """Selects action based on the current Q-value estimates using Noisy Nets."""
@@ -249,7 +295,7 @@ class RainbowDQNAgent:
         if self.training_mode and hasattr(self.network, "reset_noise"):
             self.network.reset_noise()
 
-        autocast_enabled = self.device == "cuda" and torch.cuda.is_available()
+        autocast_enabled = self.device.type == "cuda" and torch.cuda.is_available()
 
         with torch.inference_mode():
             with autocast("cuda", enabled=autocast_enabled):
@@ -264,6 +310,32 @@ class RainbowDQNAgent:
                 assert isinstance(action, int), f"Selected action is not an integer: {action}"
                 assert 0 <= action < self.num_actions, f"Selected action ({action}) is out of bounds [0, {self.num_actions})"
         return action
+
+    def _resolve_device(self, requested_device) -> torch.device:
+        """Normalizes the requested device into a torch.device, falling back to CPU if needed."""
+        if isinstance(requested_device, torch.device):
+            resolved = requested_device
+        elif isinstance(requested_device, str):
+            try:
+                resolved = torch.device(requested_device)
+            except (TypeError, RuntimeError) as exc:
+                logger.warning(
+                    "Invalid device string '%s' (%s). Falling back to CPU.",
+                    requested_device,
+                    exc,
+                )
+                resolved = torch.device("cpu")
+        elif requested_device is None:
+            resolved = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            logger.warning(f"Unsupported device specification '{requested_device}'. Falling back to CPU.")
+            resolved = torch.device("cpu")
+
+        if resolved.type == "cuda" and not torch.cuda.is_available():
+            logger.warning("CUDA device requested but not available. Falling back to CPU.")
+            resolved = torch.device("cpu")
+
+        return resolved
 
     def _get_n_step_info(self, steps: int | None = None):
         """
@@ -672,6 +744,14 @@ class RainbowDQNAgent:
             assert torch.isfinite(td_errors_tensor).all(), "NaN or Inf found in TD errors tensor"
         # ----------------------------------------- #
 
+        td_errors_np = td_errors_tensor.detach().cpu().numpy()
+        td_mean = float(td_errors_np.mean())
+        td_std = float(td_errors_np.std())
+        self.last_td_error_stats = {
+            "mean": td_mean,
+            "std": td_std,
+        }
+
         return loss, td_errors_tensor
 
     def learn(self):
@@ -697,8 +777,14 @@ class RainbowDQNAgent:
                 self.batch_size,
             ), "TD errors tensor from _compute_loss has wrong shape/type"
 
+        # Log GPU memory usage if using CUDA (less frequently to reduce log spam)
+        if self.device.type == "cuda" and torch.cuda.is_available() and self.total_steps % 100 == 0:
+            allocated = torch.cuda.memory_allocated(self.device) / 1024**2
+            reserved = torch.cuda.memory_reserved(self.device) / 1024**2
+            logger.debug(f"GPU Memory - Allocated: {allocated:.1f} MB, Reserved: {reserved:.1f} MB")
+
         # Check if AMP is enabled (scaler exists)
-        amp_enabled = self.scaler is not None and self.device == "cuda"
+        amp_enabled = self.scaler is not None and self.device.type == "cuda"
 
         # Optimize the model
         self.optimizer.zero_grad()
@@ -739,19 +825,8 @@ class RainbowDQNAgent:
             # Standard optimizer step
             self.optimizer.step()
 
-        # Step the scheduler if it's enabled and not ReduceLROnPlateau (which needs a metric)
-        if self.scheduler and self.lr_scheduler_enabled:
-            # ReduceLROnPlateau is stepped with a metric, e.g., validation loss.
-            # Other schedulers like StepLR, CosineAnnealingLR are typically stepped per optimizer step or epoch.
-            # Assuming per-optimizer-step for now for StepLR and CosineAnnealingLR.
-            # If your chosen scheduler (e.g., ReduceLROnPlateau) needs a metric,
-            # this call will need to be moved or conditionally executed based on the scheduler type
-            # and the metric passed to scheduler.step(metric).
-            if not isinstance(self.scheduler, lr_scheduler.ReduceLROnPlateau):
-                self.scheduler.step()
-            # For logging current LR
-            # current_lr = self.optimizer.param_groups[0]['lr']
-            # logger.debug(f"Current LR: {current_lr}")
+        # Step LR scheduler when appropriate (no-op for schedulers that require validation metrics)
+        self._step_scheduler()
 
         # Update priorities in PER using the TD errors (ensure they are positive)
         # Add a small epsilon to prevent priorities of 0
@@ -766,6 +841,13 @@ class RainbowDQNAgent:
 
         # Increment step counter and update target network periodically
         self.total_steps += 1
+        if self.last_td_error_stats is not None and self.total_steps % 100 == 0:
+            logger.info(
+                "TD error stats at learn step %s - mean: %.6f, std: %.6f",
+                self.total_steps,
+                self.last_td_error_stats.get("mean", float("nan")),
+                self.last_td_error_stats.get("std", float("nan")),
+            )
         if self.total_steps % self.target_update_freq == 0:
             self._update_target_network()
             logger.info(f"Step {self.total_steps}: Target network updated.")
@@ -781,33 +863,51 @@ class RainbowDQNAgent:
         # Log every 60 agent learning steps if the window has data
         if self.total_steps % 60 == 0 and len(self.n_step_reward_window) > 0:
             try:
-                min_r = min(self.n_step_reward_window)
-                max_r = max(self.n_step_reward_window)
-                logger.info(f"N-Step Reward Window (last {len(self.n_step_reward_window)} learns): Min={min_r:.4f}, Max={max_r:.4f}")
+                rewards_array = np.fromiter(self.n_step_reward_window, dtype=float)
+                min_r = float(rewards_array.min())
+                max_r = float(rewards_array.max())
+                mean_r = float(rewards_array.mean())
+                std_r = float(rewards_array.std(ddof=0))
+                logger.info(
+                    "N-Step Reward Window (last %s learns): Min=%.4f, Max=%.4f, Mean=%.4f, Std=%.4f",
+                    len(self.n_step_reward_window),
+                    min_r,
+                    max_r,
+                    mean_r,
+                    std_r,
+                )
             except ValueError:
                 # Should not happen if len > 0, but safeguard
-                logger.warning("Could not calculate min/max for n-step reward window.")
+                logger.warning("Could not calculate statistics for n-step reward window.")
         # --- END ADDED ---
 
         return loss_item  # Return loss for external logging/monitoring
 
-    def step_lr_scheduler(self, metric: float):
-        """Steps the learning rate scheduler if it's ReduceLROnPlateau and a metric is provided."""
-        if self.scheduler and self.lr_scheduler_enabled and isinstance(self.scheduler, lr_scheduler.ReduceLROnPlateau):
-            try:
-                current_lr = self.optimizer.param_groups[0]["lr"]
+    def _step_scheduler(self, metric: float | None = None) -> bool:
+        """Internal helper that steps the scheduler when conditions are satisfied."""
+        if not self.scheduler or not self.lr_scheduler_enabled:
+            return False
+
+        try:
+            if self._scheduler_requires_metric:
+                if metric is None:
+                    return False
                 self.scheduler.step(metric)
-                new_lr = self.optimizer.param_groups[0]["lr"]
-                if new_lr < current_lr:
-                    logger.info(
-                        f"LR scheduler 'ReduceLROnPlateau' stepped. LR reduced from {current_lr} to {new_lr} based on metric: {metric:.4f}"
-                    )
-                else:
-                    logger.debug(f"LR scheduler 'ReduceLROnPlateau' stepped with metric: {metric:.4f}. LR unchanged: {current_lr}")
-            except Exception as e:
-                logger.error(f"Error stepping ReduceLROnPlateau scheduler: {e}", exc_info=True)
-        elif self.scheduler and self.lr_scheduler_enabled:
-            logger.debug(f"LR scheduler is enabled but is not ReduceLROnPlateau. Not stepping with metric. Type: {type(self.scheduler)}")
+            else:
+                self.scheduler.step()
+            return True
+        except Exception as error:
+            logger.error("Failed to step LR scheduler: %s", error, exc_info=True)
+            return False
+
+    def step_lr_scheduler(self, metric: float):
+        """Public hook to step schedulers that require an evaluation metric."""
+        stepped = self._step_scheduler(metric)
+        if not stepped and self.scheduler and self.lr_scheduler_enabled and not self._scheduler_requires_metric:
+            logger.debug(
+                "step_lr_scheduler called with metric for scheduler type %s that does not require one.",
+                type(self.scheduler),
+            )
 
     def _update_target_network(self):
         """Copies weights from online network to target network."""

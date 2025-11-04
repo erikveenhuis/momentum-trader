@@ -29,11 +29,12 @@ class SumTree:
 
     write = 0  # Current position in the data array (leaves)
 
-    def __init__(self, capacity: int):
+    def __init__(self, capacity: int, *, debug: bool = False):
         self.capacity = capacity
         self.tree = np.zeros(2 * capacity - 1)  # Stores priorities (internal nodes are sums)
         self.data_indices = np.zeros(capacity, dtype=int)  # Maps tree leaf index to data index in buffer
         self.size = 0  # Current number of items stored
+        self.debug = debug
 
     def _propagate(self, idx: int, change: float):
         """Propagates priority change up the tree."""
@@ -76,7 +77,10 @@ class SumTree:
 
     def get(self, s: float) -> tuple[int, float, int]:
         """Samples a leaf node based on cumulative priority s."""
-        assert s >= 0.0 and s <= self.total() + 1e-6, f"Sample value {s} out of range [0, {self.total()}]"
+        if self.debug:
+            total = self.total()
+            if not (0.0 <= s <= total + 1e-6):
+                raise ValueError(f"Sample value {s} out of range [0, {total}]")
         idx = self._retrieve(0, s)
         data_idx_ptr = idx - self.capacity + 1  # Map tree leaf index back to data index pointer (0 to capacity-1)
         return (idx, self.tree[idx], self.data_indices[data_idx_ptr])
@@ -91,17 +95,18 @@ class SumTree:
 # --- Start: Prioritized Replay Buffer (PER) ---
 # Simplified PER implementation (SumTree can be more efficient for large buffers)
 class PrioritizedReplayBuffer:
-    def __init__(self, capacity, alpha=0.6, beta_start=0.4, beta_frames=100000):
+    def __init__(self, capacity, alpha=0.6, beta_start=0.4, beta_frames=100000, *, debug: bool = False):
         self.epsilon = 1e-5  # Small constant to ensure non-zero priority
         self.capacity = capacity
         self.alpha = alpha  # Priority exponent
         self.beta_start = beta_start  # Initial IS exponent
         self.beta_frames = beta_frames
         self.buffer = deque(maxlen=capacity)  # Stores Experience objects
-        self.tree = SumTree(capacity)  # Manages priorities
+        self.tree = SumTree(capacity, debug=debug)  # Manages priorities
         self.beta = beta_start  # Current beta value, updated externally
         self.max_priority = 1.0  # Track max priority efficiently
         self.buffer_write_idx = 0  # Tracks current write position in self.buffer
+        self.debug = debug
 
     def update_beta(self, total_steps: int):
         """Updates the beta value based on the total training steps."""
@@ -138,7 +143,8 @@ class PrioritizedReplayBuffer:
         priorities = []
         segment = self.tree.total() / batch_size
         # Ensure beta is up-to-date (though agent should call update_beta)
-        assert 0.0 <= self.beta <= 1.0, f"Invalid beta value: {self.beta}"
+        if self.debug and not (0.0 <= self.beta <= 1.0):
+            raise ValueError(f"Invalid beta value: {self.beta}")
         for i in range(batch_size):
             a = segment * i
             b = segment * (i + 1)
@@ -156,11 +162,14 @@ class PrioritizedReplayBuffer:
         weights = (N * sampling_probabilities) ** (-self.beta)
         # Normalize by max weight for stability
         max_weight = weights.max() if weights.size > 0 else 1.0
-        assert max_weight > 1e-9, f"Max IS weight is zero or negative ({max_weight})"
+        if self.debug and max_weight <= 1e-9:
+            raise ValueError(f"Max IS weight is zero or negative ({max_weight})")
         weights /= max_weight  # Normalize for stability
         weights = np.array(weights, dtype=np.float32)
-        assert weights.shape == (batch_size,), f"IS weights shape mismatch. Expected ({batch_size},), got {weights.shape}"
-        assert np.all(weights >= 0) and np.all(weights <= 1.0 + 1e-6), "IS weights are outside [0, 1] range"  # Allow small tolerance
+        if self.debug and weights.shape != (batch_size,):
+            raise ValueError(f"IS weights shape mismatch. Expected ({batch_size},), got {weights.shape}")
+        if self.debug and (np.any(weights < 0) or np.any(weights > 1.0 + 1e-6)):
+            raise ValueError("IS weights are outside [0, 1] range")
 
         # Unzip samples
         (
@@ -174,18 +183,29 @@ class PrioritizedReplayBuffer:
         ) = zip(*samples)
 
         # --- Start: Add assertions for sampled data types and basic structure ---
-        assert len(market_data) == batch_size, "Incorrect number of market_data samples"
-        assert len(account_state) == batch_size, "Incorrect number of account_state samples"
-        assert len(actions) == batch_size, "Incorrect number of action samples"
-        assert len(rewards) == batch_size, "Incorrect number of reward samples"
-        assert len(next_market_data) == batch_size, "Incorrect number of next_market_data samples"
-        assert len(next_account_state) == batch_size, "Incorrect number of next_account_state samples"
-        assert len(dones) == batch_size, "Incorrect number of done samples"
-        # Check types (assuming they are stored as numpy arrays originally)
-        assert all(isinstance(x, np.ndarray) for x in market_data), "Market data samples are not all numpy arrays"
-        assert all(isinstance(x, np.ndarray) for x in account_state), "Account state samples are not all numpy arrays"
-        assert all(isinstance(x, np.ndarray) for x in next_market_data), "Next market data samples are not all numpy arrays"
-        assert all(isinstance(x, np.ndarray) for x in next_account_state), "Next account state samples are not all numpy arrays"
+        if self.debug:
+            if len(market_data) != batch_size:
+                raise ValueError("Incorrect number of market_data samples")
+            if len(account_state) != batch_size:
+                raise ValueError("Incorrect number of account_state samples")
+            if len(actions) != batch_size:
+                raise ValueError("Incorrect number of action samples")
+            if len(rewards) != batch_size:
+                raise ValueError("Incorrect number of reward samples")
+            if len(next_market_data) != batch_size:
+                raise ValueError("Incorrect number of next_market_data samples")
+            if len(next_account_state) != batch_size:
+                raise ValueError("Incorrect number of next_account_state samples")
+            if len(dones) != batch_size:
+                raise ValueError("Incorrect number of done samples")
+            if not all(isinstance(x, np.ndarray) for x in market_data):
+                raise TypeError("Market data samples are not all numpy arrays")
+            if not all(isinstance(x, np.ndarray) for x in account_state):
+                raise TypeError("Account state samples are not all numpy arrays")
+            if not all(isinstance(x, np.ndarray) for x in next_market_data):
+                raise TypeError("Next market data samples are not all numpy arrays")
+            if not all(isinstance(x, np.ndarray) for x in next_account_state):
+                raise TypeError("Next account state samples are not all numpy arrays")
         # --- End: Add assertions for sampled data types and basic structure ---
 
         return (
@@ -204,17 +224,23 @@ class PrioritizedReplayBuffer:
 
     def update_priorities(self, tree_indices, batch_priorities_tensor):
         """Updates priorities of sampled transitions using a tensor of priorities."""
-        assert isinstance(batch_priorities_tensor, torch.Tensor), "batch_priorities must be a tensor"
-        assert len(tree_indices) == len(batch_priorities_tensor), "Indices and priorities length mismatch in update_priorities"
+        if self.debug and not isinstance(batch_priorities_tensor, torch.Tensor):
+            raise TypeError("batch_priorities must be a tensor")
+        if self.debug and len(tree_indices) != len(batch_priorities_tensor):
+            raise ValueError("Indices and priorities length mismatch in update_priorities")
 
         td_errors = batch_priorities_tensor.detach().cpu().numpy()
         # Calculate new priorities: |TD_error|**alpha + epsilon
         new_priorities = (np.abs(td_errors) + self.epsilon) ** self.alpha
-        assert np.all(new_priorities > 0), f"New priority calculated is non-positive: min={new_priorities.min()}"
+        if self.debug and np.any(new_priorities <= 0):
+            raise ValueError(f"New priority calculated is non-positive: min={new_priorities.min()}")
 
         # Update priorities in the deque
         for tree_idx, priority in zip(tree_indices, new_priorities):
-            assert priority > 0
+            if priority <= 0:
+                if self.debug:
+                    raise ValueError("Encountered non-positive priority during update")
+                priority = self.epsilon
             self.tree.update(tree_idx, priority)
 
         # Calculate max priority in the current batch and update overall max
@@ -289,7 +315,8 @@ class PrioritizedReplayBuffer:
         # self.capacity is checked above
 
         # Sanity check after loading
-        assert len(self.buffer) == self.tree.size, "Buffer deque length doesn't match SumTree size after load"
+        if self.debug and len(self.buffer) != self.tree.size:
+            raise ValueError("Buffer deque length doesn't match SumTree size after load")
 
     def __len__(self):
         # Return the current fill size of the buffer/tree

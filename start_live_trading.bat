@@ -29,12 +29,25 @@ set ALPACA_PAPER_TRADING=true
 echo ✅ Credentials configured (Paper Trading: %ALPACA_PAPER_TRADING%)
 echo.
 
+REM Prevent PC from sleeping during live trading (monitor can sleep)
+echo Preventing system sleep during live trading (monitor can still sleep)...
+powercfg /change standby-timeout-ac 0 >nul 2>&1
+powercfg /change hibernate-timeout-ac 0 >nul 2>&1
+powercfg /change standby-timeout-dc 0 >nul 2>&1
+powercfg /change hibernate-timeout-dc 0 >nul 2>&1
+echo.
+
 REM Check if virtual environment exists and activate it
 echo Activating virtual environment...
 call venv\Scripts\activate.bat
 if errorlevel 1 (
     echo ERROR: Failed to activate virtual environment
     echo Please check your virtual environment setup.
+    echo.
+    echo Restoring default power settings...
+    powercfg /change standby-timeout-ac 30 >nul 2>&1
+    powercfg /change standby-timeout-dc 15 >nul 2>&1
+    echo Power settings restored.
     echo.
     pause
     exit /b 1
@@ -52,6 +65,11 @@ if errorlevel 1 (
         echo ERROR: Automatic package refresh failed
         echo Please run refresh_packages.bat manually and check for errors.
         echo.
+        echo Restoring default power settings...
+        powercfg /change standby-timeout-ac 30 >nul 2>&1
+        powercfg /change standby-timeout-dc 15 >nul 2>&1
+        echo Power settings restored.
+        echo.
         pause
         exit /b 1
     )
@@ -61,6 +79,11 @@ if errorlevel 1 (
     if errorlevel 1 (
         echo ERROR: Still cannot import momentum_live.cli module after refresh
         echo Please check the refresh logs above for errors.
+        echo.
+        echo Restoring default power settings...
+        powercfg /change standby-timeout-ac 30 >nul 2>&1
+        powercfg /change standby-timeout-dc 15 >nul 2>&1
+        echo Power settings restored.
         echo.
         pause
         exit /b 1
@@ -78,4 +101,9 @@ python -m momentum_live.cli --symbols BTC/USD,ETH/USD --log-level INFO
 
 echo.
 echo Live trading session ended.
+echo Restoring default power settings...
+powercfg /change standby-timeout-ac 30 >nul 2>&1
+powercfg /change standby-timeout-dc 15 >nul 2>&1
+echo Power settings restored.
+echo.
 pause

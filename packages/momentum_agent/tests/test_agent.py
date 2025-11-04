@@ -93,13 +93,14 @@ def test_agent_initialization(agent, default_config):
     assert agent.buffer.capacity == default_config["replay_buffer_size"]
     assert agent.total_steps == 0
     assert agent.training_mode is True
-    assert agent.device == ("cuda" if torch.cuda.is_available() else "cpu")  # Verify device used
+    expected_device_type = "cuda" if torch.cuda.is_available() else "cpu"
+    assert agent.device.type == expected_device_type  # Verify device used
 
     # Check network parameters are on the correct device
     for param in agent.network.parameters():
-        assert str(param.device).startswith(agent.device)
+        assert param.device.type == agent.device.type
     for param in agent.target_network.parameters():
-        assert str(param.device).startswith(agent.device)
+        assert param.device.type == agent.device.type
 
 
 @pytest.mark.unittest

@@ -9,6 +9,7 @@ import sys  # Added sys module
 import time  # Added for timestamping log directories
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict
 
 import numpy as np
 import torch
@@ -41,24 +42,47 @@ sys.path.insert(0, str(project_root))
 logger = get_logger("momentum_train.Main")
 
 
-def configure_logging(log_level: str | None = None) -> None:
+DEFAULT_LOG_LEVEL_OVERRIDES: Dict[str, Any] = {
+    "momentum_train.Main": logging.INFO,
+    "Trainer": logging.INFO,
+    "Agent": logging.INFO,
+    "DataManager": logging.INFO,
+    "TransformerModel": logging.INFO,
+    "Buffer": logging.INFO,
+    "Metrics": logging.INFO,
+    "Evaluation": logging.INFO,
+}
+
+
+def configure_logging(cli_log_level: str | None = None, config: Dict[str, Any] | None = None) -> None:
     """Configure logging for the momentum_train package."""
+
+    config = config or {}
+
+    log_filename = config.get("log_filename", "training.log")
+    logs_dir = config.get("logs_dir")
+
+    # Determine base levels, allowing CLI to take precedence when provided.
+    root_level = cli_log_level or config.get("root_level", logging.INFO)
+    console_level = cli_log_level or config.get("console_level", root_level)
+    file_level = cli_log_level or config.get("file_level", root_level)
+
+    # Merge default overrides with config-specified overrides (config wins)
+    level_overrides = DEFAULT_LOG_LEVEL_OVERRIDES.copy()
+    config_overrides = config.get("level_overrides") or {}
+    if isinstance(config_overrides, dict):
+        level_overrides.update(config_overrides)
+    else:
+        logger.warning("logging.level_overrides must be a dictionary; ignoring provided value.")
 
     setup_package_logging(
         "momentum_train",
-        log_filename="training.log",
-        root_level=log_level if log_level is not None else logging.INFO,
-        console_level=log_level if log_level is not None else logging.INFO,
-        level_overrides={
-            "momentum_train.Main": logging.INFO,
-            "Trainer": logging.INFO,
-            "Agent": logging.INFO,
-            "DataManager": logging.INFO,
-            "TransformerModel": logging.INFO,
-            "Buffer": logging.INFO,
-            "Metrics": logging.INFO,
-            "Evaluation": logging.INFO,
-        },
+        log_filename=log_filename,
+        root_level=root_level,
+        console_level=console_level,
+        file_level=file_level,
+        logs_dir=logs_dir,
+        level_overrides=level_overrides,
     )
 
 
@@ -89,9 +113,11 @@ def evaluate_on_test_data(agent: RainbowDQNAgent, trainer: RainbowTrainerModule,
     episode_scores = []
 
     try:
-        for test_file in test_files:
+        for i, test_file in enumerate(test_files):
             try:
-                result = trainer._validate_single_file(test_file)
+                result = trainer._validate_single_file(
+                    test_file, validation_episode=i, total_validation_episodes=len(test_files), context="test"
+                )
             except Exception as exc:  # Defensive: _validate_single_file already catches most errors
                 logger.error(f"Unexpected error while evaluating {test_file.name}: {exc}")
                 continue
@@ -409,7 +435,6 @@ def main():  # Remove default config_path
     try:
         with open(config_path, "r") as f:
             config = yaml.safe_load(f)
-        logger.info(f"Configuration loaded successfully from {config_path}")
     except FileNotFoundError:
         logger.error(f"Configuration file not found at {config_path}. Exiting.")
         return
@@ -419,6 +444,11 @@ def main():  # Remove default config_path
     except Exception as e:
         logger.error(f"An unexpected error occurred loading config: {e}. Exiting.")
         return
+
+    # Reconfigure logging if the config supplies overrides (CLI takes precedence)
+    logging_config = config.get("logging") if isinstance(config, dict) else None
+    configure_logging(args.log_level, logging_config)
+    logger.info(f"Configuration loaded successfully from {config_path}")
 
     # --- Extract sections and parameters ---
     # Expect these sections to exist

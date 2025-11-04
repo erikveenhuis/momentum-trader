@@ -44,6 +44,14 @@ if not exist "models\runs" (
     exit /b 1
 )
 
+REM Prevent PC from sleeping during TensorBoard session (monitor can sleep)
+echo Preventing system sleep during TensorBoard session (monitor can still sleep)...
+powercfg /change standby-timeout-ac 0 >nul 2>&1
+powercfg /change hibernate-timeout-ac 0 >nul 2>&1
+powercfg /change standby-timeout-dc 0 >nul 2>&1
+powercfg /change hibernate-timeout-dc 0 >nul 2>&1
+echo.
+
 REM Start TensorBoard pointing to the runs directory
 echo Starting TensorBoard...
 echo TensorBoard will be available at: http://localhost:6006
@@ -53,4 +61,11 @@ echo.
 
 tensorboard --logdir=models\runs --port=6006 --host=localhost
 
+echo.
+echo TensorBoard session ended.
+echo Restoring default power settings...
+powercfg /change standby-timeout-ac 30 >nul 2>&1
+powercfg /change standby-timeout-dc 15 >nul 2>&1
+echo Power settings restored.
+echo.
 pause

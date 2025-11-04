@@ -3,7 +3,7 @@ split_output_base_dir: data/processed # Output train/val/test subdirs here
 train_subdir: train
 val_subdir: validation
 test_subdir: test
-test_months: 3  # Hold out the most recent 3 months for evaluation
-validation_months: 3  # Use the 3 months preceding the test window for validation
+test_months: 6  # Hold out the most recent 3 months for evaluation
+validation_months: 1  # Use the 3 months preceding the test window for validation
 seed: 42
 clear_output: true # Clears train/val/test subdirs before copying

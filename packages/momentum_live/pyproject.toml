@@ -17,7 +17,7 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "momentum_agent==0.1.6",
+    "momentum_agent==0.1.7",
     "momentum_env==0.1.6",
     "momentum-core==0.1.0",
     "alpaca-py>=0.14.0",

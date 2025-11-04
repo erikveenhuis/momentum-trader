@@ -66,6 +66,8 @@ class RainbowTrainerModule:
         self.update_freq = self.trainer_config.get("update_freq", 4)
         self.log_freq = self.trainer_config.get("log_freq", 100)
         self.warmup_steps = self.trainer_config.get("warmup_steps", 50000)
+        self.invalid_action_window = self.trainer_config.get("invalid_action_window", 20)
+        self.invalid_action_rate_window: deque[float] = deque(maxlen=self.invalid_action_window)
         self.render_training_enabled = bool(self.trainer_config.get("render_training", False))
         self.render_validation_enabled = bool(self.trainer_config.get("render_validation", False))
         self.render_evaluation_enabled = bool(self.trainer_config.get("render_evaluation", False))
@@ -405,6 +407,10 @@ class RainbowTrainerModule:
                 # --- Log Loss to TensorBoard --- #
                 if self.writer and loss_value is not None:
                     self.writer.add_scalar("Train/Loss", loss_value, total_train_steps)
+                    td_stats = getattr(self.agent, "last_td_error_stats", None)
+                    if td_stats:
+                        self.writer.add_scalar("Train/TD_Error_Mean", td_stats.get("mean", float("nan")), total_train_steps)
+                        self.writer.add_scalar("Train/TD_Error_Std", td_stats.get("std", float("nan")), total_train_steps)
                 # ---------------------------- #
 
             except Exception:
@@ -470,7 +476,17 @@ class RainbowTrainerModule:
         logger.info(
             f"  Avg Loss: {(episode_loss / (steps_in_episode / self.update_freq)) if steps_in_episode > 0 else 0:.4f}"
         )  # Adjust loss averaging
-        logger.info(f"  Invalid Actions: {invalid_action_count}")
+        steps_safe = max(steps_in_episode, 1)
+        invalid_action_rate = invalid_action_count / steps_safe
+        self.invalid_action_rate_window.append(invalid_action_rate)
+        rolling_invalid_rate = float(np.mean(self.invalid_action_rate_window)) if self.invalid_action_rate_window else 0.0
+        logger.info(
+            "  Invalid Actions: %s (%.2f%% of steps, Rolling %.2f%% over last %s episodes)",
+            invalid_action_count,
+            invalid_action_rate * 100,
+            rolling_invalid_rate * 100,
+            len(self.invalid_action_rate_window),
+        )
         logger.info(f"  Final Portfolio Value: ${final_info.get('portfolio_value', -1):.2f}")
         logger.info(f"  Final Position: {final_info.get('position', -1):.4f}")
         # tracker.log_summary(logger, episode + 1) # Original line causing error
@@ -491,6 +507,8 @@ class RainbowTrainerModule:
                 avg_reward_window,
                 episode,
             )
+            self.writer.add_scalar("Train/Average Reward (Total)", avg_reward_total, episode)
+            self.writer.add_scalar("Train/Steps Per Episode", steps_in_episode, episode)
             if steps_in_episode > 0:
                 avg_episode_loss = episode_loss / (steps_in_episode / self.update_freq + 1e-6)  # Avoid div by zero
                 self.writer.add_scalar("Train/Average Episode Loss", avg_episode_loss, episode)
@@ -500,6 +518,19 @@ class RainbowTrainerModule:
                 self.writer.add_scalar("Train/Sharpe Ratio", metrics.get("sharpe_ratio", np.nan), episode)
                 # Max drawdown is usually negative or zero, store as positive percentage for clarity if convention is to show magnitude
                 self.writer.add_scalar("Train/Max Drawdown Pct", metrics.get("max_drawdown", np.nan) * 100, episode)
+                self.writer.add_scalar("Train/Transaction Costs", metrics.get("transaction_costs", np.nan), episode)
+                self.writer.add_scalar("Train/Avg Tracker Reward", metrics.get("avg_reward", np.nan), episode)
+                action_counts = metrics.get("action_counts", {})
+                if action_counts:
+                    for action_idx, count in action_counts.items():
+                        action_rate = count / steps_safe if steps_safe > 0 else 0.0
+                        self.writer.add_scalar(f"Train/Action Count/{action_idx}", count, episode)
+                        self.writer.add_scalar(f"Train/Action Rate/{action_idx}", action_rate, episode)
+
+            self.writer.add_scalar("Train/Final Portfolio Value", final_info.get("portfolio_value", np.nan), episode)
+            self.writer.add_scalar("Train/Final Position", final_info.get("position", np.nan), episode)
+            self.writer.add_scalar("Train/Invalid Action Rate", invalid_action_rate, episode)
+            self.writer.add_scalar("Train/Rolling Invalid Action Rate", rolling_invalid_rate, episode)
         # ------------------------------------------ #
 
     def _handle_validation_and_checkpointing(
@@ -838,9 +869,13 @@ class RainbowTrainerModule:
         return total_reward, metrics, final_info
 
     # --- Validation Helper Methods ---
-    def _validate_single_file(self, val_file: Path) -> dict | None:
+    def _validate_single_file(
+        self, val_file: Path, validation_episode: int = 0, total_validation_episodes: int = 1, context: str = "validation"
+    ) -> dict | None:
         """Runs validation on a single file and returns collected metrics/results."""
-        logger.info(f"--- VALIDATING ON FILE: {val_file.name} ---")
+        logger.info(
+            f"--- Starting {context.capitalize()} Episode {validation_episode + 1}/{total_validation_episodes} using file: {val_file.name} ---"
+        )
         env_key = str(val_file)
         env = self._validation_env_cache.get(env_key)
         created_env = False
@@ -888,14 +923,14 @@ class RainbowTrainerModule:
         # --- Enhanced per-file logging (BEFORE score calculation) ---
         # Check if metrics are valid before logging
         if file_metrics:
-            logger.info(f"  Results for {val_file.name}:")
-            logger.info(f"    Reward: {reward:.4f}")
-            logger.info(f"    Portfolio Value: ${file_metrics.get('portfolio_value', np.nan):.2f}")  # Use .get()
-            logger.info(f"    Total Return: {file_metrics.get('total_return', np.nan):.2f}%")
-            logger.info(f"    Sharpe Ratio: {file_metrics.get('sharpe_ratio', np.nan):.4f}")
-            logger.info(f"    Max Drawdown: {file_metrics.get('max_drawdown', np.nan)*100:.2f}%")
-            logger.info(f"    Action Counts: {file_metrics.get('action_counts', {})}")
-            logger.info(f"    Transaction Costs: ${file_metrics.get('transaction_costs', np.nan):.2f}")
+            logger.debug(f"  Results for {val_file.name}:")
+            logger.debug(f"    Reward: {reward:.4f}")
+            logger.debug(f"    Portfolio Value: ${file_metrics.get('portfolio_value', np.nan):.2f}")  # Use .get()
+            logger.debug(f"    Total Return: {file_metrics.get('total_return', np.nan):.2f}%")
+            logger.debug(f"    Sharpe Ratio: {file_metrics.get('sharpe_ratio', np.nan):.4f}")
+            logger.debug(f"    Max Drawdown: {file_metrics.get('max_drawdown', np.nan)*100:.2f}%")
+            logger.debug(f"    Action Counts: {file_metrics.get('action_counts', {})}")
+            logger.debug(f"    Transaction Costs: ${file_metrics.get('transaction_costs', np.nan):.2f}")
         else:
             logger.warning(f"Metrics dictionary is empty for {val_file.name}, cannot log detailed results.")
 
@@ -916,7 +951,7 @@ class RainbowTrainerModule:
                     if not (0.0 <= _score <= 1.0):
                         raise ValueError(f"Episode score out of range [0,1]: {_score}")
                     episode_score = _score  # Assign valid score
-                    logger.info(f"    Episode Score: {episode_score:.4f}")
+                    logger.debug(f"    Episode Score: {episode_score:.4f}")
                 except (ValueError, KeyError, TypeError, Exception) as score_e:
                     logger.error(
                         f"Error calculating or validating episode score for {val_file.name}: {score_e}",
@@ -924,7 +959,7 @@ class RainbowTrainerModule:
                     )
                     logger.debug(f"Setting episode_score to -np.inf due to exception for {val_file.name}")
                     episode_score = -np.inf  # Penalize score calculation errors by setting score to -inf
-                    logger.info("    Episode Score: SET TO -np.inf due to calculation error.")
+                    logger.debug("    Episode Score: SET TO -np.inf due to calculation error.")
             else:
                 logger.warning(
                     f"Skipping score calculation for {val_file.name} due to empty/invalid metrics. Setting episode_score to -np.inf."
@@ -1057,7 +1092,9 @@ class RainbowTrainerModule:
 
             # 1. Validate each file
             for i, val_file in enumerate(val_files):
-                single_file_result = self._validate_single_file(val_file)
+                single_file_result = self._validate_single_file(
+                    val_file, validation_episode=i, total_validation_episodes=len(val_files), context="validation"
+                )
                 # FIX: Only process results if the single file validation succeeded
                 if single_file_result is not None:
                     all_file_metrics.append(single_file_result["file_metrics"])
