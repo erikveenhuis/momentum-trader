@@ -4,8 +4,8 @@
 # These credentials are for paper trading only
 # Make sure crypto trading permissions are enabled in your Alpaca dashboard
 
-$env:ALPACA_API_KEY = "PKISXJBRRJT7MTI553CDXGNHOJ"
-$env:ALPACA_API_SECRET = "9yZ7cNgr7StgNctiWBedoWpcpHjX5nxkBdP9s1JSbW2L"
+$env:ALPACA_API_KEY = "YOUR_ALPACA_API_KEY_HERE"
+$env:ALPACA_API_SECRET = "YOUR_ALPACA_API_SECRET_HERE"
 $env:ALPACA_PAPER_TRADING = "true"
 
 Write-Host "Alpaca API credentials set successfully!"
