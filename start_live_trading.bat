@@ -18,15 +18,24 @@ echo ========================================
 echo  🚀 MOMENTUM LIVE TRADING SYSTEM
 echo ========================================
 echo.
-echo Setting Alpaca API credentials...
+echo Checking Alpaca API credentials...
 echo.
 
-REM Set Alpaca API credentials
-set ALPACA_API_KEY=PKWKLNE6QHTADHRTUTB22EOYWW
-set ALPACA_API_SECRET=AUjDNbw5Atb8jGxvraRnhs1xg4P81mgKwzoQFRTS2Znw
-set ALPACA_PAPER_TRADING=true
+REM Check if credentials are set
+if "%ALPACA_API_KEY%"=="" (
+    echo ERROR: ALPACA_API_KEY environment variable not set
+    echo Please set your Alpaca credentials using set_alpaca_credentials.bat
+    pause
+    exit /b 1
+)
+if "%ALPACA_API_SECRET%"=="" (
+    echo ERROR: ALPACA_API_SECRET environment variable not set
+    echo Please set your Alpaca credentials using set_alpaca_credentials.bat
+    pause
+    exit /b 1
+)
 
-echo ✅ Credentials configured (Paper Trading: %ALPACA_PAPER_TRADING%)
+echo ✅ Credentials found (Paper Trading: %ALPACA_PAPER_TRADING%)
 echo.
 
 REM Prevent PC from sleeping during live trading (monitor can sleep)
@@ -89,6 +98,21 @@ if errorlevel 1 (
         exit /b 1
     )
     echo ✓ momentum_live module imported successfully after refresh
+)
+
+REM Reset Alpaca paper account before starting live trading
+echo Resetting Alpaca paper trading account...
+python -m momentum_live.reset_account --log-level INFO --wait-interval 2 --timeout 120
+if errorlevel 1 (
+    echo ERROR: Failed to reset Alpaca paper trading account.
+    echo.
+    echo Restoring default power settings...
+    powercfg /change standby-timeout-ac 30 >nul 2>&1
+    powercfg /change standby-timeout-dc 15 >nul 2>&1
+    echo Power settings restored.
+    echo.
+    pause
+    exit /b 1
 )
 
 echo Starting live trading for BTC/USD and ETH/USD...

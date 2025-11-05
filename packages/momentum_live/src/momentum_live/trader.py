@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Deque, Dict, Optional
+from typing import Deque, Dict, Iterable, Optional
 
 import numpy as np
 from momentum_agent import RainbowDQNAgent
@@ -143,6 +143,9 @@ class MomentumLiveTrader:
         self.shared_balance = config.initial_balance
         self.shared_portfolio_value = config.initial_balance
 
+        # Minimum notional amount for live orders to avoid micro-trades
+        self.min_notional = float(getattr(config, "min_notional", 10.0))
+
         for symbol in config.symbols:
             normalizer = LiveFeatureNormalizer(config.window_size)
             # Each symbol tracks only its own position, balance comes from shared pool
@@ -169,11 +172,51 @@ class MomentumLiveTrader:
     def symbols(self) -> tuple[str, ...]:
         return tuple(self.symbol_states.keys())
 
+    def preload_history(self, bars: Iterable[BarData]) -> None:
+        """Seed normalizers with historical bars before live streaming."""
+
+        ordered_bars = sorted(bars, key=lambda bar: (bar.timestamp, bar.symbol))
+        if not ordered_bars:
+            LOGGER.info("No historical bars provided for warmup")
+            return
+
+        for bar in ordered_bars:
+            symbol_state = self.symbol_states.get(bar.symbol)
+            if symbol_state is None:
+                LOGGER.debug("Skipping warmup bar for untracked symbol %s", bar.symbol)
+                continue
+
+            symbol_state.update_price(bar.close)
+            symbol_state.normalizer.update(bar)
+
+        for symbol, state in self.symbol_states.items():
+            LOGGER.info(
+                "Warmup status | symbol=%s | window_count=%d/%d",
+                symbol,
+                state.normalizer.count,
+                state.normalizer.window_size,
+            )
+
     def process_bar(self, bar: BarData) -> Optional[Dict[str, object]]:
         symbol_state = self.symbol_states.get(bar.symbol)
         if symbol_state is None:
             LOGGER.debug("Received bar for untracked symbol %s", bar.symbol)
             return None
+
+        LOGGER.info(
+            "Bar received | symbol=%s | ts=%s | open=%.2f | high=%.2f | low=%.2f | close=%.2f | volume=%.6f",
+            bar.symbol,
+            bar.timestamp,
+            bar.open,
+            bar.high,
+            bar.low,
+            bar.close,
+            bar.volume,
+        )
+
+        pre_shared_balance = self.shared_balance
+        pre_portfolio_value = self.shared_portfolio_value
+        pre_position = symbol_state.portfolio_state.position
 
         symbol_state.update_price(bar.close)
         ready = symbol_state.normalizer.update(bar)
@@ -182,8 +225,26 @@ class MomentumLiveTrader:
             return None
 
         observation = symbol_state.observation(self.shared_balance)
+        LOGGER.info(
+            "Observation ready | symbol=%s | balance=%.2f | position=%.6f | window_count=%d",
+            bar.symbol,
+            pre_shared_balance,
+            pre_position,
+            symbol_state.normalizer.count,
+        )
+
         action_index = self.agent.select_action(observation)
         action_label, fraction = self._map_action(action_index)
+
+        LOGGER.info(
+            "Action selected | symbol=%s | ts=%s | action=%s | index=%d | fraction=%.2f | price=%.2f",
+            bar.symbol,
+            bar.timestamp,
+            action_label,
+            action_index,
+            fraction,
+            bar.close,
+        )
 
         current_price = float(bar.close)
         trade_type = 0 if action_label == "hold" else 1 if action_label == "buy" else 2
@@ -191,14 +252,53 @@ class MomentumLiveTrader:
         # Execute real order if trading client is available and action is not hold
         order_result = None
         if self.trading_client and action_label != "hold":
-            order_result = self._execute_order(bar.symbol, action_label, fraction, current_price)
-            if order_result:
-                # Update shared balance and symbol position based on executed order
-                self._update_shared_portfolio_from_order(order_result, trade_type, fraction, current_price)
-                is_valid = True
-            else:
-                # Order failed, mark as invalid
+            if action_label == "sell" and symbol_state.portfolio_state.position <= 0.0:
+                LOGGER.warning(
+                    "Skipping live SELL for %s due to zero position | position=%.6f",
+                    bar.symbol,
+                    symbol_state.portfolio_state.position,
+                )
                 is_valid = False
+            elif action_label == "buy" and self.shared_balance <= 0.0:
+                LOGGER.warning(
+                    "Skipping live BUY for %s due to zero balance | shared_balance=%.2f",
+                    bar.symbol,
+                    self.shared_balance,
+                )
+                is_valid = False
+            elif action_label == "sell" and symbol_state.portfolio_state.position * current_price < self.min_notional:
+                LOGGER.warning(
+                    "Skipping live SELL for %s due to insufficient notional | position=%.6f | min_notional=%.2f",
+                    bar.symbol,
+                    symbol_state.portfolio_state.position,
+                    self.min_notional,
+                )
+                is_valid = False
+            elif action_label == "buy" and (self.shared_balance * fraction) < self.min_notional:
+                LOGGER.warning(
+                    "Skipping live BUY for %s due to insufficient notional | balance=%.2f | fraction=%.2f | min_notional=%.2f",
+                    bar.symbol,
+                    self.shared_balance,
+                    fraction,
+                    self.min_notional,
+                )
+                is_valid = False
+            else:
+                LOGGER.info(
+                    "Submitting live order | symbol=%s | action=%s | fraction=%.2f | price=%.2f",
+                    bar.symbol,
+                    action_label,
+                    fraction,
+                    current_price,
+                )
+                order_result = self._execute_order(bar.symbol, action_label, fraction, current_price)
+                if order_result:
+                    # Update shared balance and symbol position based on executed order
+                    self._update_shared_portfolio_from_order(order_result, trade_type, fraction, current_price)
+                    is_valid = True
+                else:
+                    # Order failed, mark as invalid
+                    is_valid = False
         else:
             # Simulate trade for validation or when no trading client
             # For simulation, create a temporary portfolio state with shared balance
@@ -222,11 +322,23 @@ class MomentumLiveTrader:
                 position_price=new_portfolio_state.position_price,
                 total_transaction_cost=new_portfolio_state.total_transaction_cost,
             )
+            LOGGER.info(
+                "Simulated trade | symbol=%s | action=%s | fraction=%.2f | new_balance=%.2f | new_position=%.6f",
+                bar.symbol,
+                action_label,
+                fraction,
+                self.shared_balance,
+                symbol_state.portfolio_state.position,
+            )
 
         # Update shared portfolio value
         total_position_value = sum(max(0.0, state.portfolio_state.position * current_price) for state in self.symbol_states.values())
         self.shared_portfolio_value = self.shared_balance + total_position_value
         symbol_state.prev_portfolio_value = self.shared_portfolio_value
+
+        post_shared_balance = self.shared_balance
+        post_position = symbol_state.portfolio_state.position
+        post_portfolio_value = self.shared_portfolio_value
 
         decision = {
             "symbol": bar.symbol,
@@ -241,15 +353,24 @@ class MomentumLiveTrader:
             "order": order_result,
         }
 
-        order_info = f" | Order: {order_result['order_id']}" if order_result else ""
+        order_info = ""
+        if order_result:
+            order_info = f" | order_id={order_result.get('order_id')} status={order_result.get('status')} qty={order_result.get('quantity', 0.0):.6f}"
+
         LOGGER.info(
-            "%s %s %.0f%% at %.2f | Shared PV %.2f (Balance: %.2f) | valid=%s%s",
+            "Decision summary | symbol=%s | ts=%s | action=%s | fraction=%.2f | price=%.2f | balance=%.2f->%.2f | "
+            "position=%.6f->%.6f | portfolio=%.2f->%.2f | valid=%s%s",
             bar.symbol,
-            action_label.upper(),
-            fraction * 100,
+            bar.timestamp,
+            action_label,
+            fraction,
             current_price,
-            self.shared_portfolio_value,
-            self.shared_balance,
+            pre_shared_balance,
+            post_shared_balance,
+            pre_position,
+            post_position,
+            pre_portfolio_value,
+            post_portfolio_value,
             is_valid,
             order_info,
         )
@@ -268,12 +389,47 @@ class MomentumLiveTrader:
             # Get account information to determine available cash
             account = self.trading_client.get_account()
             available_cash = float(account.cash)
+            spendable_cash = min(self.shared_balance, available_cash)
+
+            LOGGER.info(
+                "Order sizing | symbol=%s | action=%s | fraction=%.2f | price=%.2f | shared_balance=%.2f | account_cash=%.2f | spendable_cash=%.2f",
+                symbol,
+                action,
+                fraction,
+                price,
+                self.shared_balance,
+                available_cash,
+                spendable_cash,
+            )
 
             # Calculate order quantity based on action
             if action == "buy":
-                # Calculate how much we can buy with available cash
-                max_spend = available_cash * fraction
+                if spendable_cash <= 0:
+                    LOGGER.warning(
+                        "Skipping %s buy due to zero spendable cash | shared_balance=%.2f | account_cash=%.2f",
+                        symbol,
+                        self.shared_balance,
+                        available_cash,
+                    )
+                    return None
+
+                # Calculate how much we can buy with available/shared cash
+                max_spend = spendable_cash * fraction
+                if max_spend < self.min_notional:
+                    LOGGER.warning(
+                        "Order notional too small for %s buy: spend=%.2f < min_notional=%.2f",
+                        symbol,
+                        max_spend,
+                        self.min_notional,
+                    )
+                    return None
                 quantity = max_spend / price
+                LOGGER.info(
+                    "Buy sizing | symbol=%s | max_spend=%.2f | quantity=%.6f",
+                    symbol,
+                    max_spend,
+                    quantity,
+                )
                 if quantity < 0.00001:  # Minimum crypto order size
                     LOGGER.warning(f"Order too small for {symbol}: ${max_spend:.2f} at ${price:.2f}")
                     return None
@@ -287,8 +443,35 @@ class MomentumLiveTrader:
                         break
 
                 quantity = current_position * fraction
+                LOGGER.info(
+                    "Sell sizing | symbol=%s | current_position=%.6f | quantity=%.6f",
+                    symbol,
+                    current_position,
+                    quantity,
+                )
                 if quantity < 0.00001:  # Minimum crypto order size
                     LOGGER.warning(f"Insufficient position for {symbol} sell: {current_position} * {fraction} = {quantity}")
+                    return None
+
+                notional = quantity * price
+                if notional < self.min_notional:
+                    LOGGER.warning(
+                        "Order notional too small for %s sell: notional=%.2f < min_notional=%.2f",
+                        symbol,
+                        notional,
+                        self.min_notional,
+                    )
+                    return None
+
+            if action == "buy":
+                notional = quantity * price
+                if notional < self.min_notional:
+                    LOGGER.warning(
+                        "Order notional too small for %s buy after sizing: notional=%.2f < min_notional=%.2f",
+                        symbol,
+                        notional,
+                        self.min_notional,
+                    )
                     return None
 
             # Create and submit market order
@@ -296,6 +479,14 @@ class MomentumLiveTrader:
 
             order_request = MarketOrderRequest(
                 symbol=symbol, qty=quantity, side=side, time_in_force=TimeInForce.GTC  # Good 'til cancelled for crypto
+            )
+
+            LOGGER.info(
+                "Submitting %s order | symbol=%s | qty=%.6f | notional≈%.2f",
+                action.upper(),
+                symbol,
+                quantity,
+                quantity * price,
             )
 
             order = self.trading_client.submit_order(order_request)
@@ -322,11 +513,28 @@ class MomentumLiveTrader:
         try:
             symbol = order_result["symbol"]
             action = order_result["side"]
-            quantity = order_result["quantity"]
+            quantity = float(order_result["quantity"])
             order_id = order_result["order_id"]
 
-            if order_result["status"] == "accepted":
-                LOGGER.info(f"Order {order_id} accepted for execution")
+            status_raw = order_result.get("status")
+            if hasattr(status_raw, "value"):
+                status_value = str(status_raw.value).lower()
+            elif hasattr(status_raw, "name"):
+                status_value = str(status_raw.name).lower()
+            else:
+                status_value = str(status_raw).lower()
+
+            accepted_statuses = {
+                "accepted",
+                "new",
+                "pending_new",
+                "filled",
+                "partially_filled",
+                "done_for_day",
+            }
+
+            if status_value in accepted_statuses:
+                LOGGER.info(f"Order {order_id} status={status_value} – updating portfolio snapshot")
 
                 # For simplicity, assume the order executes at the requested price
                 # In production, you'd wait for actual fills
@@ -385,7 +593,7 @@ class MomentumLiveTrader:
                         LOGGER.warning(f"Insufficient position for {symbol} sell order: need {quantity:.6f}, have {current_position:.6f}")
 
             else:
-                LOGGER.warning(f"Order {order_id} status: {order_result['status']}")
+                LOGGER.warning(f"Order {order_id} status {status_raw!r} not treated as executed; skipping portfolio update")
 
         except Exception as e:
             LOGGER.error(f"Error updating shared portfolio from order: {e}")

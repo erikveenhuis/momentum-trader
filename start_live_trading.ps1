@@ -6,15 +6,24 @@ Write-Host " 🚀 MOMENTUM LIVE TRADING SYSTEM" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 
-Write-Host "Setting Alpaca API credentials..." -ForegroundColor Yellow
+Write-Host "Checking Alpaca API credentials..." -ForegroundColor Yellow
 Write-Host ""
 
-# Set Alpaca API credentials
-$env:ALPACA_API_KEY = "PKWKLNE6QHTADHRTUTB22EOYWW"
-$env:ALPACA_API_SECRET = "AUjDNbw5Atb8jGxvraRnhs1xg4P81mgKwzoQFRTS2Znw"
-$env:ALPACA_PAPER_TRADING = "true"
+# Check if credentials are set
+if (-not $env:ALPACA_API_KEY) {
+    Write-Host "ERROR: ALPACA_API_KEY environment variable not set" -ForegroundColor Red
+    Write-Host "Please set your Alpaca credentials using set_alpaca_credentials.ps1" -ForegroundColor Yellow
+    Read-Host "Press Enter to exit"
+    exit 1
+}
+if (-not $env:ALPACA_API_SECRET) {
+    Write-Host "ERROR: ALPACA_API_SECRET environment variable not set" -ForegroundColor Red
+    Write-Host "Please set your Alpaca credentials using set_alpaca_credentials.ps1" -ForegroundColor Yellow
+    Read-Host "Press Enter to exit"
+    exit 1
+}
 
-Write-Host "✅ Credentials configured (Paper Trading: $env:ALPACA_PAPER_TRADING)" -ForegroundColor Green
+Write-Host "✅ Credentials found (Paper Trading: $env:ALPACA_PAPER_TRADING)" -ForegroundColor Green
 Write-Host ""
 Write-Host "Starting live trading for BTC/USD and ETH/USD..." -ForegroundColor Green
 Write-Host "Press Ctrl+C to stop the system gracefully" -ForegroundColor Yellow

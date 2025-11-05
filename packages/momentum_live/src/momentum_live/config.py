@@ -51,6 +51,7 @@ class LiveTradingConfig:
     transaction_fee: float = 0.001
     reward_scale: float = 50.0
     invalid_action_penalty: float = -0.05
+    min_notional: float = 10.0
 
     def __post_init__(self) -> None:
         if isinstance(self.symbols, Iterable) and not isinstance(self.symbols, str):
@@ -75,6 +76,9 @@ class LiveTradingConfig:
 
         if self.invalid_action_penalty >= 0:
             raise ValueError("invalid_action_penalty should be negative to penalise invalid trades")
+
+        if self.min_notional <= 0:
+            raise ValueError("min_notional must be positive")
 
 
 def parse_symbols(symbols: str | Sequence[str]) -> List[str]:
