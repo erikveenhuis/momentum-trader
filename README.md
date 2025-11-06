@@ -1,280 +1,224 @@
 # Momentum Trader Monorepo
 
-A monorepo containing all components for a reinforcement learning-based trading system using Rainbow DQN.
+Reinforcement learning workflow for momentum-based cryptocurrency trading. The repository bundles reusable packages for data processing, training a Rainbow DQN agent, and running the policy live against Alpaca's crypto feed.
 
-## 🏗️ Project Structure
+## Requirements
 
-This is a workspace-style monorepo organized into independent packages:
+- Python 3.13+
+- Windows 10/11 (automation scripts are written for Windows; Linux/macOS are supported via the Python CLIs)
+- CUDA-capable GPU (optional but recommended for training and live inference)
+- Alpaca Markets account with crypto paper trading enabled (for live trading mode)
+
+## Project Structure
 
 ```
 momentum-trader/
 ├── packages/
-│   ├── momentum_env/       # Trading environment (gymnasium-based)
-│   ├── momentum_agent/     # Rainbow DQN agent implementation
-│   ├── momentum_train/     # Training module with trainer and metrics
-│   └── momentum_live/      # Live trading (placeholder for future work)
-├── config/                 # Configuration files (YAML)
-├── data/                   # Data directories (raw, processed, extracted)
-├── scripts/                # Data processing scripts
-├── tests/                  # Integration tests
-└── legacy_src_backup/     # Backup of original structure (for reference)
+│   ├── momentum_core/     # Shared logging and utilities
+│   ├── momentum_env/      # Gymnasium-based trading environment
+│   ├── momentum_agent/    # Rainbow DQN (Transformer encoder + PER)
+│   ├── momentum_train/    # Training loop, metrics, experiment tooling
+│   └── momentum_live/     # Live trading CLI for Alpaca streams
+├── config/                # YAML configs for training & data prep
+├── data/                  # Raw, extracted, and processed datasets
+├── logs/                  # Rotating logs for training & live trading
+├── models/                # Saved checkpoints from `momentum_train`
+├── scripts/               # Data ingestion and maintenance scripts
+├── install_packages.bat   # Windows helper to install editable packages
+├── refresh_packages.bat   # Reinstall editable packages in-place
+├── start_training*.bat    # Training shortcuts (resume, tensorboard, etc.)
+├── start_live_trading*.bat# Live trading launcher & PowerShell variant
+├── LIVE_TRADING_README.md # Detailed live trading guide
+└── README.md
 ```
 
-## 📦 Packages
+## Packages
+
+### momentum_core
+Shared infrastructure (logging helpers, environment-variable overrides, rotating file handlers) used by every other package.
+
+**Install**
+```bash
+cd packages/momentum_core
+pip install -e .
+```
+
+**Use**
+```python
+from momentum_core.logging import setup_logging, get_logger
+```
 
 ### momentum_env
-Trading environment package. A Gymnasium environment for reinforcement learning.
+Gymnasium-compatible trading environment that surfaces normalized OHLCV windows, shared cash state, configurable fees, and reward shaping hooks.
 
-**Install:**
+**Install**
 ```bash
 cd packages/momentum_env
 pip install -e .
 ```
 
-**Import:**
+**Use**
 ```python
 from momentum_env import TradingEnv, TradingEnvConfig
 ```
 
-**Dependencies:**
-- gymnasium
-- numpy
-- pandas
-- matplotlib
-
 ### momentum_agent
-Rainbow DQN agent implementation with:
-- Distributional RL (C51)
-- Prioritized Experience Replay (PER)
-- Multi-step returns
-- Double Q-Learning
-- Noisy Nets for exploration
-- Dueling network architecture
+Rainbow DQN agent with Transformer encoders, distributional value heads (C51), prioritized replay, noisy nets, dueling heads, and multi-step returns.
 
-**Install:**
+**Install**
 ```bash
 cd packages/momentum_agent
 pip install -e .
 ```
 
-**Import:**
+**Use**
 ```python
-from momentum_agent import RainbowDQNAgent, RainbowNetwork, PrioritizedReplayBuffer
+from momentum_agent import RainbowDQNAgent
 ```
 
-**Dependencies:**
-- torch
-- numpy
-- PyYAML
-- momentum_env
-
 ### momentum_train
-Training module with trainer, metrics, and data management.
+Training orchestration: checkpointing, evaluation, metrics (Sharpe ratio, max drawdown), curriculum hooks, WandB/TensorBoard logging, and CLI entry points.
 
-**Install:**
+**Install**
 ```bash
 cd packages/momentum_train
 pip install -e .
 ```
 
-**Import:**
+**Use**
 ```python
-from momentum_train import RainbowTrainerModule, DataManager, PerformanceTracker
-from momentum_train import calculate_sharpe_ratio, calculate_max_drawdown
-```
-
-**Dependencies:**
-- torch
-- numpy
-- pandas
-- scikit-learn
-- PyYAML
-- momentum_agent
-- momentum_env
-- tensorboard
-- wandb
-
-### momentum_live
-Live trading package (skeleton - under development).
-
-## 🚀 Quick Start
-
-### 1. Install All Packages
-
-Install packages in dependency order:
-
-```bash
-# Base package
-cd packages/momentum_env
-pip install -e .
-
-# Agent package
-cd ../momentum_agent
-pip install -e .
-
-# Training package
-cd ../momentum_train
-pip install -e .
-
-# Return to root
-cd ../../..
-```
-
-### 2. Setup Data
-
-Data should be organized as:
-```
-data/
-├── raw/           # Raw market data (CSV files)
-├── extracted/     # Extracted/processed raw data
-└── processed/     # Final processed data
-    ├── train/
-    ├── validation/
-    └── test/
-```
-
-### 3. Configure Training
-
-Edit `config/training_config.yaml` to set your hyperparameters.
-
-### 4. Run Training
-
-```bash
 python -m momentum_train.run_training --config_path config/training_config.yaml
 ```
 
-Or with resume:
+### momentum_live
+End-to-end live trading loop that loads trained checkpoints, streams Alpaca crypto bars, and executes paper (or live) orders with shared cash management and safety rails.
+
+**Install**
 ```bash
-python -m momentum_train.run_training --config_path config/training_config.yaml --resume
+cd packages/momentum_live
+pip install -e .
 ```
 
-### 5. Run Evaluation
+**Use**
+```python
+python -m momentum_live.cli --symbols BTC/USD,ETH/USD --log-level INFO
+```
 
-Set `mode: eval` in config and specify `eval_model_prefix`.
+## Setup
 
-## 📊 Features
+1. Create and activate a Python 3.13 virtual environment.
+   ```bash
+   python -m venv venv
+   source venv/bin/activate            # Linux/macOS
+   .\venv\Scripts\activate           # Windows PowerShell / CMD
+   python -m pip install --upgrade pip
+   ```
+2. Install the packages in editable mode (top-level script handles ordering on Windows).
+   ```bash
+   # Windows shortcut
+   .\install_packages.bat
 
-### Trading Environment
-- Normalized OHLCV observations with configurable window size
-- Discrete action space: Hold, Buy (10%/25%/50%), Sell (10%/25%/100%)
-- Account state tracking (position, balance, transaction costs)
-- Configurable fees and initial balance
+   # Cross-platform manual install
+   pip install -e packages/momentum_core \
+               -e packages/momentum_env \
+               -e packages/momentum_agent \
+               -e packages/momentum_train \
+               -e packages/momentum_live
+   ```
+3. (Optional) Enable Git hooks to enforce `pytest` before each commit.
+   ```bash
+   git config core.hooksPath githooks
+   ```
 
-### Agent Architecture
-- Rainbow DQN with full feature set
-- Transformer-based state encoding
-- Distributional value estimation (C51)
-- Prioritized experience replay
-- Multi-step returns
-- Noisy linear layers for exploration
+## Data Pipeline
 
-### Training Features
-- Checkpoint management
-- Early stopping
-- Performance metrics (Sharpe ratio, max drawdown, avg returns)
-- TensorBoard integration
-- WandB logging support
-- Validation on separate data splits
+Historical data lives in `data/` and is organized by stage:
 
-### Visualization
-- Enable real-time charts by setting `environment.render_mode` to `human` (or `terminal`) in `config/training_config.yaml`.
-- Turn on rendering for specific loops with the new trainer flags:
-  - `render_training`
-  - `render_validation`
-  - `render_evaluation`
-- Control how often frames update using the corresponding `*_every_n_steps` options and optionally draw the first frame after each `env.reset()` with `render_on_reset`.
-- For a quick demo, run the random agent script: `python -m momentum_env.random_agent --skip-env-check`.
+```
+data/
+├── raw/        # Original vendor files (e.g. Polygon aggregates)
+├── extracted/  # One file per symbol/day after cleaning
+└── processed/  # Train/validation/test parquet/CSV windows
+```
 
-## 🧪 Running Tests
+Helpers in `scripts/data_processing/` handle ingestion and cleaning:
+
+- `extract_raw.py` – decompresses vendor archives, normalizes ticker names, filters incomplete days, and logs anomalies. Configure via `config/extract_raw_config.yaml`.
+- `split_data.py` – builds rolling windows and splits into train/validation/test according to `config/split_config.yaml`.
+- `collect_raw_data.sh` – optional shell script to fetch new raw dumps.
+
+Run them with the virtual environment active, for example:
 
 ```bash
-# Run all tests
-pytest
+python scripts/data_processing/extract_raw.py --config config/extract_raw_config.yaml
+python scripts/data_processing/split_data.py --config config/split_config.yaml
+```
 
-# Run specific package tests
-pytest tests/momentum_env/
-pytest tests/momentum_agent/
-pytest tests/momentum_train/
+## Training Workflow
 
-# Run with coverage
+1. Review `config/training_config.yaml` for hyperparameters, logging, resume behaviour, and rendering toggles.
+2. Launch training:
+   ```bash
+   python -m momentum_train.run_training --config_path config/training_config.yaml
+   ```
+   - `--resume` reuses the latest checkpoint in `models/`.
+   - `--mode eval` runs evaluation against the validation/test splits.
+3. Windows shortcuts
+   - `start_training.bat` – launches training in a separate console, prevents sleep, and restores power settings on exit.
+   - `start_training_resume.bat` – resumes from the latest checkpoint.
+   - `start_tensorboard.bat` – opens TensorBoard pointed at `logs/tensorboard/`.
+
+Metrics and debug output are written to `logs/training.log` using the shared `momentum_core` logging stack.
+
+## Live Trading
+
+All live-trading specifics live in `packages/momentum_live` plus the supporting scripts:
+
+- `start_live_trading.bat` / `.ps1` – wraps environment activation, credential checks, lock-file handling, account reset for paper trading, and launches `momentum_live.cli`.
+- `set_alpaca_credentials.(bat|ps1)` – convenience helper to export Alpaca keys (or load them via `.env`).
+- `LIVE_TRADING_README.md` – detailed walkthrough, requirements, and troubleshooting tips.
+
+Manual CLI usage:
+
+```bash
+python -m momentum_live.cli \
+    --symbols BTC/USD,ETH/USD \
+    --models-dir models \
+    --log-level INFO
+```
+
+By default the CLI searches `models/` for the best checkpoint (based on validation score) and falls back to a freshly initialized agent if loading fails. Logs stream to `logs/live_trading.log`.
+
+## Features Snapshot
+
+- **Environment** – configurable window sizes, normalized OHLCV features, discrete allocation actions (buy/sell in 10–100% tiers), account state tracking, configurable fees and invalid-action penalties.
+- **Agent** – Transformer encoder over price history, dueling C51 heads, prioritized replay with beta annealing, multi-step returns, noisy exploration layers, gradient clipping, and optional LR scheduling.
+- **Training** – resumable checkpoints, gradient accumulation, validation hooks, automated metrics (Sharpe, max drawdown, volatility), TensorBoard + Weights & Biases support, configurable rendering for human/terminal modes.
+- **Live Trading** – Alpaca data stream consumer with shared balance across symbols, safety checks (cash availability, position limits, min order sizes), optional automatic paper account reset, and graceful shutdown handling.
+- **Logging** – consistent formatting and rotating file handlers via `momentum_core.logging` for Python CLIs and standalone scripts.
+
+## Tests & Quality Gates
+
+```bash
+pytest                                   # run full test suite
+pytest packages/momentum_env/tests       # per-package tests
 pytest --cov=momentum_env --cov=momentum_agent --cov=momentum_train
 ```
 
-## ✅ Enforce Tests Before Commit
+Continuous integration is backed by the optional Git pre-commit hook (`githooks/pre-commit`) that runs `pytest` before allowing commits.
 
-We ship a Git pre-commit hook in `githooks/pre-commit` that runs the entire test suite (`pytest`). To enable it, point Git to the repository hooks directory:
+## Development Notes
 
-```bash
-git config core.hooksPath githooks
-```
+- Editable installs mean changes under `packages/<name>/src/<name>/` are immediately importable without reinstalling.
+- When adding dependencies, update the relevant `pyproject.toml` and rerun `pip install -e .` for that package (or `refresh_packages.bat`).
+- Shared utilities belong in `momentum_core` to avoid circular dependencies.
 
-From then on, every `git commit` will automatically run `pytest`. Commits are blocked when tests fail, ensuring the main branch only receives changes that keep the test suite green.
+## Additional Documentation
 
-If you need to skip the hook temporarily (for example, when working offline), you can use `git commit --no-verify`, but please re-run the tests manually before pushing.
+- `LIVE_TRADING_README.md` – deep dive into the live trading stack.
+- `htmlcov/` – HTML coverage report produced by `pytest --cov`.
+- `logs/` – inspect training and live trading runs.
 
-If you are on Windows, ensure that `python` is available on your `PATH`; Git for Windows will use the shebang in the hook (`#!/usr/bin/env python3`).
-
-## 📝 Development
-
-### Making Changes
-1. Edit code in `packages/[package_name]/src/[package_name]/`
-2. Changes are immediately available due to editable installs
-3. Re-install package if you add new dependencies to `pyproject.toml`
-
-### Adding a New Package
-1. Create `packages/new_package/`
-2. Add `src/new_package/` directory structure
-3. Create `pyproject.toml` with dependencies
-4. Install with `pip install -e .`
-
-### Package Dependencies
-- `momentum_env` has no internal dependencies
-- `momentum_agent` depends on `momentum_env`
-- `momentum_train` depends on `momentum_agent` and `momentum_env`
-- `momentum_live` depends on `momentum_agent` and `momentum_env`
-
-## 🔧 Configuration
-
-Key configuration files:
-- `config/training_config.yaml` - Training hyperparameters
-- `config/extract_raw_config.yaml` - Data extraction settings
-- `config/split_config.yaml` - Data splitting configuration
-
-## 📈 Monitoring
-
-- **TensorBoard**: Training metrics and losses
-- **WandB**: Experiment tracking and hyperparameter tuning
-- **Logs**: `logs/training.log` contains detailed training logs
-
-## 🤝 Contributing
-
-This is currently a personal project. If you'd like to contribute:
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Run tests to ensure nothing breaks
-5. Submit a pull request
-
-## 📄 License
+## License
 
 MIT License
-
-## 📚 Additional Notes
-
-### Legacy Structure
-The original code has been backed up to `legacy_src_backup/` directory for reference.
-
-### Why Monorepo?
-This monorepo structure was chosen because:
-- ✅ Fast iteration (no need to publish packages)
-- ✅ Cross-package changes are easy
-- ✅ Single repository to clone
-- ✅ Consistent version management
-- ✅ Easier dependency management
-
-### Migration from Separate Repos
-This monorepo consolidates:
-- `trader` → `packages/momentum_train`
-- `trading-env` → `packages/momentum_env`
-- `momentum-agent` → `packages/momentum_agent`
-- `momentum-live` → `packages/momentum_live` (planned)
