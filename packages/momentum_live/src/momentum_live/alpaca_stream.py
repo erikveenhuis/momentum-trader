@@ -271,11 +271,26 @@ class AlpacaStreamRunner:
             stream.run()
         except KeyboardInterrupt:  # pragma: no cover - manual stop
             LOGGER.info("Live stream interrupted by user")
+        except ValueError as exc:
+            if "connection limit exceeded" in str(exc).lower():
+                LOGGER.error(
+                    "Connection limit exceeded. This may be due to: "
+                    "1) Multiple instances running simultaneously, "
+                    "2) Other applications using the same Alpaca credentials, "
+                    "3) Account type limitations. "
+                    "Try closing other instances or check your account limits."
+                )
+                raise RuntimeError("Alpaca connection limit exceeded") from exc
+            else:
+                raise
 
     def stop(self) -> None:
         if self._stream is not None:
-            self._stream.stop()
-            LOGGER.info("Requested Alpaca stream shutdown")
+            try:
+                self._stream.stop()
+                LOGGER.info("Requested Alpaca stream shutdown")
+            except Exception as exc:
+                LOGGER.warning("Error during stream shutdown: %s", exc)
 
 
 __all__ = ["AlpacaStreamRunner"]

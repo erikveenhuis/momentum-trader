@@ -59,5 +59,11 @@ checkpoints/
 .ruff_cache/
 .mypy_cache/
 
+# Environment files
+.env
+
+# Lock files
+momentum_trading.lock
+
 # Legacy (optional - remove when confident)
 # legacy_src_backup/

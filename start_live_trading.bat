@@ -5,6 +5,50 @@ REM This script sets up credentials and starts live trading
 REM Get the directory where this batch file is located
 cd /d "%~dp0"
 
+REM Check for lock file (indicates another instance is running)
+if exist "momentum_trading.lock" (
+    echo ⚠️  WARNING: Found momentum_trading.lock file
+    echo This indicates another momentum trading session may be running.
+    echo This could cause connection limit issues with Alpaca.
+    echo.
+    for /f "tokens=*" %%i in (momentum_trading.lock) do echo Lock file created: %%i
+    echo.
+    echo If you're sure no other instance is running, you can delete the lock file.
+    echo Press Ctrl+C to cancel, or Enter to continue anyway...
+    pause >nul
+    echo.
+) else (
+    echo %date% %time% > momentum_trading.lock
+)
+
+REM Terminate any existing momentum_live.cli processes before starting
+echo Checking for existing live trading Python processes...
+set "KILLED_PROCESSES=0"
+for /f "usebackq tokens=*" %%P in (`powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*momentum_live.cli*' } | ForEach-Object { $_.ProcessId }"`) do (
+    echo Terminating existing momentum_live.cli process ID %%P
+    taskkill /PID %%P /F >nul 2>&1
+    set "KILLED_PROCESSES=1"
+)
+if "%KILLED_PROCESSES%"=="0" (
+    echo No existing live trading processes found.
+) else (
+    echo Existing live trading processes terminated.
+)
+echo.
+
+REM Load environment variables from .env file if it exists
+if exist ".env" (
+    echo Loading environment variables from .env file...
+    for /f "tokens=*" %%i in (.env) do (
+        echo %%i | findstr /r "^#" >nul 2>&1
+        if errorlevel 1 (
+            for /f "tokens=1,* delims==" %%a in ("%%i") do set "%%a=%%b" 2>nul
+        )
+    )
+    echo ✅ Environment variables loaded from .env file
+    echo.
+)
+
 REM Check if virtual environment exists
 if not exist "venv\Scripts\activate.bat" (
     echo ERROR: Virtual environment not found at venv\Scripts\activate.bat
@@ -100,19 +144,25 @@ if errorlevel 1 (
     echo ✓ momentum_live module imported successfully after refresh
 )
 
-REM Reset Alpaca paper account before starting live trading
-echo Resetting Alpaca paper trading account...
-python -m momentum_live.reset_account --log-level INFO --wait-interval 2 --timeout 120
-if errorlevel 1 (
-    echo ERROR: Failed to reset Alpaca paper trading account.
+REM Reset Alpaca account before starting trading (paper trading only)
+if "%ALPACA_PAPER_TRADING%"=="true" (
+    echo Resetting Alpaca paper trading account...
+    python -m momentum_live.reset_account --log-level INFO --wait-interval 2 --timeout 120
+    if errorlevel 1 (
+        echo ERROR: Failed to reset Alpaca paper trading account.
+        echo.
+        echo Restoring default power settings...
+        powercfg /change standby-timeout-ac 30 >nul 2>&1
+        powercfg /change standby-timeout-dc 15 >nul 2>&1
+        echo Power settings restored.
+        echo.
+        pause
+        exit /b 1
+    )
+) else (
+    echo ⚠️  REAL MONEY TRADING MODE: Skipping account reset for safety.
+    echo    Please ensure your live trading account is in the desired state before proceeding.
     echo.
-    echo Restoring default power settings...
-    powercfg /change standby-timeout-ac 30 >nul 2>&1
-    powercfg /change standby-timeout-dc 15 >nul 2>&1
-    echo Power settings restored.
-    echo.
-    pause
-    exit /b 1
 )
 
 echo Starting live trading for BTC/USD and ETH/USD...
@@ -122,9 +172,17 @@ echo ========================================
 
 REM Run the live trading system
 python -m momentum_live.cli --symbols BTC/USD,ETH/USD --log-level INFO
+set EXITCODE=%errorlevel%
 
 echo.
-echo Live trading session ended.
+if %EXITCODE% equ 1 (
+    echo ❌ Live trading failed to start. Check the logs above for details.
+    echo This may be due to connection limits or authentication issues.
+) else (
+    echo Live trading session ended.
+)
+echo Cleaning up lock file...
+if exist "momentum_trading.lock" del "momentum_trading.lock"
 echo Restoring default power settings...
 powercfg /change standby-timeout-ac 30 >nul 2>&1
 powercfg /change standby-timeout-dc 15 >nul 2>&1

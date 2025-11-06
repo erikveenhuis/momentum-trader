@@ -123,7 +123,23 @@ def main(argv: list[str] | None = None) -> int:
 
         trader = MomentumLiveTrader(agent=agent, config=trading_config)
         runner = AlpacaStreamRunner(credentials=credentials, trader=trader)
-        runner.run_forever()
+
+        try:
+            runner.run_forever()
+        except KeyboardInterrupt:
+            logger.info("Received interrupt signal, shutting down...")
+            # Note: runner.stop() can cause asyncio event loop issues during shutdown
+            # The stream should naturally stop on KeyboardInterrupt
+        except RuntimeError as exc:
+            if "connection limit exceeded" in str(exc).lower():
+                logger.error(f"Failed to start live trading: {exc}")
+                logger.error("Please check that you don't have multiple instances running and try again later.")
+                return 1
+            else:
+                raise
+        except Exception:
+            logger.info("Unexpected error occurred")
+            raise
     except Exception as exc:  # pragma: no cover - CLI level protection
         logging.getLogger("momentum_live.cli").exception("Fatal error in live runner: %s", exc)
         return 1

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -294,8 +295,8 @@ class MomentumLiveTrader:
                 order_result = self._execute_order(bar.symbol, action_label, fraction, current_price)
                 if order_result:
                     # Update shared balance and symbol position based on executed order
-                    self._update_shared_portfolio_from_order(order_result, trade_type, fraction, current_price)
-                    is_valid = True
+                    executed = self._update_shared_portfolio_from_order(order_result, trade_type, fraction, current_price)
+                    is_valid = executed
                 else:
                     # Order failed, mark as invalid
                     is_valid = False
@@ -355,7 +356,12 @@ class MomentumLiveTrader:
 
         order_info = ""
         if order_result:
-            order_info = f" | order_id={order_result.get('order_id')} status={order_result.get('status')} qty={order_result.get('quantity', 0.0):.6f}"
+            order_info = (
+                " | order_id="
+                f"{order_result.get('order_id')} status={order_result.get('status')}"
+                f" qty={order_result.get('quantity', 0.0):.6f}"
+                f" filled={order_result.get('filled_quantity', 0.0):.6f}"
+            )
 
         LOGGER.info(
             "Decision summary | symbol=%s | ts=%s | action=%s | fraction=%.2f | price=%.2f | balance=%.2f->%.2f | "
@@ -437,8 +443,10 @@ class MomentumLiveTrader:
                 # Get current position for this symbol
                 positions = self.trading_client.get_all_positions()
                 current_position = 0.0
+                sanitized_symbol = symbol.replace("/", "")
                 for position in positions:
-                    if position.symbol == symbol:
+                    position_symbol = getattr(position, "symbol", "")
+                    if position_symbol == symbol or position_symbol == sanitized_symbol:
                         current_position = float(position.qty)
                         break
 
@@ -477,14 +485,16 @@ class MomentumLiveTrader:
             # Create and submit market order
             side = OrderSide.BUY if action == "buy" else OrderSide.SELL
 
+            trade_symbol = symbol.replace("/", "") if "/" in symbol else symbol
+
             order_request = MarketOrderRequest(
-                symbol=symbol, qty=quantity, side=side, time_in_force=TimeInForce.GTC  # Good 'til cancelled for crypto
+                symbol=trade_symbol, qty=quantity, side=side, time_in_force=TimeInForce.GTC  # Good 'til cancelled for crypto
             )
 
             LOGGER.info(
-                "Submitting %s order | symbol=%s | qty=%.6f | notional≈%.2f",
+                "Submitting %s order | symbol=%s | qty=%.6f | notional~=%.2f",
                 action.upper(),
-                symbol,
+                trade_symbol,
                 quantity,
                 quantity * price,
             )
@@ -493,14 +503,18 @@ class MomentumLiveTrader:
 
             LOGGER.info(f"Submitted {action.upper()} order for {quantity:.6f} {symbol} at market price")
 
-            return {
-                "order_id": order.id,
-                "symbol": symbol,
-                "side": action,
-                "quantity": quantity,
-                "price": price,
-                "status": order.status,
-            }
+            completed_order = self._wait_for_order_completion(order.id)
+            if completed_order is not None:
+                order = completed_order
+
+            return self._build_order_result(
+                order=order,
+                submitted_symbol=symbol,
+                trade_symbol=trade_symbol,
+                side=action,
+                requested_quantity=quantity,
+                reference_price=price,
+            )
 
         except Exception as e:
             LOGGER.error(f"Failed to execute {action} order for {symbol}: {e}")
@@ -508,95 +522,188 @@ class MomentumLiveTrader:
 
     def _update_shared_portfolio_from_order(
         self, order_result: Dict[str, object], trade_type: int, fraction: float, current_price: float
-    ) -> None:
+    ) -> bool:
         """Update shared portfolio state based on executed order."""
         try:
             symbol = order_result["symbol"]
             action = order_result["side"]
-            quantity = float(order_result["quantity"])
             order_id = order_result["order_id"]
 
-            status_raw = order_result.get("status")
-            if hasattr(status_raw, "value"):
-                status_value = str(status_raw.value).lower()
-            elif hasattr(status_raw, "name"):
-                status_value = str(status_raw.name).lower()
-            else:
-                status_value = str(status_raw).lower()
+            status_value = order_result.get("status_lower") or str(order_result.get("status", "")).lower()
+            filled_quantity = float(order_result.get("filled_quantity", 0.0) or 0.0)
+            filled_price = float(order_result.get("filled_avg_price", current_price) or current_price)
 
-            accepted_statuses = {
-                "accepted",
-                "new",
-                "pending_new",
-                "filled",
-                "partially_filled",
-                "done_for_day",
-            }
+            if filled_quantity <= 0.0:
+                LOGGER.info(
+                    "Order %s not filled yet (status=%s); skipping portfolio update",
+                    order_id,
+                    status_value or "unknown",
+                )
+                return False
 
-            if status_value in accepted_statuses:
-                LOGGER.info(f"Order {order_id} status={status_value} – updating portfolio snapshot")
+            LOGGER.info(
+                "Order %s status=%s – applying filled quantity %.6f at price %.2f",
+                order_id,
+                status_value,
+                filled_quantity,
+                filled_price,
+            )
 
-                # For simplicity, assume the order executes at the requested price
-                # In production, you'd wait for actual fills
-                if action == "buy":
-                    cost = quantity * current_price
-                    fee = cost * self.config.transaction_fee
-                    total_cost = cost + fee
+            if action == "buy":
+                cost = filled_quantity * filled_price
+                fee = cost * self.config.transaction_fee
+                total_cost = cost + fee
 
-                    if self.shared_balance >= total_cost:
-                        self.shared_balance -= total_cost
+                if self.shared_balance + 1e-9 >= total_cost:
+                    self.shared_balance -= total_cost
 
-                        # Update symbol position
-                        symbol_state = self.symbol_states[symbol]
-                        current_position = symbol_state.portfolio_state.position
-                        current_position_value = current_position * symbol_state.portfolio_state.position_price
-
-                        new_position = current_position + quantity
-                        new_position_price = (current_position_value + cost) / new_position if new_position > 0 else 0.0
-
-                        symbol_state.portfolio_state = PortfolioState(
-                            balance=0.0,
-                            position=new_position,
-                            position_price=new_position_price,
-                            total_transaction_cost=symbol_state.portfolio_state.total_transaction_cost + fee,
-                        )
-
-                        LOGGER.info(f"Updated position for {symbol}: {current_position:.6f} -> {new_position:.6f}")
-                    else:
-                        LOGGER.warning(
-                            f"Insufficient balance for {symbol} buy order: need ${total_cost:.2f}, have ${self.shared_balance:.2f}"
-                        )
-
-                elif action == "sell":
-                    # Update symbol position
                     symbol_state = self.symbol_states[symbol]
                     current_position = symbol_state.portfolio_state.position
+                    current_position_value = current_position * symbol_state.portfolio_state.position_price
 
-                    if current_position >= quantity:
-                        proceeds = quantity * current_price
-                        fee = proceeds * self.config.transaction_fee
-                        net_proceeds = proceeds - fee
+                    new_position = current_position + filled_quantity
+                    new_position_price = (current_position_value + cost) / new_position if new_position > 0 else 0.0
 
-                        self.shared_balance += net_proceeds
+                    symbol_state.portfolio_state = PortfolioState(
+                        balance=0.0,
+                        position=new_position,
+                        position_price=new_position_price,
+                        total_transaction_cost=symbol_state.portfolio_state.total_transaction_cost + fee,
+                    )
 
-                        new_position = current_position - quantity
+                    LOGGER.info(f"Updated position for {symbol}: {current_position:.6f} -> {new_position:.6f}")
+                else:
+                    LOGGER.warning(
+                        "Insufficient balance for %s buy fill: need $%.2f, have $%.2f",
+                        symbol,
+                        total_cost,
+                        self.shared_balance,
+                    )
+                    return False
 
-                        symbol_state.portfolio_state = PortfolioState(
-                            balance=0.0,
-                            position=new_position,
-                            position_price=symbol_state.portfolio_state.position_price,  # Keep existing price
-                            total_transaction_cost=symbol_state.portfolio_state.total_transaction_cost + fee,
-                        )
+            elif action == "sell":
+                symbol_state = self.symbol_states[symbol]
+                current_position = symbol_state.portfolio_state.position
 
-                        LOGGER.info(f"Updated position for {symbol}: {current_position:.6f} -> {new_position:.6f}")
-                    else:
-                        LOGGER.warning(f"Insufficient position for {symbol} sell order: need {quantity:.6f}, have {current_position:.6f}")
+                if current_position + 1e-9 >= filled_quantity:
+                    proceeds = filled_quantity * filled_price
+                    fee = proceeds * self.config.transaction_fee
+                    net_proceeds = proceeds - fee
 
-            else:
-                LOGGER.warning(f"Order {order_id} status {status_raw!r} not treated as executed; skipping portfolio update")
+                    self.shared_balance += net_proceeds
+
+                    new_position = max(0.0, current_position - filled_quantity)
+
+                    symbol_state.portfolio_state = PortfolioState(
+                        balance=0.0,
+                        position=new_position,
+                        position_price=symbol_state.portfolio_state.position_price,
+                        total_transaction_cost=symbol_state.portfolio_state.total_transaction_cost + fee,
+                    )
+
+                    LOGGER.info(f"Updated position for {symbol}: {current_position:.6f} -> {new_position:.6f}")
+                else:
+                    LOGGER.warning(
+                        "Insufficient position for %s sell fill: need %.6f, have %.6f",
+                        symbol,
+                        filled_quantity,
+                        current_position,
+                    )
+                    return False
+
+            return True
 
         except Exception as e:
             LOGGER.error(f"Error updating shared portfolio from order: {e}")
+            return False
+
+    def _wait_for_order_completion(self, order_id: str, timeout: float = 15.0, interval: float = 0.5):
+        """Poll Alpaca for order completion up to a timeout."""
+        if not self.trading_client:
+            return None
+
+        deadline = time.monotonic() + max(timeout, interval)
+        last_snapshot = None
+
+        while time.monotonic() < deadline:
+            try:
+                last_snapshot = self.trading_client.get_order_by_id(order_id)
+            except Exception as exc:
+                LOGGER.warning("Unable to refresh order %s: %s", order_id, exc)
+                return last_snapshot
+
+            status_text = self._extract_status_text(getattr(last_snapshot, "status", None))
+            status_lower = status_text.lower()
+
+            if status_lower in {"filled", "partially_filled", "canceled", "expired", "done_for_day", "rejected"}:
+                return last_snapshot
+
+            time.sleep(interval)
+
+        if last_snapshot is not None:
+            status_text = self._extract_status_text(getattr(last_snapshot, "status", None)) or "unknown"
+            LOGGER.info(
+                "Order %s still %s after %.1fs timeout; continuing with latest snapshot",
+                order_id,
+                status_text,
+                timeout,
+            )
+
+        return last_snapshot
+
+    def _build_order_result(
+        self,
+        order,
+        submitted_symbol: str,
+        trade_symbol: str,
+        side: str,
+        requested_quantity: float,
+        reference_price: float,
+    ) -> Dict[str, object]:
+        """Normalize an Alpaca order object into a serializable dict."""
+
+        order_id = getattr(order, "id", None)
+        status_text = self._extract_status_text(getattr(order, "status", None))
+        status_lower = status_text.lower() if status_text else ""
+
+        def _to_float(value, default: float = 0.0) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        filled_qty = _to_float(getattr(order, "filled_qty", None), 0.0)
+        filled_avg_price = _to_float(getattr(order, "filled_avg_price", None), reference_price)
+
+        return {
+            "order_id": order_id,
+            "symbol": submitted_symbol,
+            "alpaca_symbol": trade_symbol,
+            "side": side,
+            "quantity": requested_quantity,
+            "filled_quantity": filled_qty,
+            "price": reference_price,
+            "filled_avg_price": filled_avg_price,
+            "status": status_text,
+            "status_lower": status_lower,
+        }
+
+    @staticmethod
+    def _extract_status_text(status_raw) -> str:
+        """Convert various Alpaca status representations into a plain string."""
+        if status_raw is None:
+            return ""
+        if hasattr(status_raw, "value"):
+            status_text = str(status_raw.value)
+        elif hasattr(status_raw, "name"):
+            status_text = str(status_raw.name)
+        else:
+            status_text = str(status_raw)
+
+        if status_text.startswith("OrderStatus."):
+            status_text = status_text.split(".", 1)[1]
+
+        return status_text
 
     def _update_portfolio_from_order(
         self, portfolio_state: PortfolioState, order_result: Dict[str, object], trade_type: int, fraction: float, current_price: float
