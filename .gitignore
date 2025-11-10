@@ -42,6 +42,7 @@ Thumbs.db
 *.prof
 logs/
 *.trace.json
+profiles/
 
 # Data (large files)
 data/

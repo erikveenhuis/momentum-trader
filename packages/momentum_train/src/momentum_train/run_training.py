@@ -14,7 +14,6 @@ from typing import Any, Dict
 import numpy as np
 import torch
 import yaml  # Added for config loading
-from momentum_agent import RainbowDQNAgent
 from momentum_core.logging import get_logger, setup_package_logging
 from momentum_env import TradingEnv, TradingEnvConfig
 
@@ -23,6 +22,8 @@ from torch.amp import GradScaler
 
 # --- Add TensorBoard import ---
 from torch.utils.tensorboard import SummaryWriter
+
+from momentum_agent import RainbowDQNAgent
 
 from .data import DataManager
 from .trainer import RainbowTrainerModule
@@ -173,7 +174,12 @@ def evaluate_on_test_data(agent: RainbowDQNAgent, trainer: RainbowTrainerModule,
         trainer.close_cached_environments()
 
 
-def run_training(config: dict, data_manager: DataManager, resume_training_flag: bool):
+def run_training(
+    config: dict,
+    data_manager: DataManager,
+    resume_training_flag: bool,
+    reset_lr_on_resume: bool = False,
+):
     """Runs the training loop for the Rainbow DQN agent."""
     # Extract relevant config sections directly (will raise KeyError if missing)
     agent_config = config["agent"]
@@ -210,15 +216,6 @@ def run_training(config: dict, data_manager: DataManager, resume_training_flag: 
         logger.info("Initialized GradScaler for Automatic Mixed Precision (AMP).")
     # --------------------------------------------------
 
-    # --- Initialize TensorBoard Writer ---
-    log_dir_base = Path(model_dir) / "runs"
-    # Create a unique directory name using a timestamp
-    current_time = time.strftime("%Y%m%d-%H%M%S")
-    log_dir = log_dir_base / current_time
-    writer = SummaryWriter(log_dir=str(log_dir))
-    logger.info(f"TensorBoard logs will be saved to: {log_dir}")
-    # ----------------------------------
-
     # Agent class is fixed for this script
     AgentClass = RainbowDQNAgent
     # --- Add seed to agent_config --- # Added
@@ -238,6 +235,7 @@ def run_training(config: dict, data_manager: DataManager, resume_training_flag: 
     start_total_steps = 0
     initial_best_score = -np.inf
     initial_early_stopping_counter = 0
+    checkpoint_data: dict[str, Any] | None = None
     # optimizer_state = None <-- Removed unused variable
     # Buffer state loading is typically not done, but agent load_model now handles optimizer/steps
     # --- End Initialization ---
@@ -253,16 +251,35 @@ def run_training(config: dict, data_manager: DataManager, resume_training_flag: 
         else:
             logger.info(f"Resume flag is set. Attempting to load unified checkpoint from: {trainer_checkpoint_path}")
 
-            loaded_checkpoint = load_checkpoint(trainer_checkpoint_path)
+            checkpoint_data = load_checkpoint(trainer_checkpoint_path)
 
-            if loaded_checkpoint:
+            if checkpoint_data:
+                if reset_lr_on_resume:
+                    logger.info("Reset LR on resume requested. Removing optimizer/scheduler/scaler states from checkpoint.")
+                    removed_optimizer = checkpoint_data.pop("optimizer_state_dict", None)
+                    removed_scheduler = checkpoint_data.pop("scheduler_state_dict", None)
+                    removed_scaler = checkpoint_data.pop("scaler_state_dict", None)
+                    if removed_optimizer is not None:
+                        logger.info("  - Optimizer state removed. New optimizer will use config lr=%s.", agent_config.get("lr"))
+                    else:
+                        logger.warning("  - No optimizer state found to remove from checkpoint.")
+                    if removed_scheduler is not None:
+                        logger.info("  - LR scheduler state removed. Scheduler will restart fresh.")
+                    if removed_scaler is not None:
+                        logger.info("  - GradScaler state removed to avoid stale statistics.")
                 logger.info("Unified checkpoint loaded successfully.")
                 # Extract trainer state
-                start_episode = loaded_checkpoint.get("episode", 0)
-                initial_best_score = loaded_checkpoint.get("best_validation_metric", -np.inf)
-                initial_early_stopping_counter = loaded_checkpoint.get("early_stopping_counter", 0)
+                start_episode = checkpoint_data.get("episode", 0)
+                initial_best_score = checkpoint_data.get("best_validation_metric", -np.inf)
+                initial_early_stopping_counter = checkpoint_data.get("early_stopping_counter", 0)
+                if reset_lr_on_resume and initial_early_stopping_counter:
+                    logger.info(
+                        "Reset LR on resume: resetting early stopping counter from %d to 0.",
+                        initial_early_stopping_counter,
+                    )
+                    initial_early_stopping_counter = 0
                 # Temporary store trainer steps for comparison, agent steps are definitive
-                trainer_steps_from_checkpoint = loaded_checkpoint.get("total_train_steps", 0)
+                trainer_steps_from_checkpoint = checkpoint_data.get("total_train_steps", 0)
                 logger.info(
                     f"Extracted trainer state: Ep={start_episode}, BestScore={initial_best_score:.4f}, EarlyStopCounter={initial_early_stopping_counter}, TrainerSteps={trainer_steps_from_checkpoint}"
                 )
@@ -270,7 +287,7 @@ def run_training(config: dict, data_manager: DataManager, resume_training_flag: 
                 # Instantiate the agent *before* loading its state
                 try:
                     # Validate loaded config if necessary (agent init might do this)
-                    loaded_agent_config = loaded_checkpoint.get("agent_config")
+                    loaded_agent_config = checkpoint_data.get("agent_config")
                     if loaded_agent_config != agent_config:
                         logger.warning("Agent config in checkpoint differs from current config file. Using current config.")
                         # Decide if this should be an error or just a warning
@@ -279,7 +296,7 @@ def run_training(config: dict, data_manager: DataManager, resume_training_flag: 
                     # Pass scaler to Agent constructor
                     agent = AgentClass(config=agent_config, device=device, scaler=scaler)
                     logger.info("Agent instantiated. Attempting to load agent state from checkpoint...")
-                    agent_loaded = agent.load_state(loaded_checkpoint)  # Pass the whole dict
+                    agent_loaded = agent.load_state(checkpoint_data)  # Pass the whole dict
 
                     if agent_loaded:
                         # Prefer the trainer's recorded step count for resume consistency
@@ -302,6 +319,7 @@ def run_training(config: dict, data_manager: DataManager, resume_training_flag: 
                         initial_best_score = -np.inf
                         initial_early_stopping_counter = 0
                         # Agent instance exists but is fresh
+                        checkpoint_data = None
                 except Exception as e:
                     logger.error(
                         f"Error occurred while instantiating agent or loading state from checkpoint: {e}. Starting training from scratch.",
@@ -312,6 +330,7 @@ def run_training(config: dict, data_manager: DataManager, resume_training_flag: 
                     initial_best_score = -np.inf
                     initial_early_stopping_counter = 0
                     agent_loaded = False  # Ensure agent is re-instantiated below
+                    checkpoint_data = None
 
             else:
                 # Checkpoint file not found or failed basic loading/validation
@@ -327,6 +346,38 @@ def run_training(config: dict, data_manager: DataManager, resume_training_flag: 
 
     assert isinstance(agent, RainbowDQNAgent), "Agent not instantiated correctly"
     logger.info(f"Agent instantiated with {sum(p.numel() for p in agent.network.parameters()):,} parameters.")
+
+    # --- Initialize TensorBoard Writer ---
+    log_dir_base = Path(model_dir) / "runs"
+    log_dir_base.mkdir(parents=True, exist_ok=True)
+
+    resume_log_dir_str = checkpoint_data.get("tensorboard_log_dir") if checkpoint_data else None
+    log_dir_path: Path
+
+    if resume_training_flag and resume_log_dir_str:
+        log_dir_path = Path(resume_log_dir_str)
+        if not log_dir_path.is_absolute():
+            log_dir_path = (log_dir_base / log_dir_path).resolve()
+        log_dir_path.mkdir(parents=True, exist_ok=True)
+        writer_kwargs: dict[str, Any] = {"log_dir": str(log_dir_path)}
+        if start_total_steps > 0:
+            writer_kwargs["purge_step"] = start_total_steps
+        writer = SummaryWriter(**writer_kwargs)
+        logger.info(f"Resuming TensorBoard logging in existing directory: {log_dir_path}")
+    else:
+        if resume_training_flag:
+            if checkpoint_data is None:
+                logger.info("No checkpoint data available; creating a new TensorBoard run directory.")
+            else:
+                logger.warning("Checkpoint did not include TensorBoard log directory; creating a new run directory.")
+        current_time = time.strftime("%Y%m%d-%H%M%S")
+        log_dir_path = log_dir_base / current_time
+        log_dir_path.mkdir(parents=True, exist_ok=True)
+        writer = SummaryWriter(log_dir=str(log_dir_path))
+        logger.info(f"TensorBoard logs will be saved to: {log_dir_path}")
+
+    # Store log dir for downstream components if needed
+    config.setdefault("run", {})["tensorboard_log_dir"] = str(log_dir_path)
 
     # --- Instantiate Trainer ---
     trainer = RainbowTrainerModule(
@@ -415,6 +466,11 @@ def main():  # Remove default config_path
         help="Resume training from the latest checkpoint.",
     )
     parser.add_argument(
+        "--reset-lr-on-resume",
+        action="store_true",
+        help="When resuming, discard optimizer/scheduler states so learning rate resets to config value.",
+    )
+    parser.add_argument(
         "--log-level",
         default=None,
         help="Logging level (e.g. DEBUG, INFO, WARNING). Overrides MOMENTUM_LOG_LEVEL* environment variables.",
@@ -423,6 +479,7 @@ def main():  # Remove default config_path
     config_path = args.config_path
     # Use the command-line flag directly for resuming
     resume_training_flag = args.resume
+    reset_lr_on_resume = args.reset_lr_on_resume
     configure_logging(args.log_level)
 
     logger.info("Starting Rainbow DQN training script...")
@@ -476,7 +533,12 @@ def main():  # Remove default config_path
 
     if mode == "train":
         # Pass the resume_training_flag to run_training
-        trained_agent, trained_trainer = run_training(config, data_manager, resume_training_flag)
+        trained_agent, trained_trainer = run_training(
+            config,
+            data_manager,
+            resume_training_flag,
+            reset_lr_on_resume=reset_lr_on_resume,
+        )
         assert isinstance(trained_agent, RainbowDQNAgent), "run_training did not return a valid agent"
         assert isinstance(trained_trainer, RainbowTrainerModule), "run_training did not return a valid trainer"
 

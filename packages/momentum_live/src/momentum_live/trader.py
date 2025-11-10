@@ -6,12 +6,14 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from typing import Deque, Dict, Iterable, Optional
 
 import numpy as np
-from momentum_agent import RainbowDQNAgent
 from momentum_core.logging import get_logger
 from momentum_env.trading import PortfolioState, TradingLogic
+
+from momentum_agent import RainbowDQNAgent
 
 from .config import LiveTradingConfig
 
@@ -398,6 +400,15 @@ class MomentumLiveTrader:
             spendable_cash = min(self.shared_balance, available_cash)
 
             LOGGER.info(
+                "Account status | trading_blocked=%s | transfers_blocked=%s | account_blocked=%s | shorting_enabled=%s | status=%s",
+                getattr(account, "trading_blocked", "n/a"),
+                getattr(account, "transfers_blocked", "n/a"),
+                getattr(account, "account_blocked", "n/a"),
+                getattr(account, "shorting_enabled", "n/a"),
+                getattr(account, "status", "n/a"),
+            )
+
+            LOGGER.info(
                 "Order sizing | symbol=%s | action=%s | fraction=%.2f | price=%.2f | shared_balance=%.2f | account_cash=%.2f | spendable_cash=%.2f",
                 symbol,
                 action,
@@ -502,10 +513,18 @@ class MomentumLiveTrader:
             order = self.trading_client.submit_order(order_request)
 
             LOGGER.info(f"Submitted {action.upper()} order for {quantity:.6f} {symbol} at market price")
+            LOGGER.info(
+                "Order submitted snapshot | %s",
+                self._order_debug_snapshot(order),
+            )
 
             completed_order = self._wait_for_order_completion(order.id)
             if completed_order is not None:
                 order = completed_order
+                LOGGER.info(
+                    "Order completion snapshot | %s",
+                    self._order_debug_snapshot(order),
+                )
 
             return self._build_order_result(
                 order=order,
@@ -624,6 +643,8 @@ class MomentumLiveTrader:
 
         deadline = time.monotonic() + max(timeout, interval)
         last_snapshot = None
+        last_status = None
+        last_filled = None
 
         while time.monotonic() < deadline:
             try:
@@ -634,6 +655,23 @@ class MomentumLiveTrader:
 
             status_text = self._extract_status_text(getattr(last_snapshot, "status", None))
             status_lower = status_text.lower()
+            filled_qty = self._to_float(getattr(last_snapshot, "filled_qty", None))
+            avg_price = self._to_float(getattr(last_snapshot, "filled_avg_price", None), default=0.0)
+            failed_reason = getattr(last_snapshot, "failed_reason", None)
+            status_message = getattr(last_snapshot, "status_message", None)
+
+            if status_lower != last_status or filled_qty != last_filled:
+                LOGGER.info(
+                    "Order %s status update | status=%s | filled_qty=%.6f | avg_fill=%.2f | failed_reason=%s | status_message=%s",
+                    order_id,
+                    status_text or "unknown",
+                    filled_qty,
+                    avg_price,
+                    failed_reason or "",
+                    status_message or "",
+                )
+                last_status = status_lower
+                last_filled = filled_qty
 
             if status_lower in {"filled", "partially_filled", "canceled", "expired", "done_for_day", "rejected"}:
                 return last_snapshot
@@ -643,10 +681,11 @@ class MomentumLiveTrader:
         if last_snapshot is not None:
             status_text = self._extract_status_text(getattr(last_snapshot, "status", None)) or "unknown"
             LOGGER.info(
-                "Order %s still %s after %.1fs timeout; continuing with latest snapshot",
+                "Order %s still %s after %.1fs timeout; continuing with latest snapshot | snapshot=%s",
                 order_id,
                 status_text,
                 timeout,
+                self._order_debug_snapshot(last_snapshot),
             )
 
         return last_snapshot
@@ -666,14 +705,11 @@ class MomentumLiveTrader:
         status_text = self._extract_status_text(getattr(order, "status", None))
         status_lower = status_text.lower() if status_text else ""
 
-        def _to_float(value, default: float = 0.0) -> float:
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                return default
-
-        filled_qty = _to_float(getattr(order, "filled_qty", None), 0.0)
-        filled_avg_price = _to_float(getattr(order, "filled_avg_price", None), reference_price)
+        filled_qty = self._to_float(getattr(order, "filled_qty", None), 0.0)
+        filled_avg_price = self._to_float(getattr(order, "filled_avg_price", None), reference_price)
+        notional = self._to_float(getattr(order, "notional", None), requested_quantity * reference_price)
+        limit_price = self._to_float(getattr(order, "limit_price", None), 0.0)
+        stop_price = self._to_float(getattr(order, "stop_price", None), 0.0)
 
         return {
             "order_id": order_id,
@@ -684,8 +720,17 @@ class MomentumLiveTrader:
             "filled_quantity": filled_qty,
             "price": reference_price,
             "filled_avg_price": filled_avg_price,
+            "notional": notional,
+            "limit_price": limit_price,
+            "stop_price": stop_price,
             "status": status_text,
             "status_lower": status_lower,
+            "failed_reason": getattr(order, "failed_reason", None),
+            "status_message": getattr(order, "status_message", None),
+            "client_order_id": getattr(order, "client_order_id", None),
+            "submitted_at": getattr(order, "submitted_at", None),
+            "filled_at": getattr(order, "filled_at", None),
+            "updated_at": getattr(order, "updated_at", None),
         }
 
     @staticmethod
@@ -704,6 +749,70 @@ class MomentumLiveTrader:
             status_text = status_text.split(".", 1)[1]
 
         return status_text
+
+    def _order_debug_snapshot(self, order) -> Dict[str, object]:
+        if order is None:
+            return {}
+
+        attributes = [
+            "id",
+            "client_order_id",
+            "symbol",
+            "qty",
+            "notional",
+            "filled_qty",
+            "filled_avg_price",
+            "side",
+            "type",
+            "order_type",
+            "time_in_force",
+            "limit_price",
+            "stop_price",
+            "status",
+            "status_message",
+            "failed_reason",
+            "submitted_at",
+            "filled_at",
+            "canceled_at",
+            "expired_at",
+            "created_at",
+            "updated_at",
+        ]
+
+        snapshot: Dict[str, object] = {}
+        for attr in attributes:
+            value = getattr(order, attr, None)
+            snapshot[attr] = self._serialize_order_value(value)
+
+        return snapshot
+
+    @staticmethod
+    def _serialize_order_value(value):
+        if value is None:
+            return None
+        if isinstance(value, (datetime,)):
+            return value.isoformat()
+        if isinstance(value, Decimal):
+            return float(value)
+        if isinstance(value, (int, float, str, bool)):
+            return value
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            pass
+        if hasattr(value, "isoformat"):
+            try:
+                return value.isoformat()
+            except Exception:  # pragma: no cover - defensive
+                return str(value)
+        return str(value)
+
+    @staticmethod
+    def _to_float(value, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
 
     def _update_portfolio_from_order(
         self, portfolio_state: PortfolioState, order_result: Dict[str, object], trade_type: int, fraction: float, current_price: float

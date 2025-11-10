@@ -45,6 +45,12 @@ except ImportError:
 logger = get_logger("data_processing.extract_raw")
 
 
+class DiskWriteError(RuntimeError):
+    """Raised when extracted CSV data cannot be written to disk."""
+
+    pass
+
+
 def configure_logging(log_level: Optional[str] = None) -> None:
     """Configure logging for the extract_raw script."""
 
@@ -311,19 +317,33 @@ def extract_gz_and_split_by_ticker(
             if ticker_day_df.empty:
                 continue
 
-            try:
-                date_str = file_date.strftime("%Y-%m-%d")
-                safe_ticker = re.sub(r'[\\\\/*?"<>|]', "_", ticker_name)  # Clean ticker for filename
-                output_file = output_dir / f"{date_str}_{safe_ticker}.csv"
+            date_str = file_date.strftime("%Y-%m-%d")
+            safe_ticker = re.sub(r'[\\\\/*?"<>|]', "_", ticker_name)  # Clean ticker for filename
+            output_file = output_dir / f"{date_str}_{safe_ticker}.csv"
 
+            try:
                 # Save the filtered, non-anomalous raw data
                 ticker_day_df.drop(columns=["date"]).sort_values("window_start").to_csv(output_file, index=False)
                 saved_count += 1
                 # logger.debug(f"[{input_gz_path.name}] Saved extracted file: {output_file.name}")
-
+            except OSError as e:
+                if output_file.exists():
+                    try:
+                        output_file.unlink()
+                    except Exception as cleanup_err:
+                        logger.warning(
+                            f"[{input_gz_path.name}] Failed to remove incomplete file {output_file.name} after disk write error: {cleanup_err}"
+                        )
+                logger.error(
+                    f"[{input_gz_path.name}] Disk write error while saving {output_file.name}: {e}",
+                    exc_info=True,
+                )
+                raise DiskWriteError(f"Disk write error for {output_file}") from e
             except Exception as e:
-                # Log remains ERROR, clearly indicates a save failure skip
-                logger.error(f"[{input_gz_path.name}] Skipped (Save Error): Ticker {ticker_name} for date {date_str}. Reason: {e}")
+                logger.error(
+                    f"[{input_gz_path.name}] Skipped (Save Error): Ticker {ticker_name} for date {date_str}. Reason: {e}",
+                    exc_info=True,
+                )
                 save_error_skips += 1  # Use the dedicated counter
 
         # Calculate total skips for this file
@@ -355,6 +375,8 @@ def extract_gz_and_split_by_ticker(
         logger.error(f"[{input_gz_path.name}] Skipping: Input GZ file not found.")
         # Update return to include new count
         return 0, 0, 0, 0, 0, 0, 0
+    except DiskWriteError:
+        raise
     except Exception as e:
         logger.error(f"Unexpected error processing GZ file {input_gz_path.name}: {e}", exc_info=True)
         # Cannot reliably determine counts, return zeros, including new counter
@@ -503,6 +525,12 @@ def run_extraction(
                             )
                             logger.info(f"Processed GZ {processed_files_count}/{len(files_to_process)} ({gz_file.name}) -> {skip_summary}")
 
+                    except DiskWriteError as exc:
+                        logger.error(
+                            f"Aborting extraction due to disk write error while processing {gz_file.name}: {exc}",
+                            exc_info=True,
+                        )
+                        raise
                     except Exception as exc:
                         logger.error(f"Error getting result for GZ file {gz_file.name}: {exc}", exc_info=True)
 

@@ -7,9 +7,11 @@ filter_complete_days: true
 exact_datapoints: 1440
 year_filter: null  # or e.g., '2023'
 filter_anomalies: true
-anomaly_std_dev_threshold: 3.0 # Common values are 3.0 to 5.0
-ohlc_range_anomaly_threshold: 0.15 # e.g., 15% range difference (high-low)/high
+anomaly_std_dev_threshold: 5.0 # Common values are 3.0 to 5.0
+ohlc_range_anomaly_threshold: 0.3 # e.g., 15% range difference (high-low)/high
 ohlc_range_anomaly_occurrence_threshold: 5 # Flag if more than 5 such candles exist
 exclude_tickers:
   - UST-USD
   - AMP-USD
+  - USDT-USD
+  - DAI-USD

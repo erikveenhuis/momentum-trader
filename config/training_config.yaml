@@ -19,7 +19,7 @@ logging:
 agent:
   # Core RL params
   gamma: 0.99
-  lr: 0.0003 # Learning rate (reduced for stability with transformer backbone)
+  lr: 0.001 # Learning rate (reduced for stability with transformer backbone)
   batch_size: 2048
   replay_buffer_size: 500000
   target_update_freq: 600 # Learner steps per target sync (~1-2 trading days)
@@ -50,8 +50,8 @@ agent:
   lr_scheduler_type: 'ReduceLROnPlateau' # e.g., 'StepLR', 'CosineAnnealingLR', 'ReduceLROnPlateau'
   lr_scheduler_params: # Parameters specific to the chosen scheduler
     mode: 'max'        # 'max' because higher validation score is better
-    factor: 0.1        # Factor by which the learning rate will be reduced. new_lr = lr * factor
-    patience: 5       # Number of epochs with no improvement after which learning rate will be reduced
+    factor: 0.5        # Factor by which the learning rate will be reduced. new_lr = lr * factor
+    patience: 10       # Number of epochs with no improvement after which learning rate will be reduced
     threshold: 0.0001  # Threshold for measuring the new optimum, to only focus on significant changes
     min_lr: 0.000001   # A lower bound on the learning rate
 
@@ -70,10 +70,11 @@ environment:
 trainer:
   seed: 42
   warmup_steps: 30000     # Steps with random actions before training
-  update_freq: 2          # Agent learning update frequency (steps)
+  update_freq: 10          # Agent learning update frequency (steps)
   log_freq: 60            # Logging frequency (steps)
-  validation_freq: 100     # Validation frequency (episodes)
-  checkpoint_save_freq: 10 # Checkpoint save frequency (episodes)
+  per_stats_log_freq: 120 # Frequency (env steps) for PER stats between episode summaries; set to 0 for episode-only logs
+  validation_freq: 30     # Validation frequency (episodes)
+  checkpoint_save_freq: 30 # Checkpoint save frequency (episodes)
   reward_window: 10       # Window for averaging episode rewards in logs
   early_stopping_patience: 15 # Episodes without validation improvement to stop
   min_validation_threshold: 0.0 # Minimum score change considered improvement

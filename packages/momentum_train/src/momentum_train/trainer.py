@@ -7,12 +7,13 @@ from typing import Dict, List, Set, Tuple  # Added Dict for cached envs
 
 import numpy as np
 import torch
-from momentum_agent import RainbowDQNAgent  # Updated import path
-from momentum_agent.constants import ACCOUNT_STATE_DIM  # Import constant
 from momentum_core.logging import get_logger
 from momentum_env import TradingEnv, TradingEnvConfig  # Use installed package
 from torch.cuda.amp import GradScaler
 from torch.utils.tensorboard import SummaryWriter
+
+from momentum_agent import RainbowDQNAgent  # Updated import path
+from momentum_agent.constants import ACCOUNT_STATE_DIM  # Import constant
 
 from .data import DataManager  # Use relative import
 from .metrics import (  # Use relative import
@@ -65,6 +66,25 @@ class RainbowTrainerModule:
         self.reward_window = self.trainer_config.get("reward_window", 10)
         self.update_freq = self.trainer_config.get("update_freq", 4)
         self.log_freq = self.trainer_config.get("log_freq", 100)
+        raw_per_stats_freq = self.trainer_config.get("per_stats_log_freq", self.log_freq)
+        try:
+            self.per_stats_log_freq = int(raw_per_stats_freq)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid per_stats_log_freq value %s; using log_freq (%s) instead.",
+                raw_per_stats_freq,
+                self.log_freq,
+            )
+            self.per_stats_log_freq = self.log_freq
+        if self.per_stats_log_freq < 0:
+            logger.warning(
+                "per_stats_log_freq must be >= 0 (received %s); using log_freq (%s) instead.",
+                self.per_stats_log_freq,
+                self.log_freq,
+            )
+            self.per_stats_log_freq = self.log_freq
+        elif self.per_stats_log_freq == 0:
+            logger.info("PER stats logging disabled because per_stats_log_freq is set to 0.")
         self.warmup_steps = self.trainer_config.get("warmup_steps", 50000)
         self.invalid_action_window = self.trainer_config.get("invalid_action_window", 20)
         self.invalid_action_rate_window: deque[float] = deque(maxlen=self.invalid_action_window)
@@ -220,6 +240,9 @@ class RainbowTrainerModule:
             # --- END ADDED Scheduler State ---
             # --- END ADDED Agent State ---
         }
+
+        if self.writer:
+            checkpoint["tensorboard_log_dir"] = getattr(self.writer, "log_dir", None)
 
         # Optionally add current validation score to the checkpoint data if available
         if validation_score is not None:
@@ -454,6 +477,45 @@ class RainbowTrainerModule:
             f"PosValue=${position_value:.2f}"
         )
 
+    def _maybe_log_per_stats(self, total_train_steps: int, *, force: bool = False) -> None:
+        """Log prioritized replay buffer statistics at the configured frequency or when forced."""
+        if total_train_steps <= 0:
+            return
+        if self.per_stats_log_freq == 0 and not force:
+            return
+        if not force and (self.per_stats_log_freq < 1 or total_train_steps % self.per_stats_log_freq != 0):
+            return
+
+        get_per_stats = getattr(self.agent, "get_per_stats", None)
+        if not callable(get_per_stats):
+            logger.debug("Agent does not expose get_per_stats; skipping PER stats logging.")
+            return
+
+        try:
+            stats = get_per_stats()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.error(f"Failed to collect PER stats: {exc}", exc_info=True)
+            return
+
+        if not stats:
+            return
+
+        logger.info(
+            "PER Stats @ env step %s (learner %s): buffer=%s/%s (%.2f%%), alpha=%.3f, beta=%.3f, "
+            "beta_progress=%.1f%%, avg_priority=%.6f, max_priority=%.6f, total_priority=%.6f",
+            total_train_steps,
+            stats.get("total_steps", -1),
+            stats.get("size", 0),
+            stats.get("capacity", 0),
+            stats.get("fill_ratio", 0.0) * 100.0,
+            stats.get("alpha", 0.0),
+            stats.get("beta", 0.0),
+            stats.get("beta_progress", 0.0) * 100.0,
+            stats.get("avg_priority", 0.0),
+            stats.get("max_priority", 0.0),
+            stats.get("total_priority", 0.0),
+        )
+
     def _log_episode_summary(
         self,
         episode: int,
@@ -464,6 +526,7 @@ class RainbowTrainerModule:
         tracker: PerformanceTracker,
         final_info: dict,
         invalid_action_count: int,
+        total_train_steps: int,
     ):
         """Logs the summary statistics at the end of an episode."""
         avg_reward_window = np.mean(total_rewards[-self.reward_window :])
@@ -532,6 +595,9 @@ class RainbowTrainerModule:
             self.writer.add_scalar("Train/Invalid Action Rate", invalid_action_rate, episode)
             self.writer.add_scalar("Train/Rolling Invalid Action Rate", rolling_invalid_rate, episode)
         # ------------------------------------------ #
+
+        # Always log PER stats at episode boundaries (unless explicitly disabled)
+        self._maybe_log_per_stats(total_train_steps, force=True)
 
     def _handle_validation_and_checkpointing(
         self,
@@ -613,6 +679,13 @@ class RainbowTrainerModule:
                     self.agent.step_lr_scheduler(validation_score)
                     new_lr = self.agent.optimizer.param_groups[0]["lr"]
                     logger.info(f"[LR Scheduler] After step: LR={new_lr:.8f}, metric={validation_score:.6f}")
+                    if new_lr < current_lr - 1e-12:
+                        if self.early_stopping_counter > 0:
+                            logger.info(
+                                "[LR Scheduler] Learning rate reduced; resetting early stopping counter (was %d).",
+                                self.early_stopping_counter,
+                            )
+                        self.early_stopping_counter = 0
                     # Log current learning rate to TensorBoard after potential step
                     if self.writer:
                         self.writer.add_scalar("Train/Learning_Rate", new_lr, total_train_steps)  # Use total_train_steps or episode
@@ -1280,6 +1353,9 @@ class RainbowTrainerModule:
             # Optionally render the environment for visualization
             self._maybe_render(env, "train", steps_in_episode)
 
+            # Log PER statistics based on total training steps
+            self._maybe_log_per_stats(total_train_steps)
+
             # Log step progress periodically
             if steps_in_episode % self.log_freq == 0:
                 self._log_step_progress(
@@ -1376,6 +1452,7 @@ class RainbowTrainerModule:
                     tracker,
                     info,
                     invalid_action_count,
+                    total_train_steps,
                 )
 
                 # 4. Handle validation and checkpointing

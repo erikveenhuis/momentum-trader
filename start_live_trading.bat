@@ -5,22 +5,6 @@ REM This script sets up credentials and starts live trading
 REM Get the directory where this batch file is located
 cd /d "%~dp0"
 
-REM Check for lock file (indicates another instance is running)
-if exist "momentum_trading.lock" (
-    echo ⚠️  WARNING: Found momentum_trading.lock file
-    echo This indicates another momentum trading session may be running.
-    echo This could cause connection limit issues with Alpaca.
-    echo.
-    for /f "tokens=*" %%i in (momentum_trading.lock) do echo Lock file created: %%i
-    echo.
-    echo If you're sure no other instance is running, you can delete the lock file.
-    echo Press Ctrl+C to cancel, or Enter to continue anyway...
-    pause >nul
-    echo.
-) else (
-    echo %date% %time% > momentum_trading.lock
-)
-
 REM Terminate any existing momentum_live.cli processes before starting
 echo Checking for existing live trading Python processes...
 set "KILLED_PROCESSES=0"
@@ -181,8 +165,6 @@ if %EXITCODE% equ 1 (
 ) else (
     echo Live trading session ended.
 )
-echo Cleaning up lock file...
-if exist "momentum_trading.lock" del "momentum_trading.lock"
 echo Restoring default power settings...
 powercfg /change standby-timeout-ac 30 >nul 2>&1
 powercfg /change standby-timeout-dc 15 >nul 2>&1

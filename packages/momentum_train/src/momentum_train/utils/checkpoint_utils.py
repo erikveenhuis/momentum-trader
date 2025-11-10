@@ -9,19 +9,44 @@ import torch
 logger = logging.getLogger("CheckpointUtils")
 
 
-def find_latest_checkpoint(model_dir: str = "models", model_prefix: str = "checkpoint_rainbow") -> Optional[str]:
-    """Finds the latest checkpoint file based on timestamp or name."""
+def find_latest_checkpoint(model_dir: str = "models", model_prefix: str = "checkpoint_trainer") -> Optional[str]:
+    """Finds the latest checkpoint file based on episode number in filename.
+
+    Uses episode number rather than modification time because:
+    - Episode number directly indicates training progress
+    - Modification time can be unreliable (files touched without being latest)
+    - In this training setup, episodes have consistent step counts (~14K steps each)
+    - Faster than loading checkpoints to check total_steps
+
+    Alternative approaches considered:
+    - Total training steps: More precise but requires loading each checkpoint
+    - Validation score: Would resume from best model, not latest progress
+    - Modification time: Unreliable as demonstrated by the ep10 file issue
+    """
+    import re
+
     # First try to find the latest checkpoint with the new naming pattern
     # Look for files matching the pattern: checkpoint_trainer_latest_YYYYMMDD_epXXX_rewardX.XXXX.pt
     pattern = os.path.join(model_dir, f"{model_prefix}_latest_*_ep*_reward*.pt")
     matching_files = glob.glob(pattern)
 
     if matching_files:
-        # Sort files by modification time (newest first)
-        matching_files.sort(key=os.path.getmtime, reverse=True)
-        latest_path = matching_files[0]
-        logger.info(f"Found latest checkpoint with new naming pattern: {latest_path}")
-        return latest_path
+        # Extract episode numbers from filenames and find the one with highest episode
+        episode_files = []
+        for file_path in matching_files:
+            filename = os.path.basename(file_path)
+            # Match pattern: checkpoint_trainer_latest_YYYYMMDD_ep{episode}_reward{reward}.pt
+            match = re.search(r"_ep(\d+)_", filename)
+            if match:
+                episode_num = int(match.group(1))
+                episode_files.append((episode_num, file_path))
+
+        if episode_files:
+            # Sort by episode number (highest first)
+            episode_files.sort(key=lambda x: x[0], reverse=True)
+            latest_episode, latest_path = episode_files[0]
+            logger.info(f"Found latest checkpoint (episode {latest_episode}): {latest_path}")
+            return latest_path
 
     # Fallback to old naming pattern
     latest_path = os.path.join(model_dir, f"{model_prefix}_latest.pt")

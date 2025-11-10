@@ -197,7 +197,12 @@ def test_run_training_resume_uses_trainer_steps(monkeypatch, tmp_path):
 
     data_manager = StubDataManager()
 
-    agent, trainer = run_training_module.run_training(config, data_manager, resume_training_flag=True)
+    agent, trainer = run_training_module.run_training(
+        config,
+        data_manager,
+        resume_training_flag=True,
+        reset_lr_on_resume=False,
+    )
 
     assert isinstance(trainer, StubTrainer)
     assert trainer.captured_start_total_steps == 1234

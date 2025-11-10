@@ -255,6 +255,47 @@ class RainbowDQNAgent:
         self.total_steps = 0  # Track total steps for target network updates and beta annealing
         self.last_td_error_stats: dict[str, float] | None = None
 
+    def get_per_stats(self) -> dict[str, float | int]:
+        """
+        Returns summary statistics for the prioritized replay buffer.
+
+        Keys:
+            size (int): Number of experiences currently in the buffer.
+            capacity (int): Maximum buffer capacity.
+            fill_ratio (float): size / capacity (0 if capacity is 0).
+            alpha (float): Current PER alpha exponent.
+            beta (float): Current PER beta value.
+            beta_progress (float): Fraction of beta annealing completed (0-1).
+            total_priority (float): Sum of all priorities in the tree.
+            avg_priority (float): Average priority for stored experiences.
+            max_priority (float): Maximum priority observed so far.
+            total_steps (int): Total learner steps recorded by the agent.
+        """
+        buffer = self.buffer
+        size = len(buffer)
+        capacity = getattr(buffer, "capacity", 0)
+        fill_ratio = (size / capacity) if capacity else 0.0
+        total_priority = float(buffer.tree.total()) if size > 0 else 0.0
+        avg_priority = (total_priority / size) if size > 0 else 0.0
+        max_priority = float(getattr(buffer, "max_priority", 0.0))
+        beta = float(getattr(buffer, "beta", 0.0))
+        alpha = float(getattr(buffer, "alpha", 0.0))
+        beta_frames = getattr(buffer, "beta_frames", 0)
+        beta_progress = min(1.0, self.total_steps / beta_frames) if beta_frames else 1.0
+
+        return {
+            "size": size,
+            "capacity": capacity,
+            "fill_ratio": fill_ratio,
+            "alpha": alpha,
+            "beta": beta,
+            "beta_progress": beta_progress,
+            "total_priority": total_priority,
+            "avg_priority": avg_priority,
+            "max_priority": max_priority,
+            "total_steps": self.total_steps,
+        }
+
     def select_action(self, obs):
         """Selects action based on the current Q-value estimates using Noisy Nets."""
         if self.debug_mode:

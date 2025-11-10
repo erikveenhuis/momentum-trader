@@ -1,6 +1,5 @@
 @echo off
-REM Resume training shortcut for Momentum Trader
-REM Double-click this file to resume training from checkpoint
+REM Resume training while resetting optimizer and LR scheduler state to config defaults.
 
 REM Get the directory where this batch file is located
 cd /d "%~dp0"
@@ -82,31 +81,28 @@ goto :no_checkpoints
     echo.
     echo The resume feature requires checkpoint files to continue training.
     echo Checkpoints are automatically saved during training based on:
-    echo   - checkpoint_save_freq setting in config/training_config.yaml
+    echo   - checkpoint_save_freq setting in config\training_config.yaml
     echo   - Currently set to save every 30 episodes
     echo.
     echo To create checkpoints for resuming:
     echo   1. Start fresh training with start_training.bat
     echo   2. Let it run for at least 30 episodes to save first checkpoint
     echo   3. Interrupt training manually (Ctrl+C) to create resume point
-    echo   4. Then use start_training_resume.bat to continue
-    echo.
-    echo Alternatively, reduce checkpoint_save_freq in config/training_config.yaml
-    echo for more frequent saves during training.
+    echo   4. Then use this script to continue with a reset learning rate
     echo.
     goto :cleanup_and_exit
 
 :found_checkpoint
 goto :start_training
 
-REM Start training with resume enabled in background
 :start_training
 echo.
-echo Found checkpoint files! Resuming training from checkpoint in background...
-echo Training logs will be written to logs/training.log
-echo You can monitor progress by opening the "Momentum Trader Training (Resume)" window
+echo Found checkpoint files! Resuming training with LR reset in background...
+echo The optimizer and LR scheduler states will be re-initialised to match the current config.
+echo Training logs will be written to logs\training.log
+echo You can monitor progress by opening the "Momentum Trader Training (Resume - Reset LR)" window
 echo.
-start "Momentum Trader Training (Resume)" cmd /c "cd /d %~dp0 && call venv\Scripts\activate.bat && python -m momentum_train.run_training --config_path config/training_config.yaml --resume && echo. && echo Training completed successfully! && echo Restoring default power settings... && powercfg /change standby-timeout-ac 30 >nul 2>&1 && powercfg /change standby-timeout-dc 15 >nul 2>&1 && echo Power settings restored. && pause"
+start "Momentum Trader Training (Resume - Reset LR)" cmd /c "cd /d %~dp0 && call venv\Scripts\activate.bat && python -m momentum_train.run_training --config_path config/training_config.yaml --resume --reset-lr-on-resume && echo. && echo Training completed successfully! && echo Restoring default power settings... && powercfg /change standby-timeout-ac 30 >nul 2>&1 && powercfg /change standby-timeout-dc 15 >nul 2>&1 && echo Power settings restored. && pause"
 
 REM Check if start command succeeded
 if errorlevel 1 (
@@ -116,7 +112,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo SUCCESS: Training resumed in background with sleep prevention enabled!
+echo SUCCESS: Training resumed in background with learning rate reset and sleep prevention enabled!
 echo Power settings will be restored when training completes.
 echo You can now close this window safely.
 echo.
