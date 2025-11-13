@@ -9,3 +9,38 @@ line_length = 100
 [tool.flake8]
 max-line-length = 100
 extend-ignore = ["E203", "W503"]
+
+[tool.pytest.ini_options]
+norecursedirs = [
+    ".git",
+    "venv",
+    "logs",
+    "models",
+    "results",
+    "data",
+    "tests/test_networks_old.py",
+]
+addopts = "-ra --color=yes -rP --cov=packages --cov-report=html"
+testpaths = [
+    "tests",
+    "packages/momentum_core/tests",
+    "packages/momentum_env/tests",
+    "packages/momentum_agent/tests",
+    "packages/momentum_train/tests",
+    "packages/momentum_live/tests",
+]
+pythonpath = [
+    ".",
+    "packages/momentum_core/src",
+    "packages/momentum_env/src",
+    "packages/momentum_agent/src",
+    "packages/momentum_train/src",
+    "packages/momentum_live/src",
+]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+markers = [
+    "integration: marks tests as integration tests",
+    "unit: marks tests as unit tests",
+]

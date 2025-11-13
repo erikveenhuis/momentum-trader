@@ -66,6 +66,15 @@ class RainbowTrainerModule:
         self.reward_window = self.trainer_config.get("reward_window", 10)
         self.update_freq = self.trainer_config.get("update_freq", 4)
         self.log_freq = self.trainer_config.get("log_freq", 100)
+        raw_grad_updates = self.trainer_config.get("gradient_updates_per_step", 1)
+        try:
+            self.gradient_updates_per_step = max(1, int(raw_grad_updates))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid gradient_updates_per_step value %s; defaulting to 1.",
+                raw_grad_updates,
+            )
+            self.gradient_updates_per_step = 1
         raw_per_stats_freq = self.trainer_config.get("per_stats_log_freq", self.log_freq)
         try:
             self.per_stats_log_freq = int(raw_per_stats_freq)
@@ -418,23 +427,35 @@ class RainbowTrainerModule:
         self.agent.store_transition(obs, action, reward, next_obs, done)
 
         # Perform learning update (only if not done from env error)
+        losses_this_step: list[float] = []
         if not done and (
             len(self.agent.buffer) >= self.agent.batch_size
             and total_train_steps > self.warmup_steps
             and total_train_steps % self.update_freq == 0
         ):
             try:
-                # Add gradient clipping
-                loss_value = self.agent.learn()
+                for _ in range(self.gradient_updates_per_step):
+                    learn_loss = self.agent.learn()
+                    if learn_loss is None:
+                        break
+                    losses_this_step.append(float(learn_loss))
 
-                # --- Log Loss to TensorBoard --- #
-                if self.writer and loss_value is not None:
-                    self.writer.add_scalar("Train/Loss", loss_value, total_train_steps)
-                    td_stats = getattr(self.agent, "last_td_error_stats", None)
-                    if td_stats:
-                        self.writer.add_scalar("Train/TD_Error_Mean", td_stats.get("mean", float("nan")), total_train_steps)
-                        self.writer.add_scalar("Train/TD_Error_Std", td_stats.get("std", float("nan")), total_train_steps)
-                # ---------------------------- #
+                if losses_this_step:
+                    loss_value = float(np.mean(losses_this_step))
+
+                    # --- Log Loss to TensorBoard --- #
+                    if self.writer:
+                        self.writer.add_scalar("Train/Loss", loss_value, total_train_steps)
+                        self.writer.add_scalar(
+                            "Train/Gradient Updates Per Step",
+                            len(losses_this_step),
+                            total_train_steps,
+                        )
+                        td_stats = getattr(self.agent, "last_td_error_stats", None)
+                        if td_stats:
+                            self.writer.add_scalar("Train/TD_Error_Mean", td_stats.get("mean", float("nan")), total_train_steps)
+                            self.writer.add_scalar("Train/TD_Error_Std", td_stats.get("std", float("nan")), total_train_steps)
+                    # ---------------------------- #
 
             except Exception:
                 logger.error(

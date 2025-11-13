@@ -45,7 +45,7 @@ def per_buffer():
 # --- Test Cases --- #
 
 
-@pytest.mark.unittest
+@pytest.mark.unit
 def test_buffer_init(per_buffer):
     """Test buffer initialization."""
     assert isinstance(per_buffer.tree, SumTree)
@@ -56,7 +56,7 @@ def test_buffer_init(per_buffer):
     assert len(per_buffer) == 0
 
 
-@pytest.mark.unittest
+@pytest.mark.unit
 def test_buffer_store_single(per_buffer):
     """Test storing a single experience."""
     exp = create_dummy_experience()
@@ -67,7 +67,7 @@ def test_buffer_store_single(per_buffer):
     assert per_buffer.buffer[0] == exp  # Check if deque stores correctly
 
 
-@pytest.mark.unittest
+@pytest.mark.unit
 def test_buffer_store_respects_max_priority(per_buffer):
     """New experiences should inherit the tracked max priority without reapplying alpha."""
     per_buffer.max_priority = 0.25
@@ -78,7 +78,7 @@ def test_buffer_store_respects_max_priority(per_buffer):
     assert per_buffer.tree.total() == pytest.approx(0.25)
 
 
-@pytest.mark.unittest
+@pytest.mark.unit
 def test_buffer_store_multiple(per_buffer):
     """Test storing multiple experiences."""
     num_items = 50
@@ -100,7 +100,7 @@ def test_buffer_store_multiple(per_buffer):
     assert per_buffer.buffer[-1] == last_exp
 
 
-@pytest.mark.unittest
+@pytest.mark.unit
 def test_buffer_store_exceed_capacity(per_buffer):
     """Test storing more experiences than capacity."""
     for i in range(BUFFER_CAPACITY + 20):
@@ -114,7 +114,7 @@ def test_buffer_store_exceed_capacity(per_buffer):
     assert per_buffer.buffer_write_idx == 20
 
 
-@pytest.mark.unittest
+@pytest.mark.unit
 def test_buffer_sample_empty(per_buffer):
     """Test sampling from an empty buffer."""
     batch, indices, weights = per_buffer.sample(BATCH_SIZE)
@@ -123,7 +123,7 @@ def test_buffer_sample_empty(per_buffer):
     assert weights is None
 
 
-@pytest.mark.unittest
+@pytest.mark.unit
 def test_buffer_sample_insufficient(per_buffer):
     """Test sampling when buffer has fewer items than batch size."""
     for i in range(BATCH_SIZE - 1):
@@ -135,7 +135,7 @@ def test_buffer_sample_insufficient(per_buffer):
     assert weights is None
 
 
-@pytest.mark.unittest
+@pytest.mark.unit
 def test_buffer_sample_sufficient(per_buffer):
     """Test sampling when buffer has enough items."""
     for i in range(BUFFER_CAPACITY):
@@ -177,7 +177,7 @@ def test_buffer_sample_sufficient(per_buffer):
     assert np.all(weights > 0) and np.all(weights <= 1.0 + 1e-6)
 
 
-@pytest.mark.unittest
+@pytest.mark.unit
 def test_buffer_update_priorities(per_buffer):
     """Test updating priorities after sampling."""
     for i in range(BUFFER_CAPACITY):
@@ -208,7 +208,7 @@ def test_buffer_update_priorities(per_buffer):
     assert per_buffer.max_priority >= np.max(new_priorities_np)
 
 
-@pytest.mark.unittest
+@pytest.mark.unit
 def test_buffer_update_beta(per_buffer):
     """Test beta annealing."""
     assert per_buffer.beta == BETA_START

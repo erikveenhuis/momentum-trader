@@ -22,7 +22,7 @@ def _create_minimal_trainer(tmp_path) -> RainbowTrainerModule:
     return trainer
 
 
-@pytest.mark.unittest
+@pytest.mark.unit
 def test_validate_aggregates_metrics_and_writes_results(tmp_path, monkeypatch):
     trainer = _create_minimal_trainer(tmp_path)
 
@@ -94,7 +94,7 @@ def test_validate_aggregates_metrics_and_writes_results(tmp_path, monkeypatch):
     assert output_files, "Validation summary JSON was not generated"
 
 
-@pytest.mark.unittest
+@pytest.mark.unit
 def test_handle_validation_and_checkpointing_triggers_best_checkpoint(tmp_path):
     trainer = _create_minimal_trainer(tmp_path)
     trainer.best_validation_metric = 0.2

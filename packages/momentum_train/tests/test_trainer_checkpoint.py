@@ -20,7 +20,7 @@ class DummyScaler:
         return {"scale": 1}
 
 
-@pytest.mark.unittest
+@pytest.mark.unit
 def test_save_checkpoint_persists_expected_keys(tmp_path):
     trainer = RainbowTrainerModule.__new__(RainbowTrainerModule)
     trainer.best_validation_metric = 0.75

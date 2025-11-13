@@ -20,7 +20,7 @@ agent:
   # Core RL params
   gamma: 0.99
   lr: 0.001 # Learning rate (reduced for stability with transformer backbone)
-  batch_size: 2048
+  batch_size: 4096
   replay_buffer_size: 500000
   target_update_freq: 600 # Learner steps per target sync (~1-2 trading days)
 
@@ -37,7 +37,7 @@ agent:
   transformer_dropout: 0.2 # Example: Dropout within transformer
 
   # Rainbow specific params
-  n_steps: 3          # Multi-step returns
+  n_steps: 5          # Multi-step returns
   num_atoms: 51       # Distributional RL atoms
   v_min: -10.0       # Distributional RL support min value (wider to cover scaled rewards)
   v_max: 10.0        # Distributional RL support max value (wider to cover scaled rewards)
@@ -71,9 +71,10 @@ trainer:
   seed: 42
   warmup_steps: 30000     # Steps with random actions before training
   update_freq: 10          # Agent learning update frequency (steps)
+  gradient_updates_per_step: 1  # Number of learner updates to run when update condition is met; increase to better utilize GPU
   log_freq: 60            # Logging frequency (steps)
   per_stats_log_freq: 120 # Frequency (env steps) for PER stats between episode summaries; set to 0 for episode-only logs
-  validation_freq: 30     # Validation frequency (episodes)
+  validation_freq: 45     # Validation frequency (episodes)
   checkpoint_save_freq: 30 # Checkpoint save frequency (episodes)
   reward_window: 10       # Window for averaging episode rewards in logs
   early_stopping_patience: 15 # Episodes without validation improvement to stop

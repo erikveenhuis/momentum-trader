@@ -81,7 +81,7 @@ def generate_dummy_observation(config):
 # --- Test Cases ---
 
 
-@pytest.mark.unittest
+@pytest.mark.unit
 def test_agent_initialization(agent, default_config):
     """Tests if the agent initializes components correctly."""
     assert agent is not None
@@ -103,7 +103,7 @@ def test_agent_initialization(agent, default_config):
         assert param.device.type == agent.device.type
 
 
-@pytest.mark.unittest
+@pytest.mark.unit
 def test_select_action(agent, default_config):
     """Tests the select_action method."""
     obs = generate_dummy_observation(default_config)
@@ -123,7 +123,7 @@ def test_select_action(agent, default_config):
     assert agent.network.training is False  # Should be in eval mode
 
 
-@pytest.mark.unittest
+@pytest.mark.unit
 def test_store_transition_and_n_step(agent, default_config):
     """Tests storing transitions and n-step buffer logic."""
     n_steps = default_config["n_steps"]
@@ -157,7 +157,7 @@ def test_store_transition_and_n_step(agent, default_config):
     assert len(agent.buffer) <= buffer_capacity
 
 
-@pytest.mark.unittest
+@pytest.mark.unit
 def test_learn_step(agent, default_config):
     """Tests a single learning step, mocking buffer sample."""
     batch_size = default_config["batch_size"]
@@ -240,7 +240,7 @@ def test_learn_step(agent, default_config):
     #     agent._update_target_network.assert_not_called()
 
 
-@pytest.mark.unittest
+@pytest.mark.unit
 def test_target_network_update(agent, default_config):
     """Tests if the target network updates correctly."""
     # Ensure network and target network start differently (modify one slightly)
@@ -269,7 +269,7 @@ def test_target_network_update(agent, default_config):
     assert params_updated, "Target network parameters should have changed after update."
 
 
-@pytest.mark.unittest
+@pytest.mark.unit
 def test_save_load_model(agent, default_config, tmp_path):
     """Tests saving and loading the agent's state."""
     # Use tmp_path for the save directory
@@ -349,7 +349,7 @@ def test_save_load_model(agent, default_config, tmp_path):
 
 
 # --- Test Configuration Compatibility Check on Load ---
-@pytest.mark.unittest
+@pytest.mark.unit
 def test_load_model_config_mismatch(agent, default_config, caplog, tmp_path):
     """Tests loading a model with a mismatched configuration."""
     # Use tmp_path for the save directory
@@ -393,7 +393,7 @@ def test_load_model_config_mismatch(agent, default_config, caplog, tmp_path):
     # shutil.rmtree(save_dir)
 
 
-@pytest.mark.unittest
+@pytest.mark.unit
 def test_set_training_mode(agent):
     """Tests setting the training mode."""
     # Initial state is training=True from fixture

@@ -25,7 +25,7 @@ class StubTrainer:
         pass
 
 
-@pytest.mark.unittest
+@pytest.mark.unit
 def test_evaluate_on_test_data_writes_results(tmp_path):
     test_files = [tmp_path / "test1.csv", tmp_path / "test2.csv"]
 
@@ -95,7 +95,7 @@ def test_evaluate_on_test_data_writes_results(tmp_path):
     assert payload["detailed_results"] == detailed_results
 
 
-@pytest.mark.unittest
+@pytest.mark.unit
 def test_evaluate_on_test_data_handles_empty_test_set(tmp_path):
     trainer = StubTrainer([], [], {})
     config = {"run": {"model_dir": str(tmp_path)}}

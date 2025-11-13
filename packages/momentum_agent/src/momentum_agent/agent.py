@@ -45,6 +45,20 @@ class RainbowDQNAgent:
         """
         self.config = config
         self.device = self._resolve_device(device)
+
+        # REQUIRE CUDA for optimal performance
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA is not available. This training requires CUDA for optimal performance with torch.compile. "
+                "Please ensure you have a CUDA-compatible GPU and PyTorch with CUDA support installed."
+            )
+
+        if self.device.type != "cuda":
+            raise RuntimeError(
+                f"CUDA device required for training, but got device: {self.device}. "
+                "Please specify device='cuda' or ensure CUDA is available."
+            )
+
         # Use direct access for mandatory parameters
         self.seed = config["seed"]
         self.gamma = config["gamma"]
@@ -76,7 +90,18 @@ class RainbowDQNAgent:
         torch.manual_seed(self.seed)
 
         if self.device.type == "cuda":
-            torch.backends.cuda.matmul.allow_tf32 = True
+            if hasattr(torch, "set_float32_matmul_precision"):
+                torch.set_float32_matmul_precision("high")
+            elif hasattr(torch.backends.cuda, "matmul") and hasattr(torch.backends.cuda.matmul, "fp32_precision"):
+                torch.backends.cuda.matmul.fp32_precision = "tf32"
+            else:
+                logger.warning(
+                    "torch.set_float32_matmul_precision is unavailable; TF32 settings fall back to torch defaults."
+                )
+            if hasattr(torch.backends, "cudnn") and hasattr(torch.backends.cudnn, "conv") and hasattr(
+                torch.backends.cudnn.conv, "fp32_precision"
+            ):
+                torch.backends.cudnn.conv.fp32_precision = "tf32"
             torch.cuda.manual_seed(self.seed)
             torch.cuda.manual_seed_all(self.seed)
             logger.info(f"CUDA seed set. AMP Enabled: {self.scaler is not None}")
@@ -123,45 +148,59 @@ class RainbowDQNAgent:
         self.target_network.load_state_dict(self.network.state_dict())
         self.target_network.eval()  # Target network is not trained directly
 
-        # Enable torch.compile for PyTorch 2.8+ with improved error handling
-        # if hasattr(torch, 'compile'):
-        #     logger.info("Attempting to apply torch.compile to network and target_network.")
-        #     compile_success = False
+        # REQUIRE torch.compile for optimal performance
+        if not hasattr(torch, 'compile'):
+            raise RuntimeError(
+                "torch.compile is not available in this PyTorch version. "
+                "Please upgrade to PyTorch 2.0+ for optimal performance."
+            )
 
-        #     # Try different compilation modes in order of preference
-        #     compile_modes = ["default", "reduce-overhead", "max-autotune"]
+        logger.info("Applying torch.compile to network and target_network (REQUIRED for training).")
+        compile_success = False
 
-        #     for mode in compile_modes:
-        #         try:
-        #             logger.info(f"Trying torch.compile with mode='{mode}'...")
-        #             self.network = torch.compile(self.network, mode=mode)
-        #             self.target_network = torch.compile(self.target_network, mode=mode)
+        # Try different compilation modes in order of preference
+        compile_modes = ["default", "reduce-overhead", "max-autotune"]
 
-        #             # Test compilation by running a small forward pass
-        #             with torch.no_grad():
-        #                 test_market = torch.zeros((1, self.window_size, self.n_features), device=self.device)
-        #                 test_account = torch.zeros((1, 2), device=self.device)
-        #                 _ = self.network(test_market, test_account)
+        for mode in compile_modes:
+            try:
+                logger.info(f"Trying torch.compile with mode='{mode}'...")
+                compiled_network = torch.compile(self.network, mode=mode)
+                compiled_target_network = torch.compile(self.target_network, mode=mode)
 
-        #             logger.info(f"torch.compile applied successfully with mode='{mode}'.")
-        #             compile_success = True
-        #             break
+                # Test compilation by running a small forward pass
+                with torch.no_grad():
+                    test_market = torch.zeros((1, self.window_size, self.n_features), device=self.device)
+                    test_account = torch.zeros((1, 2), device=self.device)
+                    _ = compiled_network(test_market, test_account)
 
-        #         except ImportError as imp_err:
-        #             logger.warning(f"torch.compile mode '{mode}' failed due to import issue: {imp_err}.")
-        #         except RuntimeError as runtime_err:
-        #             # Handle cases where compilation fails due to backend issues
-        #             if "Triton" in str(runtime_err) or "triton" in str(runtime_err).lower():
-        #                 logger.warning(f"torch.compile mode '{mode}' failed due to Triton backend issues: {runtime_err}. This is common on Windows.")
-        #             else:
-        #                 logger.warning(f"torch.compile mode '{mode}' failed with runtime error: {runtime_err}.")
-        #         except Exception as e:
-        #             logger.warning(f"torch.compile mode '{mode}' failed with unexpected error: {e}.")
+                # Only assign if compilation and test succeeded
+                self.network = compiled_network
+                self.target_network = compiled_target_network
+                logger.info(f"torch.compile applied successfully with mode='{mode}'.")
+                compile_success = True
+                break
 
-        #     if not compile_success:
-        #         logger.warning("All torch.compile modes failed. Proceeding without compilation. This is normal on some platforms (e.g., Windows without Triton).")
-        # else:
-        #     logger.warning("torch.compile not available in this PyTorch version.")
+            except ImportError as imp_err:
+                logger.error(f"torch.compile mode '{mode}' failed due to import issue: {imp_err}.")
+            except RuntimeError as runtime_err:
+                # Handle cases where compilation fails due to backend issues
+                if "Triton" in str(runtime_err) or "triton" in str(runtime_err).lower():
+                    logger.error(f"torch.compile mode '{mode}' failed due to Triton backend issues: {runtime_err}.")
+                else:
+                    logger.error(f"torch.compile mode '{mode}' failed with runtime error: {runtime_err}.")
+            except Exception as e:
+                logger.error(f"torch.compile mode '{mode}' failed with unexpected error: {e}.")
+
+        if not compile_success:
+            raise RuntimeError(
+                "All torch.compile modes failed. torch.compile is REQUIRED for training. "
+                "Please ensure you have:\n"
+                "1. CUDA-compatible GPU\n"
+                "2. GCC compiler installed (sudo apt install build-essential)\n"
+                "3. Python development headers (sudo apt install python3-dev)\n"
+                "4. Working Triton installation\n"
+                "Training cannot proceed without compilation optimization."
+            )
 
         # Optimizer
         self.optimizer = optim.Adam(self.network.parameters(), lr=self.lr)
@@ -252,6 +291,7 @@ class RainbowDQNAgent:
         self._non_blocking_copy = self.device.type == "cuda" and torch.cuda.is_available()
         self._market_tensor = torch.zeros((1, self.window_size, self.n_features), device=self.device, dtype=torch.float32)
         self._account_tensor = torch.zeros((1, ACCOUNT_STATE_DIM), device=self.device, dtype=torch.float32)
+        self._initialize_batch_tensors()
         self.total_steps = 0  # Track total steps for target network updates and beta annealing
         self.last_td_error_stats: dict[str, float] | None = None
 
@@ -377,6 +417,94 @@ class RainbowDQNAgent:
             resolved = torch.device("cpu")
 
         return resolved
+
+    def _initialize_batch_tensors(self) -> None:
+        """Pre-allocate reusable tensors for PER batches to limit GPU allocations."""
+        self._batch_market_tensor = torch.empty(
+            (self.batch_size, self.window_size, self.n_features),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self._batch_account_tensor = torch.empty(
+            (self.batch_size, ACCOUNT_STATE_DIM),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self._batch_next_market_tensor = torch.empty_like(self._batch_market_tensor)
+        self._batch_next_account_tensor = torch.empty_like(self._batch_account_tensor)
+        self._batch_actions_tensor = torch.empty(
+            (self.batch_size,),
+            device=self.device,
+            dtype=torch.long,
+        )
+        self._batch_rewards_tensor = torch.empty(
+            (self.batch_size, 1),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self._batch_dones_tensor = torch.empty_like(self._batch_rewards_tensor)
+        self._batch_weights_tensor = torch.empty_like(self._batch_rewards_tensor)
+
+    def _prepare_batch_tensors(
+        self,
+        market_data: np.ndarray,
+        account_state: np.ndarray,
+        actions: np.ndarray,
+        rewards: np.ndarray,
+        next_market_data: np.ndarray,
+        next_account_state: np.ndarray,
+        dones: np.ndarray,
+        weights: np.ndarray,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Copy numpy arrays sampled from PER into persistent GPU tensors."""
+        self._batch_market_tensor.copy_(
+            torch.from_numpy(market_data),
+            non_blocking=self._non_blocking_copy,
+        )
+        self._batch_account_tensor.copy_(
+            torch.from_numpy(account_state),
+            non_blocking=self._non_blocking_copy,
+        )
+        self._batch_next_market_tensor.copy_(
+            torch.from_numpy(next_market_data),
+            non_blocking=self._non_blocking_copy,
+        )
+        self._batch_next_account_tensor.copy_(
+            torch.from_numpy(next_account_state),
+            non_blocking=self._non_blocking_copy,
+        )
+
+        actions_tensor = torch.from_numpy(actions.astype(np.int64, copy=False))
+        self._batch_actions_tensor.copy_(actions_tensor, non_blocking=self._non_blocking_copy)
+
+        rewards_tensor = torch.from_numpy(rewards.astype(np.float32, copy=False)).view(-1, 1)
+        self._batch_rewards_tensor.copy_(rewards_tensor, non_blocking=self._non_blocking_copy)
+
+        dones_tensor = torch.from_numpy(dones.astype(np.float32, copy=False)).view(-1, 1)
+        self._batch_dones_tensor.copy_(dones_tensor, non_blocking=self._non_blocking_copy)
+
+        weights_tensor = torch.from_numpy(weights.astype(np.float32, copy=False)).view(-1, 1)
+        self._batch_weights_tensor.copy_(weights_tensor, non_blocking=self._non_blocking_copy)
+
+        return (
+            self._batch_market_tensor,
+            self._batch_account_tensor,
+            self._batch_actions_tensor,
+            self._batch_rewards_tensor,
+            self._batch_next_market_tensor,
+            self._batch_next_account_tensor,
+            self._batch_dones_tensor,
+            self._batch_weights_tensor,
+        )
 
     def _get_n_step_info(self, steps: int | None = None):
         """
@@ -680,15 +808,25 @@ class RainbowDQNAgent:
             assert weights.shape == (self.batch_size,), "Batch weights shape mismatch"
             # --- End: Assert batch shapes and types ---
 
-        # Convert numpy arrays from buffer to tensors
-        market_data_batch = torch.FloatTensor(market_data).to(self.device)
-        account_state_batch = torch.FloatTensor(account_state).to(self.device)
-        next_market_data_batch = torch.FloatTensor(next_market_data).to(self.device)
-        next_account_state_batch = torch.FloatTensor(next_account_state).to(self.device)
-        actions_batch = torch.LongTensor(actions).to(self.device)  # Action indices [B]
-        rewards_batch = torch.FloatTensor(rewards).unsqueeze(1).to(self.device)  # [B, 1]
-        dones_batch = torch.FloatTensor(dones).unsqueeze(1).to(self.device)  # [B, 1]
-        weights_batch = torch.FloatTensor(weights).unsqueeze(1).to(self.device)  # [B, 1]
+        (
+            market_data_batch,
+            account_state_batch,
+            actions_batch,
+            rewards_batch,
+            next_market_data_batch,
+            next_account_state_batch,
+            dones_batch,
+            weights_batch,
+        ) = self._prepare_batch_tensors(
+            market_data,
+            account_state,
+            actions,
+            rewards,
+            next_market_data,
+            next_account_state,
+            dones,
+            weights,
+        )
 
         if self.debug_mode:
             # --- Start: Assert tensor shapes after conversion ---
@@ -725,65 +863,71 @@ class RainbowDQNAgent:
             ), "Tensor weights_batch shape mismatch"
             # --- End: Assert tensor shapes ---
 
+        amp_enabled = self.scaler is not None and self.device.type == "cuda"
+
         # --- Calculate Target Distribution (m) --- #
         # This is the projected distribution for the Bellman target Z(s_t, a_t)
-        target_distribution = self._project_target_distribution(
-            next_market_data_batch, next_account_state_batch, rewards_batch, dones_batch
-        )
-        if self.debug_mode:
-            assert target_distribution.shape == (
-                self.batch_size,
-                self.num_atoms,
-            ), "Target distribution shape mismatch"
-        # ---------------------------------------- #
+        with autocast("cuda", enabled=amp_enabled):
+            target_distribution = self._project_target_distribution(
+                next_market_data_batch, next_account_state_batch, rewards_batch, dones_batch
+            )
+            if self.debug_mode:
+                assert target_distribution.shape == (
+                    self.batch_size,
+                    self.num_atoms,
+                ), "Target distribution shape mismatch"
+            # ---------------------------------------- #
 
-        # --- Calculate Online Distribution and Loss --- #
-        # Get log probabilities Z(s_t, a) from the online network
-        log_ps = self.network(market_data_batch, account_state_batch)  # [B, num_actions, num_atoms]
-        if self.debug_mode:
-            assert log_ps.shape == (
-                self.batch_size,
-                self.num_actions,
-                self.num_atoms,
-            ), "Online log_ps shape mismatch"
+            # --- Calculate Online Distribution and Loss --- #
+            # Get log probabilities Z(s_t, a) from the online network
+            log_ps = self.network(market_data_batch, account_state_batch)  # [B, num_actions, num_atoms]
+            if self.debug_mode:
+                assert log_ps.shape == (
+                    self.batch_size,
+                    self.num_actions,
+                    self.num_atoms,
+                ), "Online log_ps shape mismatch"
 
-        # Gather the log-probabilities for the actions actually taken: log Z(s_t, a_t)
-        # We need to select the log probabilities corresponding to actions_batch
-        actions_indices = actions_batch.view(self.batch_size, 1, 1).expand(self.batch_size, 1, self.num_atoms)
-        log_ps_a = log_ps.gather(1, actions_indices).squeeze(1)  # [B, num_atoms]
-        if self.debug_mode:
-            assert log_ps_a.shape == (
-                self.batch_size,
-                self.num_atoms,
-            ), "Online log_ps_a shape mismatch"
+            # Gather the log-probabilities for the actions actually taken: log Z(s_t, a_t)
+            # We need to select the log probabilities corresponding to actions_batch
+            actions_indices = actions_batch.view(self.batch_size, 1, 1).expand(self.batch_size, 1, self.num_atoms)
+            log_ps_a = log_ps.gather(1, actions_indices).squeeze(1)  # [B, num_atoms]
+            if self.debug_mode:
+                assert log_ps_a.shape == (
+                    self.batch_size,
+                    self.num_atoms,
+                ), "Online log_ps_a shape mismatch"
 
-        # Calculate cross-entropy loss between target and online distributions
-        # Loss = -sum_i [ target_distribution_i * log(online_distribution_i) ]
-        # Target distribution is detached as it acts as the label.
-        loss_elementwise = -(target_distribution.detach() * log_ps_a).sum(dim=1)  # [B]
-        if self.debug_mode:
-            assert loss_elementwise.shape == (self.batch_size,), "Per-sample loss shape mismatch"
+            # Calculate cross-entropy loss between target and online distributions
+            # Loss = -sum_i [ target_distribution_i * log(online_distribution_i) ]
+            # Target distribution is detached as it acts as the label.
+            loss_elementwise = -(target_distribution.detach() * log_ps_a).sum(dim=1)  # [B]
+            if self.debug_mode:
+                assert loss_elementwise.shape == (self.batch_size,), "Per-sample loss shape mismatch"
 
-        # Apply Importance Sampling weights and calculate mean loss
-        loss = (loss_elementwise * weights_batch.squeeze(1).detach()).mean()  # Scalar
-        if loss.ndim != 0:
-            raise RuntimeError("Final loss is not a scalar")
-        if not torch.isfinite(loss):
-            raise FloatingPointError(f"Loss calculation resulted in NaN or Inf: {loss.item()}")
-        # ----------------------------------------- #
+            # Apply Importance Sampling weights and calculate mean loss
+            loss = (loss_elementwise * weights_batch.squeeze(1).detach()).mean()  # Scalar
+            if loss.ndim != 0:
+                raise RuntimeError("Final loss is not a scalar")
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"Loss calculation resulted in NaN or Inf: {loss.item()}")
+            # ----------------------------------------- #
 
-        # --- Calculate TD errors for PER update --- #
-        # TD error is | E[Target Distribution] - E[Online Distribution for a_t] |
-        # Calculate expected Q-values E[Z(s_t, a_t)] from the online distribution for the action taken
-        q_values_online = (torch.exp(log_ps_a) * self.support.unsqueeze(0)).sum(dim=1)  # [B]
-        # Calculate expected target Q-values E[Projected Target Distribution]
-        q_values_target = (target_distribution * self.support.unsqueeze(0)).sum(dim=1)  # [B]
-        # TD error = |Target Q - Online Q|
-        td_errors_tensor = (q_values_target.detach() - q_values_online.detach()).abs()
-        if self.debug_mode:
-            assert td_errors_tensor.shape == (self.batch_size,), "TD errors tensor shape mismatch"
-            assert torch.isfinite(td_errors_tensor).all(), "NaN or Inf found in TD errors tensor"
-        # ----------------------------------------- #
+            # --- Calculate TD errors for PER update --- #
+            # TD error is | E[Target Distribution] - E[Online Distribution for a_t] |
+            # Calculate expected Q-values E[Z(s_t, a_t)] from the online distribution for the action taken
+            q_values_online = (torch.exp(log_ps_a) * self.support.unsqueeze(0)).sum(dim=1)  # [B]
+            # Calculate expected target Q-values E[Projected Target Distribution]
+            q_values_target = (target_distribution * self.support.unsqueeze(0)).sum(dim=1)  # [B]
+            # TD error = |Target Q - Online Q|
+            td_errors_tensor = (q_values_target.detach() - q_values_online.detach()).abs()
+            if self.debug_mode:
+                assert td_errors_tensor.shape == (self.batch_size,), "TD errors tensor shape mismatch"
+                assert torch.isfinite(td_errors_tensor).all(), "NaN or Inf found in TD errors tensor"
+            # ----------------------------------------- #
+
+        loss = loss.float()
+        td_errors_tensor = td_errors_tensor.float()
 
         td_errors_np = td_errors_tensor.detach().cpu().numpy()
         td_mean = float(td_errors_np.mean())
@@ -828,7 +972,7 @@ class RainbowDQNAgent:
         amp_enabled = self.scaler is not None and self.device.type == "cuda"
 
         # Optimize the model
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
 
         if amp_enabled:
             # Scale loss and backpropagate

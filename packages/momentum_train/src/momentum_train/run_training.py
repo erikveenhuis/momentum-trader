@@ -348,16 +348,46 @@ def run_training(
     logger.info(f"Agent instantiated with {sum(p.numel() for p in agent.network.parameters()):,} parameters.")
 
     # --- Initialize TensorBoard Writer ---
-    log_dir_base = Path(model_dir) / "runs"
-    log_dir_base.mkdir(parents=True, exist_ok=True)
+    configured_log_dir_base = Path(model_dir) / "runs"
+    configured_log_dir_base.mkdir(parents=True, exist_ok=True)
+    if configured_log_dir_base.is_absolute():
+        log_dir_base = configured_log_dir_base
+    else:
+        log_dir_base = (Path.cwd() / configured_log_dir_base).resolve()
 
     resume_log_dir_str = checkpoint_data.get("tensorboard_log_dir") if checkpoint_data else None
     log_dir_path: Path
 
     if resume_training_flag and resume_log_dir_str:
-        log_dir_path = Path(resume_log_dir_str)
-        if not log_dir_path.is_absolute():
-            log_dir_path = (log_dir_base / log_dir_path).resolve()
+        raw_log_dir_path = Path(resume_log_dir_str)
+        if raw_log_dir_path.is_absolute():
+            log_dir_path = raw_log_dir_path
+        else:
+            normalized_path = raw_log_dir_path
+            matched_prefix = False
+            for base_candidate in (configured_log_dir_base, Path("runs"), Path(model_dir)):
+                try:
+                    normalized_path = raw_log_dir_path.relative_to(base_candidate)
+                except ValueError:
+                    continue
+                else:
+                    matched_prefix = True
+                    break
+
+            if matched_prefix:
+                if normalized_path == Path("."):
+                    logger.warning(
+                        "TensorBoard log directory from checkpoint %s did not include a run subdirectory; using base directory %s.",
+                        resume_log_dir_str,
+                        log_dir_base,
+                    )
+                    log_dir_path = log_dir_base
+                else:
+                    log_dir_path = (log_dir_base / normalized_path).resolve()
+            elif raw_log_dir_path.parent == Path("."):
+                log_dir_path = (log_dir_base / raw_log_dir_path).resolve()
+            else:
+                log_dir_path = (Path.cwd() / raw_log_dir_path).resolve()
         log_dir_path.mkdir(parents=True, exist_ok=True)
         writer_kwargs: dict[str, Any] = {"log_dir": str(log_dir_path)}
         if start_total_steps > 0:
@@ -371,7 +401,7 @@ def run_training(
             else:
                 logger.warning("Checkpoint did not include TensorBoard log directory; creating a new run directory.")
         current_time = time.strftime("%Y%m%d-%H%M%S")
-        log_dir_path = log_dir_base / current_time
+        log_dir_path = (log_dir_base / current_time).resolve()
         log_dir_path.mkdir(parents=True, exist_ok=True)
         writer = SummaryWriter(log_dir=str(log_dir_path))
         logger.info(f"TensorBoard logs will be saved to: {log_dir_path}")

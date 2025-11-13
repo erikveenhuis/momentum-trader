@@ -12,7 +12,7 @@ def _write_csv(directory: Path, name: str) -> Path:
     return file_path
 
 
-@pytest.mark.unittest
+@pytest.mark.unit
 def test_data_manager_organize_and_random_file(tmp_path, monkeypatch):
     processed_dir = tmp_path / "processed"
     train_file = _write_csv(processed_dir / "train", "2024-01-01_BTC-USD.csv")
@@ -31,7 +31,7 @@ def test_data_manager_organize_and_random_file(tmp_path, monkeypatch):
     assert dm.get_random_training_file() == train_file
 
 
-@pytest.mark.unittest
+@pytest.mark.unit
 def test_data_manager_missing_directories(tmp_path):
     with pytest.raises(FileNotFoundError):
         DataManager(base_dir=tmp_path / "nonexistent", processed_dir_name="processed")
