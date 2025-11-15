@@ -130,15 +130,6 @@ def calculate_episode_score(metrics: Dict[str, float]) -> float:
 class PerformanceTracker:
     """Track performance metrics over time."""
 
-    def __init__(self, window_size: int = 100):
-        assert isinstance(window_size, int) and window_size > 0, "Window size must be a positive integer"
-        self.window_size = window_size
-        self.portfolio_values = []
-        self.returns = []
-        self.actions = []
-        self.transaction_costs = []
-        self.rewards = []
-
     def add_initial_value(self, initial_value: float):
         """Adds the initial portfolio value before the first step."""
         assert isinstance(initial_value, (float, np.float32, np.float64)) and initial_value >= 0, "Invalid initial portfolio value"
@@ -147,12 +138,29 @@ class PerformanceTracker:
         else:
             logger.warning("Attempted to add initial value when portfolio history already exists.")
 
+    def __init__(self, window_size: int = 100):
+        assert isinstance(window_size, int) and window_size > 0, "Window size must be a positive integer"
+        self.window_size = window_size
+        self.portfolio_values = []
+        self.returns = []
+        self.actions = []
+        self.transaction_costs = []
+        self.rewards = []
+        self.positions = []
+        self.balances = []
+        self.position_values = []
+        self.exposures = []
+
     def update(
         self,
         portfolio_value: float,
         action: float,
         reward: float,
         transaction_cost: float = 0.0,
+        *,
+        position: float | None = None,
+        balance: float | None = None,
+        price: float | None = None,
     ):
         """Update tracker with new values."""
         assert isinstance(portfolio_value, (float, np.float32, np.float64)) and portfolio_value >= 0, "Invalid portfolio value"
@@ -165,6 +173,17 @@ class PerformanceTracker:
         self.actions.append(action)
         self.rewards.append(reward)
         self.transaction_costs.append(transaction_cost)
+
+        if position is not None:
+            position_float = float(position)
+            self.positions.append(position_float)
+        if balance is not None:
+            self.balances.append(float(balance))
+        if position is not None and price is not None:
+            position_value = float(position) * float(price)
+            self.position_values.append(position_value)
+            exposure = abs(position_value) / (portfolio_value + 1e-9)
+            self.exposures.append(exposure)
 
         if len(self.portfolio_values) > 1:
             prev_value = self.portfolio_values[-2]
@@ -203,6 +222,16 @@ class PerformanceTracker:
             "avg_reward": np.mean(self.rewards) if self.rewards else 0.0,
             "action_counts": self.get_action_counts(),
         }
+        if self.positions:
+            metrics["avg_position"] = float(np.mean(self.positions))
+            metrics["avg_abs_position"] = float(np.mean(np.abs(self.positions)))
+        if self.balances:
+            metrics["avg_balance"] = float(np.mean(self.balances))
+        if self.position_values:
+            metrics["avg_position_value"] = float(np.mean(self.position_values))
+        if self.exposures:
+            metrics["avg_exposure_pct"] = float(np.mean(self.exposures) * 100.0)
+            metrics["max_exposure_pct"] = float(np.max(self.exposures) * 100.0)
         assert all(
             isinstance(v, (float, np.float32, np.float64, dict)) for v in metrics.values()
         ), "Not all calculated metrics are floats or dict"
@@ -241,6 +270,18 @@ class PerformanceTracker:
             "transaction_costs": sum(recent_costs) if recent_costs else 0.0,
             "avg_reward": np.mean(recent_rewards),
         }
+        if len(self.positions) >= effective_window - 1:
+            recent_positions = self.positions[-(effective_window - 1) :]
+            metrics["avg_position"] = float(np.mean(recent_positions))
+            metrics["avg_abs_position"] = float(np.mean(np.abs(recent_positions)))
+        if len(self.balances) >= effective_window - 1:
+            metrics["avg_balance"] = float(np.mean(self.balances[-(effective_window - 1) :]))
+        if len(self.position_values) >= effective_window - 1:
+            metrics["avg_position_value"] = float(np.mean(self.position_values[-(effective_window - 1) :]))
+        if len(self.exposures) >= effective_window - 1:
+            recent_exposures = self.exposures[-(effective_window - 1) :]
+            metrics["avg_exposure_pct"] = float(np.mean(recent_exposures) * 100.0)
+            metrics["max_exposure_pct"] = float(np.max(recent_exposures) * 100.0)
         assert all(isinstance(v, (float, np.float32, np.float64)) for v in metrics.values()), "Not all calculated recent metrics are floats"
         assert 0.0 <= metrics["max_drawdown"] <= 1.0, "Recent max drawdown out of range [0, 1]"
         assert not any(np.isnan(v) or np.isinf(v) for v in metrics.values()), "NaN or Inf found in calculated recent metrics"

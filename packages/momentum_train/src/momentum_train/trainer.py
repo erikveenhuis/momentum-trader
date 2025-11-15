@@ -66,6 +66,19 @@ class RainbowTrainerModule:
         self.reward_window = self.trainer_config.get("reward_window", 10)
         self.update_freq = self.trainer_config.get("update_freq", 4)
         self.log_freq = self.trainer_config.get("log_freq", 100)
+        self.reward_clip_value: float | None = None
+        raw_reward_clip = self.trainer_config.get("reward_clip")
+        if raw_reward_clip is not None:
+            try:
+                reward_clip_float = float(raw_reward_clip)
+            except (TypeError, ValueError):
+                logger.warning("Invalid reward_clip value %s; disabling reward clipping.", raw_reward_clip)
+            else:
+                if reward_clip_float <= 0:
+                    logger.warning("reward_clip must be positive (received %s); disabling reward clipping.", reward_clip_float)
+                else:
+                    self.reward_clip_value = reward_clip_float
+                    logger.info("Reward clipping enabled with ±%.4f bound.", self.reward_clip_value)
         raw_grad_updates = self.trainer_config.get("gradient_updates_per_step", 1)
         try:
             self.gradient_updates_per_step = max(1, int(raw_grad_updates))
@@ -94,6 +107,46 @@ class RainbowTrainerModule:
             self.per_stats_log_freq = self.log_freq
         elif self.per_stats_log_freq == 0:
             logger.info("PER stats logging disabled because per_stats_log_freq is set to 0.")
+        raw_final_phase_start = self.trainer_config.get("final_phase_lr_start_frac")
+        raw_final_phase_multiplier = self.trainer_config.get("final_phase_lr_multiplier")
+        self.final_phase_lr_start_frac: float | None = None
+        self.final_phase_lr_multiplier: float | None = None
+        if raw_final_phase_start is not None and raw_final_phase_multiplier is not None:
+            try:
+                start_frac = float(raw_final_phase_start)
+                multiplier = float(raw_final_phase_multiplier)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid final phase LR configuration (start=%s, multiplier=%s); disabling final-phase decay.",
+                    raw_final_phase_start,
+                    raw_final_phase_multiplier,
+                )
+            else:
+                if not (0.0 < start_frac < 1.0):
+                    logger.warning(
+                        "final_phase_lr_start_frac must be between 0 and 1 (received %.4f); disabling final-phase decay.",
+                        start_frac,
+                    )
+                elif not (0.0 < multiplier < 1.0):
+                    logger.warning(
+                        "final_phase_lr_multiplier must be between 0 and 1 (received %.4f); disabling final-phase decay.",
+                        multiplier,
+                    )
+                else:
+                    self.final_phase_lr_start_frac = start_frac
+                    self.final_phase_lr_multiplier = multiplier
+                    logger.info(
+                        "Final-phase LR decay enabled (start_frac=%.3f, multiplier=%.3f).",
+                        start_frac,
+                        multiplier,
+                    )
+        elif raw_final_phase_start is not None or raw_final_phase_multiplier is not None:
+            logger.warning(
+                "Incomplete final phase LR configuration (start_frac=%s, multiplier=%s); both must be provided. Disabling final-phase decay.",
+                raw_final_phase_start,
+                raw_final_phase_multiplier,
+            )
+        self._final_phase_lr_applied = False
         self.warmup_steps = self.trainer_config.get("warmup_steps", 50000)
         self.invalid_action_window = self.trainer_config.get("invalid_action_window", 20)
         self.invalid_action_rate_window: deque[float] = deque(maxlen=self.invalid_action_window)
@@ -109,6 +162,9 @@ class RainbowTrainerModule:
         self.model_dir = self.run_config.get("model_dir", "models")
         os.makedirs(self.model_dir, exist_ok=True)
         self._validation_env_cache: Dict[str, TradingEnv] = {}
+        self._abort_training = False
+        self._abort_reason: str | None = None
+        self._abort_step: int | None = None
 
     def should_stop_early(self, validation_metrics: List[dict]) -> bool:
         """Check if training should stop early based on validation performance."""
@@ -398,6 +454,23 @@ class RainbowTrainerModule:
             if not isinstance(info, dict):
                 logger.error(f"info is not a dict: {type(info)}")
 
+            reward = float(reward)
+            original_reward = reward
+            if self.reward_clip_value is not None:
+                clipped_reward = float(np.clip(reward, -self.reward_clip_value, self.reward_clip_value))
+                if clipped_reward != reward:
+                    logger.debug(
+                        "Reward clipped from %.6f to %.6f at episode %s step %s.",
+                        reward,
+                        clipped_reward,
+                        episode,
+                        steps_in_episode,
+                    )
+                reward = clipped_reward
+                if isinstance(info, dict):
+                    info["unclipped_reward"] = original_reward
+                    info["clipped_reward"] = reward
+
             # Original assertions (modified)
             assert isinstance(next_obs, dict) and "market_data" in next_obs and "account_state" in next_obs
             assert isinstance(done, (bool, np.bool_))
@@ -457,6 +530,16 @@ class RainbowTrainerModule:
                             self.writer.add_scalar("Train/TD_Error_Std", td_stats.get("std", float("nan")), total_train_steps)
                     # ---------------------------- #
 
+            except FloatingPointError as exc:
+                logger.error(
+                    f"!!! EXCEPTION during learning update at step {total_train_steps} !!!",
+                    exc_info=True,
+                )
+                if not self._abort_training:
+                    self._abort_training = True
+                    self._abort_reason = f"FloatingPointError during learning update: {exc}"
+                    self._abort_step = total_train_steps
+                done = True  # Stop episode on learning error
             except Exception:
                 logger.error(
                     f"!!! EXCEPTION during learning update at step {total_train_steps} !!!",
@@ -537,6 +620,78 @@ class RainbowTrainerModule:
             stats.get("total_priority", 0.0),
         )
 
+    def _maybe_apply_final_phase_lr_decay(
+        self,
+        *,
+        current_episode: int,
+        total_episodes: int,
+        total_train_steps: int,
+    ) -> bool:
+        """Apply a one-time LR decay near the end of training if configured."""
+        if (
+            self.final_phase_lr_start_frac is None
+            or self.final_phase_lr_multiplier is None
+            or self._final_phase_lr_applied
+        ):
+            return False
+
+        try:
+            threshold_episode = int(total_episodes * self.final_phase_lr_start_frac)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid final-phase LR start fraction %s; skipping final-phase decay.",
+                self.final_phase_lr_start_frac,
+            )
+            self._final_phase_lr_applied = True
+            return False
+
+        if current_episode < threshold_episode:
+            return False
+
+        optimizer = getattr(self.agent, "optimizer", None)
+        if optimizer is None:
+            logger.warning("Optimizer unavailable when attempting final-phase LR decay; skipping.")
+            self._final_phase_lr_applied = True
+            return False
+
+        scheduler_params = {}
+        if isinstance(self.agent_config, dict):
+            scheduler_params = self.agent_config.get("lr_scheduler_params", {}) or {}
+        min_lr = None
+        if isinstance(scheduler_params, dict) and "min_lr" in scheduler_params:
+            try:
+                min_lr = float(scheduler_params["min_lr"])
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid min_lr value %s; ignoring min_lr constraint for final-phase decay.",
+                    scheduler_params["min_lr"],
+                )
+                min_lr = None
+
+        changed = False
+        for param_group in optimizer.param_groups:
+            old_lr = param_group.get("lr")
+            if old_lr is None:
+                continue
+            old_lr_float = float(old_lr)
+            new_lr = old_lr_float * self.final_phase_lr_multiplier
+            if min_lr is not None:
+                new_lr = max(new_lr, min_lr)
+            if abs(new_lr - old_lr_float) > 1e-12:
+                param_group["lr"] = new_lr
+                changed = True
+
+        if changed:
+            self._final_phase_lr_applied = True
+            logger.info(
+                "[FinalPhaseLR] Applied LR multiplier %.3f at episode %s/%s (total steps %s).",
+                self.final_phase_lr_multiplier,
+                current_episode + 1,
+                total_episodes,
+                total_train_steps,
+            )
+        return changed
+
     def _log_episode_summary(
         self,
         episode: int,
@@ -581,6 +736,11 @@ class RainbowTrainerModule:
         logger.info(f"  Metrics - Max Drawdown: {metrics.get('max_drawdown', np.nan)*100:.2f}%" if metrics else "Metrics: N/A")
         logger.info(f"  Metrics - Action Counts: {metrics.get('action_counts', {})}" if metrics else "Metrics: N/A")
         logger.info(f"  Metrics - Transaction Costs: ${metrics.get('transaction_costs', np.nan):.2f}" if metrics else "Metrics: N/A")
+        if metrics:
+            logger.info(f"  Metrics - Avg Exposure: {metrics.get('avg_exposure_pct', np.nan):.2f}%")
+            logger.info(f"  Metrics - Max Exposure: {metrics.get('max_exposure_pct', np.nan):.2f}%")
+            logger.info(f"  Metrics - Avg Position: {metrics.get('avg_position', np.nan):.4f}")
+            logger.info(f"  Metrics - Avg Balance: ${metrics.get('avg_balance', np.nan):.2f}")
         # ------------------------- #
 
         # --- Log Episode Summary to TensorBoard --- #
@@ -604,6 +764,17 @@ class RainbowTrainerModule:
                 self.writer.add_scalar("Train/Max Drawdown Pct", metrics.get("max_drawdown", np.nan) * 100, episode)
                 self.writer.add_scalar("Train/Transaction Costs", metrics.get("transaction_costs", np.nan), episode)
                 self.writer.add_scalar("Train/Avg Tracker Reward", metrics.get("avg_reward", np.nan), episode)
+                if "avg_exposure_pct" in metrics:
+                    self.writer.add_scalar("Train/Avg Exposure Pct", metrics.get("avg_exposure_pct", np.nan), episode)
+                    self.writer.add_scalar("Train/Max Exposure Pct", metrics.get("max_exposure_pct", np.nan), episode)
+                if "avg_position" in metrics:
+                    self.writer.add_scalar("Train/Avg Position", metrics.get("avg_position", np.nan), episode)
+                if "avg_abs_position" in metrics:
+                    self.writer.add_scalar("Train/Avg Abs Position", metrics.get("avg_abs_position", np.nan), episode)
+                if "avg_balance" in metrics:
+                    self.writer.add_scalar("Train/Avg Balance", metrics.get("avg_balance", np.nan), episode)
+                if "avg_position_value" in metrics:
+                    self.writer.add_scalar("Train/Avg Position Value", metrics.get("avg_position_value", np.nan), episode)
                 action_counts = metrics.get("action_counts", {})
                 if action_counts:
                     for action_idx, count in action_counts.items():
@@ -690,6 +861,35 @@ class RainbowTrainerModule:
                         avg_val_metrics.get("max_drawdown", np.nan) * 100,
                         episode,
                     )
+                    if "avg_exposure_pct" in avg_val_metrics:
+                        self.writer.add_scalar(
+                            "Validation/Avg Exposure Pct",
+                            avg_val_metrics.get("avg_exposure_pct", np.nan),
+                            episode,
+                        )
+                        self.writer.add_scalar(
+                            "Validation/Max Exposure Pct",
+                            avg_val_metrics.get("max_exposure_pct", np.nan),
+                            episode,
+                        )
+                    if "avg_position" in avg_val_metrics:
+                        self.writer.add_scalar(
+                            "Validation/Avg Position",
+                            avg_val_metrics.get("avg_position", np.nan),
+                            episode,
+                        )
+                    if "avg_abs_position" in avg_val_metrics:
+                        self.writer.add_scalar(
+                            "Validation/Avg Abs Position",
+                            avg_val_metrics.get("avg_abs_position", np.nan),
+                            episode,
+                        )
+                    if "avg_balance" in avg_val_metrics:
+                        self.writer.add_scalar(
+                            "Validation/Avg Balance",
+                            avg_val_metrics.get("avg_balance", np.nan),
+                            episode,
+                        )
             # ---------------------------------------------------- #
 
             # --- Step LR Scheduler if it's ReduceLROnPlateau --- #
@@ -713,6 +913,12 @@ class RainbowTrainerModule:
                 else:
                     logger.warning("Skipping ReduceLROnPlateau step due to invalid validation score (-np.inf).")
             # ---------------------------------------------------- #
+
+            if should_stop_training and self.early_stopping_counter < self.early_stopping_patience:
+                logger.info(
+                    "[EarlyStopping] Counter reset after scheduler step; deferring stop to observe reduced learning rate."
+                )
+                should_stop_training = False
 
             # Save checkpoint AFTER validation
             self._save_checkpoint(
@@ -909,6 +1115,9 @@ class RainbowTrainerModule:
                         action=action,
                         reward=reward,
                         transaction_cost=info.get("step_transaction_cost", 0.0),  # Use step cost
+                        position=info.get("position"),
+                        balance=info.get("balance"),
+                        price=info.get("price"),
                     )
                     total_reward += reward
                     obs = next_obs
@@ -1025,6 +1234,10 @@ class RainbowTrainerModule:
             logger.debug(f"    Max Drawdown: {file_metrics.get('max_drawdown', np.nan)*100:.2f}%")
             logger.debug(f"    Action Counts: {file_metrics.get('action_counts', {})}")
             logger.debug(f"    Transaction Costs: ${file_metrics.get('transaction_costs', np.nan):.2f}")
+            logger.debug(f"    Avg Exposure: {file_metrics.get('avg_exposure_pct', np.nan):.2f}%")
+            logger.debug(f"    Max Exposure: {file_metrics.get('max_exposure_pct', np.nan):.2f}%")
+            logger.debug(f"    Avg Position: {file_metrics.get('avg_position', np.nan):.4f}")
+            logger.debug(f"    Avg Balance: ${file_metrics.get('avg_balance', np.nan):.2f}")
         else:
             logger.warning(f"Metrics dictionary is empty for {val_file.name}, cannot log detailed results.")
 
@@ -1072,6 +1285,12 @@ class RainbowTrainerModule:
                 "sharpe_ratio": float(file_metrics.get("sharpe_ratio", np.nan)),
                 "max_drawdown": float(file_metrics.get("max_drawdown", np.nan)),
                 "transaction_costs": float(final_info.get("transaction_cost", np.nan)),
+                "avg_exposure_pct": float(file_metrics.get("avg_exposure_pct", np.nan)),
+                "max_exposure_pct": float(file_metrics.get("max_exposure_pct", np.nan)),
+                "avg_position": float(file_metrics.get("avg_position", np.nan)),
+                "avg_abs_position": float(file_metrics.get("avg_abs_position", np.nan)),
+                "avg_balance": float(file_metrics.get("avg_balance", np.nan)),
+                "avg_position_value": float(file_metrics.get("avg_position_value", np.nan)),
             }
         else:
             # Create placeholder if metrics were invalid
@@ -1115,6 +1334,12 @@ class RainbowTrainerModule:
         sharpes = [m.get("sharpe_ratio", np.nan) for m in all_file_metrics]
         drawdowns = [m.get("max_drawdown", np.nan) for m in all_file_metrics]
         costs = [m.get("transaction_costs", np.nan) for m in all_file_metrics]
+        avg_positions = [m.get("avg_position", np.nan) for m in all_file_metrics]
+        avg_abs_positions = [m.get("avg_abs_position", np.nan) for m in all_file_metrics]
+        avg_balances = [m.get("avg_balance", np.nan) for m in all_file_metrics]
+        avg_exposures = [m.get("avg_exposure_pct", np.nan) for m in all_file_metrics]
+        max_exposures = [m.get("max_exposure_pct", np.nan) for m in all_file_metrics]
+        avg_position_values = [m.get("avg_position_value", np.nan) for m in all_file_metrics]
 
         return {
             "avg_reward": float(np.nanmean(rewards)),
@@ -1123,6 +1348,12 @@ class RainbowTrainerModule:
             "sharpe_ratio": float(np.nanmean(sharpes)),
             "max_drawdown": float(np.nanmean(drawdowns)),
             "transaction_costs": float(np.nanmean(costs)),
+            "avg_position": float(np.nanmean(avg_positions)),
+            "avg_abs_position": float(np.nanmean(avg_abs_positions)),
+            "avg_balance": float(np.nanmean(avg_balances)),
+            "avg_exposure_pct": float(np.nanmean(avg_exposures)),
+            "max_exposure_pct": float(np.nanmean(max_exposures)),
+            "avg_position_value": float(np.nanmean(avg_position_values)),
         }
 
     def _save_validation_results(self, validation_score: float, avg_metrics: dict, detailed_results: List[dict]):
@@ -1221,6 +1452,11 @@ class RainbowTrainerModule:
             logger.info(f"  Average Sharpe: {avg_metrics['sharpe_ratio']:.4f}")
             logger.info(f"  Average Max Drawdown: {avg_metrics['max_drawdown']*100:.2f}%")
             logger.info(f"Average Transaction Costs: ${avg_metrics['transaction_costs']:.2f}")
+            logger.info(f"Average Exposure: {avg_metrics['avg_exposure_pct']:.2f}%")
+            logger.info(f"Average Max Exposure: {avg_metrics['max_exposure_pct']:.2f}%")
+            logger.info(f"Average Position: {avg_metrics['avg_position']:.4f}")
+            logger.info(f"Average Abs Position: {avg_metrics['avg_abs_position']:.4f}")
+            logger.info(f"Average Balance: ${avg_metrics['avg_balance']:.2f}")
             logger.info("============================================")
 
             # 5. Save validation results
@@ -1357,6 +1593,9 @@ class RainbowTrainerModule:
                 action=action,
                 reward=reward,
                 transaction_cost=info.get("step_transaction_cost", 0.0),
+                position=info.get("position"),
+                balance=info.get("balance"),
+                price=info.get("price"),
             )
             recent_step_rewards.append(reward)
             episode_reward += reward
@@ -1426,6 +1665,9 @@ class RainbowTrainerModule:
         self.total_train_steps = start_total_steps  # Also store on self for internal checks
 
         self.agent.set_training_mode(True)
+        self._abort_training = False
+        self._abort_reason = None
+        self._abort_step = None
 
         total_rewards = []  # Track rewards across episodes for logging
 
@@ -1444,6 +1686,15 @@ class RainbowTrainerModule:
         # Main training loop
         try:
             for episode in range(start_episode, num_episodes):
+                if self._maybe_apply_final_phase_lr_decay(
+                    current_episode=episode,
+                    total_episodes=num_episodes,
+                    total_train_steps=total_train_steps,
+                ):
+                    if self.writer:
+                        current_lr = self.agent.optimizer.param_groups[0]["lr"]
+                        self.writer.add_scalar("Train/Learning_Rate", current_lr, total_train_steps)
+
                 # 1. Initialize episode environment and tracker
                 episode_env, initial_obs, initial_info, tracker = self._initialize_episode(specific_file, episode, num_episodes)
                 if episode_env is None or tracker is None:
@@ -1475,6 +1726,18 @@ class RainbowTrainerModule:
                     invalid_action_count,
                     total_train_steps,
                 )
+
+                if self._abort_training:
+                    abort_message = self._abort_reason or "Unrecoverable learning error encountered."
+                    if self._abort_step is not None:
+                        logger.error(
+                            "Terminating training loop at step %s due to: %s",
+                            self._abort_step,
+                            abort_message,
+                        )
+                    else:
+                        logger.error("Terminating training loop due to: %s", abort_message)
+                    break
 
                 # 4. Handle validation and checkpointing
                 should_stop = self._handle_validation_and_checkpointing(episode, total_train_steps, val_files, tracker)

@@ -18,9 +18,9 @@ logging:
 
 agent:
   # Core RL params
-  gamma: 0.99
-  lr: 0.001 # Learning rate (reduced for stability with transformer backbone)
-  batch_size: 4096
+  gamma: 0.95
+  lr: 0.0005 # Learning rate
+  batch_size: 16384
   replay_buffer_size: 500000
   target_update_freq: 600 # Learner steps per target sync (~1-2 trading days)
 
@@ -34,13 +34,15 @@ agent:
   nhead: 4 # Number of attention heads
   num_encoder_layers: 3 # Example: Number of Transformer encoder layers
   dim_feedforward: 512 # Example: Feedforward dimension
-  transformer_dropout: 0.2 # Example: Dropout within transformer
+  transformer_dropout: 0.1 # Example: Dropout within transformer
 
   # Rainbow specific params
   n_steps: 5          # Multi-step returns
   num_atoms: 51       # Distributional RL atoms
-  v_min: -10.0       # Distributional RL support min value (wider to cover scaled rewards)
-  v_max: 10.0        # Distributional RL support max value (wider to cover scaled rewards)
+  v_min: -2.0       # Distributional RL support min value (wider to cover scaled rewards)
+  v_max: 2.0        # Distributional RL support max value (wider to cover scaled rewards)
+  categorical_logging_interval: 2000 # Learner steps between categorical target histogram logs
+  categorical_logging_percentiles: [5, 25, 50, 75, 95] # Percentiles reported for categorical targets
   alpha: 0.6          # PER priority exponent
   beta_start: 0.3     # PER importance sampling exponent (initial)
   beta_frames: 400000 # PER beta annealing frames (steps)
@@ -51,7 +53,7 @@ agent:
   lr_scheduler_params: # Parameters specific to the chosen scheduler
     mode: 'max'        # 'max' because higher validation score is better
     factor: 0.5        # Factor by which the learning rate will be reduced. new_lr = lr * factor
-    patience: 10       # Number of epochs with no improvement after which learning rate will be reduced
+    patience: 3        # Number of epochs with no improvement after which learning rate will be reduced
     threshold: 0.0001  # Threshold for measuring the new optimum, to only focus on significant changes
     min_lr: 0.000001   # A lower bound on the learning rate
 
@@ -63,23 +65,26 @@ environment:
   window_size: 60 # Window size for the environment same as the agent
   initial_balance: 1000.0
   transaction_fee: 0.001 # Percentage fee
-  reward_scale: 50.0  # Scale factor for PnL component of reward
+  reward_scale: 10.0  # Scale factor for PnL component of reward
   invalid_action_penalty: -0.05 # Penalty for invalid actions
   render_mode:  # Set to 'human' or 'terminal' to enable visualization
 
 trainer:
   seed: 42
-  warmup_steps: 30000     # Steps with random actions before training
+  warmup_steps: 50000     # Steps with random actions before training
   update_freq: 10          # Agent learning update frequency (steps)
-  gradient_updates_per_step: 1  # Number of learner updates to run when update condition is met; increase to better utilize GPU
+  gradient_updates_per_step: 3  # Number of learner updates to run when update condition is met; increase to better utilize GPU
   log_freq: 60            # Logging frequency (steps)
-  per_stats_log_freq: 120 # Frequency (env steps) for PER stats between episode summaries; set to 0 for episode-only logs
-  validation_freq: 45     # Validation frequency (episodes)
+  per_stats_log_freq: 0 # Frequency (env steps) for PER stats between episode summaries; set to 0 for episode-only logs
+  validation_freq: 20     # Validation frequency (episodes)
   checkpoint_save_freq: 30 # Checkpoint save frequency (episodes)
   reward_window: 10       # Window for averaging episode rewards in logs
-  early_stopping_patience: 15 # Episodes without validation improvement to stop
+  reward_clip: 10.0       # Absolute clip applied to per-step rewards before learning
+  early_stopping_patience: 4 # Episodes without validation improvement to stop
+  final_phase_lr_start_frac: 0.7  # Fraction of training after which to force a terminal LR decay
+  final_phase_lr_multiplier: 0.5  # Multiplier applied to the LR once the final phase begins
   min_validation_threshold: 0.0 # Minimum score change considered improvement
-  render_training: true # Enable live rendering during training episodes
+  render_training: false # Enable live rendering during training episodes
   render_training_every_n_steps: 10 # Render frequency (in environment steps) when enabled
   render_validation: false # Enable live rendering during validation episodes
   render_validation_every_n_steps: 1 # Render frequency during validation when enabled

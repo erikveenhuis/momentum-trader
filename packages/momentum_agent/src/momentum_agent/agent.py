@@ -79,6 +79,25 @@ class RainbowDQNAgent:
         self.beta_frames = config["beta_frames"]
         self.grad_clip_norm = config["grad_clip_norm"]
         self.store_partial_n_step = self.config.get("store_partial_n_step", False)
+        self.categorical_logging_interval = int(config.get("categorical_logging_interval", 2000))
+        if self.categorical_logging_interval <= 0:
+            logger.warning(
+                "categorical_logging_interval must be a positive integer; falling back to default of 2000 learner steps."
+            )
+            self.categorical_logging_interval = 2000
+        raw_percentiles = config.get("categorical_logging_percentiles", [5, 25, 50, 75, 95])
+        filtered_percentiles: list[float] = []
+        for value in raw_percentiles if isinstance(raw_percentiles, (list, tuple)) else [raw_percentiles]:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if 0 < numeric < 100:
+                filtered_percentiles.append(numeric)
+        if filtered_percentiles:
+            self.categorical_logging_percentiles = sorted(filtered_percentiles)
+        else:
+            self.categorical_logging_percentiles = [5.0, 25.0, 50.0, 75.0, 95.0]
         # Optional flags can still use .get()
         self.debug_mode = config.get("debug", False)
         self.scaler = scaler  # Store the scaler instance
@@ -118,6 +137,11 @@ class RainbowDQNAgent:
         # Distributional RL setup
         self.support = torch.linspace(self.v_min, self.v_max, self.num_atoms).to(self.device)
         self.delta_z = (self.v_max - self.v_min) / (self.num_atoms - 1)
+        self.support_cpu = np.linspace(self.v_min, self.v_max, self.num_atoms, dtype=np.float64)
+        self._categorical_target_accumulator = {
+            "mass": np.zeros(self.num_atoms, dtype=np.float64),
+            "samples": 0,
+        }
 
         # Initialize Networks
         # Pass the agent's config dictionary and device directly
@@ -771,6 +795,81 @@ class RainbowDQNAgent:
 
             return m
 
+    def _accumulate_categorical_target_stats(self, target_distribution: torch.Tensor) -> None:
+        """Accumulates categorical target distributions for periodic logging."""
+        if self.categorical_logging_interval <= 0 or target_distribution is None:
+            return
+
+        if target_distribution.numel() == 0:
+            return
+
+        try:
+            batch_mass = (
+                target_distribution.detach().sum(dim=0).to(device="cpu", dtype=torch.float64).numpy()
+            )
+        except (RuntimeError, ValueError) as error:
+            logger.warning(f"Failed to accumulate categorical target stats: {error}")
+            return
+
+        if not np.isfinite(batch_mass).all():
+            logger.warning("Non-finite values encountered while accumulating categorical target stats; skipping update.")
+            return
+
+        self._categorical_target_accumulator["mass"] += batch_mass
+        self._categorical_target_accumulator["samples"] += target_distribution.shape[0]
+
+    def _log_categorical_target_stats(self) -> None:
+        """Logs histogram and percentiles for accumulated categorical target distributions."""
+        accumulator = self._categorical_target_accumulator
+
+        total_samples = accumulator["samples"]
+        if total_samples == 0:
+            return
+
+        mass = accumulator["mass"]
+        total_mass = mass.sum()
+        if not np.isfinite(total_mass) or total_mass <= 0:
+            logger.warning("Invalid total mass encountered while logging categorical target stats; resetting accumulator.")
+            accumulator["mass"].fill(0.0)
+            accumulator["samples"] = 0
+            return
+
+        probs = mass / total_mass
+        if not np.isfinite(probs).all():
+            logger.warning("Non-finite probabilities encountered in categorical target stats; resetting accumulator.")
+            accumulator["mass"].fill(0.0)
+            accumulator["samples"] = 0
+            return
+
+        cdf = np.cumsum(probs)
+        percentile_strings = []
+        for percentile in self.categorical_logging_percentiles:
+            target = percentile / 100.0
+            idx = int(np.searchsorted(cdf, target, side="left"))
+            idx = min(max(idx, 0), self.num_atoms - 1)
+            percentile_strings.append(f"{percentile:.1f}%={self.support_cpu[idx]:.4f}")
+
+        mean_value = float(np.dot(probs, self.support_cpu))
+        edge_min = float(probs[0])
+        edge_max = float(probs[-1])
+
+        logger.info(
+            "Categorical target stats at learn step %s (accumulated over %s samples): mean=%.4f, edge_mass=(min=%.4f, max=%.4f), percentiles=[%s]",
+            self.total_steps,
+            total_samples,
+            mean_value,
+            edge_min,
+            edge_max,
+            ", ".join(percentile_strings),
+        )
+        logger.info(
+            "Categorical target histogram (avg prob per atom, sum=1.0): %s",
+            np.array2string(probs, precision=4, suppress_small=True),
+        )
+
+        accumulator["mass"].fill(0.0)
+        accumulator["samples"] = 0
+
     def _compute_loss(self, batch, weights):
         """Computes the C51 loss using PER weights."""
         (
@@ -876,6 +975,7 @@ class RainbowDQNAgent:
                     self.batch_size,
                     self.num_atoms,
                 ), "Target distribution shape mismatch"
+            self._accumulate_categorical_target_stats(target_distribution)
             # ---------------------------------------- #
 
             # --- Calculate Online Distribution and Loss --- #
@@ -1026,6 +1126,11 @@ class RainbowDQNAgent:
 
         # Increment step counter and update target network periodically
         self.total_steps += 1
+        if (
+            self.categorical_logging_interval > 0
+            and self.total_steps % self.categorical_logging_interval == 0
+        ):
+            self._log_categorical_target_stats()
         if self.last_td_error_stats is not None and self.total_steps % 100 == 0:
             logger.info(
                 "TD error stats at learn step %s - mean: %.6f, std: %.6f",
