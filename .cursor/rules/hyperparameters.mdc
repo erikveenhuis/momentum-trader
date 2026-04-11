@@ -1,0 +1,26 @@
+---
+description: Hyperparameter rationale for the momentum trading agent
+globs: config/training_config.yaml
+alwaysApply: false
+---
+
+# Hyperparameter Rationale
+
+## Model Size (do NOT change without evidence)
+- hidden_dim=256: right-sized for 60x12 input. 512 would 4x Transformer cost for marginal gain.
+- 3 encoder layers: compositional depth for multi-step temporal reasoning. 2 loses depth, 4 adds cost.
+- dim_feedforward=512: 2x hidden_dim is standard. Could try 256 for speed if training is slow.
+- nhead=4: could experiment with 8 (zero param cost, finer attention) as a second-order optimization.
+
+## RL Params
+- gamma=0.99: minute-scale trades still benefit from looking ahead. 0.95 discounts too aggressively.
+- batch_size=8192: balances GPU utilization (~41% VRAM on RTX 5090) with PER effectiveness. 16384 approximates uniform sampling.
+- buffer=1M: 24k files x 1440 bars = 34M total bars. Larger buffer = more diverse replay.
+- n_steps=3: tight credit assignment for in-and-out-in-minutes momentum. 5 was too long-horizon.
+- reward_scale=1.0: with n_steps=3 and gamma=0.99, n-step returns stay in [-10, 10] C51 support. Old scale=10 caused edge-piling.
+
+## Hardware Context (RTX 5090 + Ryzen 9 9950X3D)
+- batch=8192 uses 13.3 GB / 31 GB VRAM (41.4%)
+- Forward: 128ms, Backward: 1178ms at batch=8192
+- Preprocessing 27k files: ~10 seconds with 12 CPU workers
+- GPU is not the bottleneck; environment stepping is

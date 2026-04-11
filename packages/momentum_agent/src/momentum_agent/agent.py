@@ -8,7 +8,6 @@ import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 from momentum_core.logging import get_logger
 from torch.amp import autocast
-from torch.cuda.amp import GradScaler
 
 from .buffer import PrioritizedReplayBuffer
 from .constants import ACCOUNT_STATE_DIM  # Import constant
@@ -30,18 +29,14 @@ class RainbowDQNAgent:
     - Noisy Nets for exploration
     """
 
-    def __init__(self, config: dict, device: str = "cuda", scaler: GradScaler | None = None):
+    def __init__(self, config: dict, device: str = "cuda", scaler=None):
         """
         Initializes the Rainbow DQN Agent.
 
         Args:
             config (dict): A dictionary containing all hyperparameters and network settings.
-                           Expected keys: seed, gamma, lr, replay_buffer_size, batch_size,
-                           target_update_freq, num_atoms, v_min, v_max, alpha, beta_start,
-                           beta_frames, n_steps, window_size, n_features, hidden_dim,
-                           num_actions, grad_clip_norm, debug (optional).
             device (str): The device to run the agent on ('cuda' or 'cpu').
-            scaler (GradScaler | None): Optional GradScaler for AMP.
+            scaler: Deprecated, kept for checkpoint compatibility. Ignored.
         """
         self.config = config
         self.device = self._resolve_device(device)
@@ -65,6 +60,7 @@ class RainbowDQNAgent:
         self.lr = config["lr"]
         self.batch_size = config["batch_size"]
         self.target_update_freq = config["target_update_freq"]
+        self.polyak_tau = config.get("polyak_tau", 0.005)
         self.n_steps = config["n_steps"]
         self.num_atoms = config["num_atoms"]
         self.v_min = config["v_min"]
@@ -100,7 +96,7 @@ class RainbowDQNAgent:
             self.categorical_logging_percentiles = [5.0, 25.0, 50.0, 75.0, 95.0]
         # Optional flags can still use .get()
         self.debug_mode = config.get("debug", False)
-        self.scaler = scaler  # Store the scaler instance
+        self.scaler = None  # GradScaler removed; bfloat16 autocast doesn't need it
         self._n_step_needs_reset = False
 
         # Setup seeds
@@ -123,11 +119,8 @@ class RainbowDQNAgent:
                 torch.backends.cudnn.conv.fp32_precision = "tf32"
             torch.cuda.manual_seed(self.seed)
             torch.cuda.manual_seed_all(self.seed)
-            logger.info(f"CUDA seed set. AMP Enabled: {self.scaler is not None}")
+            logger.info("CUDA seed set. AMP enabled with bfloat16 autocast.")
         else:
-            if self.scaler is not None:
-                logger.info("GradScaler provided for non-CUDA device; disabling AMP.")
-                self.scaler = None
             logger.info("Agent on CPU. AMP Disabled.")
 
         logger.info(f"Initializing RainbowDQNAgent on {self.device}")
@@ -194,7 +187,7 @@ class RainbowDQNAgent:
                 # Test compilation by running a small forward pass
                 with torch.no_grad():
                     test_market = torch.zeros((1, self.window_size, self.n_features), device=self.device)
-                    test_account = torch.zeros((1, 2), device=self.device)
+                    test_account = torch.zeros((1, ACCOUNT_STATE_DIM), device=self.device)
                     _ = compiled_network(test_market, test_account)
 
                 # Only assign if compilation and test succeeded
@@ -360,8 +353,8 @@ class RainbowDQNAgent:
             "total_steps": self.total_steps,
         }
 
-    def select_action(self, obs):
-        """Selects action based on the current Q-value estimates using Noisy Nets."""
+    def select_action(self, obs, action_mask=None):
+        """Selects action based on Q-values, with optional action masking."""
         if self.debug_mode:
             assert isinstance(obs, dict), "Observation must be a dictionary"
             assert "market_data" in obs and "account_state" in obs, "Observation missing required keys"
@@ -403,14 +396,18 @@ class RainbowDQNAgent:
         autocast_enabled = self.device.type == "cuda" and torch.cuda.is_available()
 
         with torch.inference_mode():
-            with autocast("cuda", enabled=autocast_enabled):
+            with autocast("cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
                 q_values = self.network.get_q_values(market_data, account_state)
             if self.debug_mode:
                 assert q_values.shape == (
                     1,
                     self.num_actions,
                 ), f"Q-values shape mismatch. Expected (1, {self.num_actions}), got {q_values.shape}"
-            action = q_values.argmax().item()  # Choose action with highest expected Q-value
+            if action_mask is not None:
+                mask_tensor = torch.tensor(action_mask, dtype=torch.bool, device=q_values.device)
+                q_values = q_values.clone()
+                q_values[0, ~mask_tensor] = float("-inf")
+            action = q_values.argmax().item()
             if self.debug_mode:
                 assert isinstance(action, int), f"Selected action is not an integer: {action}"
                 assert 0 <= action < self.num_actions, f"Selected action ({action}) is out of bounds [0, {self.num_actions})"
@@ -962,11 +959,9 @@ class RainbowDQNAgent:
             ), "Tensor weights_batch shape mismatch"
             # --- End: Assert tensor shapes ---
 
-        amp_enabled = self.scaler is not None and self.device.type == "cuda"
+        amp_enabled = self.device.type == "cuda" and torch.cuda.is_available()
 
-        # --- Calculate Target Distribution (m) --- #
-        # This is the projected distribution for the Bellman target Z(s_t, a_t)
-        with autocast("cuda", enabled=amp_enabled):
+        with autocast("cuda", dtype=torch.bfloat16, enabled=amp_enabled):
             target_distribution = self._project_target_distribution(
                 next_market_data_batch, next_account_state_batch, rewards_batch, dones_batch
             )
@@ -1005,12 +1000,18 @@ class RainbowDQNAgent:
             if self.debug_mode:
                 assert loss_elementwise.shape == (self.batch_size,), "Per-sample loss shape mismatch"
 
-            # Apply Importance Sampling weights and calculate mean loss
-            loss = (loss_elementwise * weights_batch.squeeze(1).detach()).mean()  # Scalar
+            loss = (loss_elementwise * weights_batch.squeeze(1).detach()).mean()
             if loss.ndim != 0:
                 raise RuntimeError("Final loss is not a scalar")
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Loss calculation resulted in NaN or Inf: {loss.item()}")
+
+            aux_pred = self.network.predict_return(market_data_batch)
+            log_ret_col = 6
+            if market_data_batch.shape[2] > log_ret_col:
+                target_return = market_data_batch[:, -1, log_ret_col].detach()
+                aux_loss = torch.nn.functional.mse_loss(aux_pred, target_return)
+                loss = loss + 0.1 * aux_loss
             # ----------------------------------------- #
 
             # --- Calculate TD errors for PER update --- #
@@ -1068,31 +1069,15 @@ class RainbowDQNAgent:
             reserved = torch.cuda.memory_reserved(self.device) / 1024**2
             logger.debug(f"GPU Memory - Allocated: {allocated:.1f} MB, Reserved: {reserved:.1f} MB")
 
-        # Check if AMP is enabled (scaler exists)
-        amp_enabled = self.scaler is not None and self.device.type == "cuda"
-
-        # Optimize the model
         self.optimizer.zero_grad(set_to_none=True)
-
-        if amp_enabled:
-            # Scale loss and backpropagate
-            self.scaler.scale(loss).backward()
-        else:
-            # Standard backward pass
-            loss.backward()
+        loss.backward()
 
         if self.debug_mode:
             for p in self.network.parameters():
                 if p.grad is not None and not torch.isfinite(p.grad).all():
                     logger.error(f"NaN or Inf detected in gradients BEFORE clipping for parameter: {p.shape}")
 
-        # Clip gradients
-        if amp_enabled:
-            # Unscale gradients before clipping
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=self.grad_clip_norm)
-        else:
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=self.grad_clip_norm)
+        torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=self.grad_clip_norm)
 
         if self.debug_mode:
             for p in self.network.parameters():
@@ -1101,14 +1086,7 @@ class RainbowDQNAgent:
                         f"NaN or Inf detected in gradients AFTER clipping (Max Norm: {self.grad_clip_norm}) for parameter: {p.shape}"
                     )
 
-        if amp_enabled:
-            # Scaler steps the optimizer
-            self.scaler.step(self.optimizer)
-            # Update scaler for next iteration
-            self.scaler.update()
-        else:
-            # Standard optimizer step
-            self.optimizer.step()
+        self.optimizer.step()
 
         # Step LR scheduler when appropriate (no-op for schedulers that require validation metrics)
         self._step_scheduler()
@@ -1138,9 +1116,9 @@ class RainbowDQNAgent:
                 self.last_td_error_stats.get("mean", float("nan")),
                 self.last_td_error_stats.get("std", float("nan")),
             )
+        self._update_target_network()
         if self.total_steps % self.target_update_freq == 0:
-            self._update_target_network()
-            logger.info(f"Step {self.total_steps}: Target network updated.")
+            logger.info(f"Step {self.total_steps}: Target network soft-updated (tau={self.polyak_tau}).")
 
         loss_item = loss.item()
         if not isinstance(loss_item, float) or np.isnan(loss_item) or np.isinf(loss_item):
@@ -1200,9 +1178,11 @@ class RainbowDQNAgent:
             )
 
     def _update_target_network(self):
-        """Copies weights from online network to target network."""
-        self.target_network.load_state_dict(self.network.state_dict())
-        logger.debug("Target network weights updated.")
+        """Polyak-averaged (soft) update: target <- tau * online + (1 - tau) * target."""
+        tau = self.polyak_tau
+        for tp, op in zip(self.target_network.parameters(), self.network.parameters()):
+            tp.data.mul_(1.0 - tau).add_(op.data, alpha=tau)
+        logger.debug(f"Target network soft-updated (tau={tau}).")
 
     def save_model(self, path_prefix):
         """Saves the agent's model and optimizer state."""
@@ -1220,7 +1200,7 @@ class RainbowDQNAgent:
             "optimizer_state_dict": self.optimizer.state_dict(),
             "total_steps": self.total_steps,  # Save total steps for resuming
             "config": self.config,  # Save the agent's config
-            "scaler_state_dict": (self.scaler.state_dict() if self.scaler else None),  # Save scaler state
+            "scaler_state_dict": None,
         }
         if self.scheduler and self.lr_scheduler_enabled:
             checkpoint["scheduler_state_dict"] = self.scheduler.state_dict()
@@ -1274,14 +1254,14 @@ class RainbowDQNAgent:
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
 
             # Load network and target network
-            if "network_state_dict" in checkpoint and self.network:
+            if "network_state_dict" in checkpoint and self.network is not None:
                 self.network.load_state_dict(checkpoint["network_state_dict"])
                 logger.info("Network state loaded.")
             else:
                 logger.warning("Network state_dict not found in checkpoint or network not initialized.")
                 return False
 
-            if "target_network_state_dict" in checkpoint and self.target_network:
+            if "target_network_state_dict" in checkpoint and self.target_network is not None:
                 self.target_network.load_state_dict(checkpoint["target_network_state_dict"])
                 logger.info("Target network state loaded.")
             else:
@@ -1290,7 +1270,7 @@ class RainbowDQNAgent:
                 # but for full resume, it's better to have it.
 
             # Load optimizer state
-            if "optimizer_state_dict" in checkpoint and self.optimizer:
+            if "optimizer_state_dict" in checkpoint and self.optimizer is not None:
                 self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
                 logger.info("Optimizer state loaded.")
             else:
@@ -1304,15 +1284,6 @@ class RainbowDQNAgent:
             else:
                 logger.warning("Total steps not found in checkpoint. Resetting to 0.")
                 self.total_steps = 0  # Or handle as error depending on requirements
-
-            # Load scaler state
-            if "scaler_state_dict" in checkpoint and self.scaler:
-                self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
-                logger.info("GradScaler state loaded.")
-            elif self.scaler is None and "scaler_state_dict" in checkpoint and checkpoint["scaler_state_dict"] is not None:
-                logger.warning("Scaler state found in checkpoint, but agent's scaler is None. Scaler state not loaded.")
-            elif self.scaler and "scaler_state_dict" not in checkpoint:
-                logger.warning("Agent has a scaler, but no scaler state found in checkpoint.")
 
             # Load scheduler state
             if "scheduler_state_dict" in checkpoint and self.scheduler and self.lr_scheduler_enabled:
@@ -1376,7 +1347,7 @@ class RainbowDQNAgent:
         successful_load = True
 
         # Load network state
-        if "network_state_dict" in agent_state_dict and self.network:
+        if "network_state_dict" in agent_state_dict and self.network is not None:
             try:
                 self.network.load_state_dict(agent_state_dict["network_state_dict"])
                 self.network.to(self.device)  # Ensure model is on the correct device
@@ -1389,7 +1360,7 @@ class RainbowDQNAgent:
             successful_load = False  # Critical component
 
         # Load target network state
-        if "target_network_state_dict" in agent_state_dict and self.target_network:
+        if "target_network_state_dict" in agent_state_dict and self.target_network is not None:
             try:
                 self.target_network.load_state_dict(agent_state_dict["target_network_state_dict"])
                 self.target_network.to(self.device)  # Ensure model is on the correct device
@@ -1402,7 +1373,7 @@ class RainbowDQNAgent:
             # successful_load = False
 
         # Load optimizer state
-        if "optimizer_state_dict" in agent_state_dict and self.optimizer:
+        if "optimizer_state_dict" in agent_state_dict and self.optimizer is not None:
             try:
                 self.optimizer.load_state_dict(agent_state_dict["optimizer_state_dict"])
                 # Ensure optimizer's state is on the correct device if parameters were moved
@@ -1422,18 +1393,6 @@ class RainbowDQNAgent:
         else:
             logger.warning("Total steps not found in provided dictionary. Agent's total_steps not updated.")
             # Consider if this should be an error or if agent's current total_steps is acceptable.
-
-        # Load scaler state
-        if "scaler_state_dict" in agent_state_dict and agent_state_dict["scaler_state_dict"] is not None and self.scaler:
-            try:
-                self.scaler.load_state_dict(agent_state_dict["scaler_state_dict"])
-                logger.info("GradScaler state loaded from dictionary.")
-            except Exception as e:
-                logger.error(f"Error loading GradScaler state_dict from dictionary: {e}", exc_info=True)
-        elif self.scaler is None and "scaler_state_dict" in agent_state_dict and agent_state_dict["scaler_state_dict"] is not None:
-            logger.warning("Scaler state found in dictionary, but agent's scaler is None. Scaler state not loaded.")
-        elif self.scaler and ("scaler_state_dict" not in agent_state_dict or agent_state_dict.get("scaler_state_dict") is None):
-            logger.warning("Agent has a scaler, but no scaler state found in dictionary. Scaler state not loaded.")
 
         # Load scheduler state
         if (

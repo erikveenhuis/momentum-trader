@@ -75,16 +75,21 @@ class DataManager:
 
         try:
             # Load and sort files from each directory by filename (assumes YYYY-MM-DD format)
-            self.train_files = sorted(list(self.train_dir.glob("*.csv")))
-            self.val_files = sorted(list(self.val_dir.glob("*.csv")))
-            self.test_files = sorted(list(self.test_dir.glob("*.csv")))
+            self.train_files = sorted(list(self.train_dir.glob("*.npz")))
+            self.val_files = sorted(list(self.val_dir.glob("*.npz")))
+            self.test_files = sorted(list(self.test_dir.glob("*.npz")))
 
-            # Assert that files were actually found if the directories exist
-            assert len(self.train_files) > 0, f"No training CSV files found in {self.train_dir}"
-            assert len(self.val_files) > 0, f"No validation CSV files found in {self.val_dir}"
-            # Test files might be optional, so only warn if missing
+            if not self.train_files:
+                self.train_files = sorted(list(self.train_dir.glob("*.csv")))
+                self.val_files = sorted(list(self.val_dir.glob("*.csv")))
+                self.test_files = sorted(list(self.test_dir.glob("*.csv")))
+                if self.train_files:
+                    logger.info("No .npz files found, falling back to CSV files.")
+
+            assert len(self.train_files) > 0, f"No training data files found in {self.train_dir}"
+            assert len(self.val_files) > 0, f"No validation data files found in {self.val_dir}"
             if len(self.test_files) == 0:
-                logger.warning(f"No test CSV files found in {self.test_dir}")
+                logger.warning(f"No test data files found in {self.test_dir}")
 
             logger.info(f"Found {len(self.train_files)} training files.")
             logger.info(f"Found {len(self.val_files)} validation files.")
@@ -122,13 +127,21 @@ class DataManager:
         # No assertion here, test files might be empty
         return self.test_files
 
-    def get_random_training_file(self) -> Path:
-        """Get a random training file."""
+    def get_random_training_file(self, curriculum_frac: float = 1.0) -> Path:
+        """Get a random training file, optionally restricted by curriculum fraction.
+
+        Args:
+            curriculum_frac: Fraction of training files to sample from (0..1).
+                The files are sorted by name (chronologically), so a fraction < 1
+                restricts to earlier (typically lower-volatility) data.
+        """
         self._ensure_organized()
         num_files = len(self.train_files)
-        logger.debug(f"[DataManager] Choosing random file from {num_files} training files.")
         assert num_files > 0, "Cannot get random file: No training files available."
-        random_file = random.choice(self.train_files)
-        logger.debug(f"[DataManager] Selected file: {random_file.name}")
+
+        pool_size = max(1, int(num_files * min(max(curriculum_frac, 0.0), 1.0)))
+        pool = self.train_files[:pool_size]
+        random_file = random.choice(pool)
+        logger.debug(f"[DataManager] Selected file: {random_file.name} (pool={pool_size}/{num_files})")
         assert random_file.exists(), f"Chosen random training file does not exist: {random_file}"
         return random_file

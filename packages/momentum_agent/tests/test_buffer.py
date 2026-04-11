@@ -224,3 +224,37 @@ def test_buffer_update_beta(per_buffer):
 
     per_buffer.update_beta(total_steps=BETA_FRAMES * 2)
     assert abs(per_buffer.beta - 1.0) < 1e-6  # Should clamp at 1.0
+
+
+@pytest.mark.unit
+def test_buffer_state_dict_roundtrip(per_buffer):
+    """Test that state_dict/load_state_dict preserves buffer contents."""
+    for i in range(BUFFER_CAPACITY):
+        per_buffer.store(*create_dummy_experience(i))
+
+    state = per_buffer.state_dict()
+    assert "buffer" in state
+    assert "tree_state" in state
+    assert len(state["buffer"]) == BUFFER_CAPACITY
+
+    new_buffer = PrioritizedReplayBuffer(
+        capacity=BUFFER_CAPACITY,
+        alpha=ALPHA,
+        beta_start=BETA_START,
+        beta_frames=BETA_FRAMES,
+    )
+    new_buffer.load_state_dict(state)
+    assert len(new_buffer) == len(per_buffer)
+
+    batch1, _, _ = per_buffer.sample(BATCH_SIZE)
+    batch2, _, _ = new_buffer.sample(BATCH_SIZE)
+    assert batch1 is not None
+    assert batch2 is not None
+
+
+@pytest.mark.unit
+def test_buffer_beta_never_exceeds_one(per_buffer):
+    """Beta should never go above 1.0 regardless of steps."""
+    for steps in [0, BETA_FRAMES, BETA_FRAMES * 10, 999999999]:
+        per_buffer.update_beta(total_steps=steps)
+        assert per_buffer.beta <= 1.0

@@ -54,8 +54,8 @@ def test_live_feature_normalizer_generates_window():
         normalizer.update(bar)
 
     window = normalizer.window()
-    assert window.shape == (3, 5)
-    assert np.all((window >= 0) & (window <= 1))
+    assert window.shape == (3, 12)
+    assert np.isfinite(window).all()
 
 
 class _StubAgent:
@@ -74,19 +74,25 @@ def test_momentum_live_trader_process_bar_returns_decision():
         transaction_fee=0.0,
         reward_scale=1.0,
         invalid_action_penalty=-0.05,
+        drawdown_penalty_lambda=0.0,
+        slippage_bps=0.0,
+        opportunity_cost_lambda=0.0,
+        min_rebalance_pct=0.02,
+        min_trade_value=1.0,
         models_dir="models",
+        checkpoint_pattern="checkpoint_trainer_best_*.pt",
     )
 
-    agent = _StubAgent([1])  # Buy action when enough history is available
+    agent = _StubAgent([1])  # Action 1 = target 20%
     trader = MomentumLiveTrader(agent=agent, config=config)
 
     timestamp = datetime.now(UTC)
     bar1 = BarData("BTC/USD", 100.0, 100.0, 100.0, 100.0, 5.0, timestamp)
     bar2 = BarData("BTC/USD", 101.0, 101.0, 101.0, 101.0, 5.0, timestamp)
 
-    assert trader.process_bar(bar1) is None  # Not enough data yet
+    assert trader.process_bar(bar1) is None
 
     decision = trader.process_bar(bar2)
     assert decision is not None
-    assert decision["action"] == "buy"
-    assert pytest.approx(decision["fraction"], rel=1e-6) == 0.10
+    assert decision["target_allocation"] == 0.2
+    assert decision["valid"] is True

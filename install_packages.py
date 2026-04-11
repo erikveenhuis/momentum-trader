@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""
-Install Momentum Trader packages in editable mode.
-
-This script installs all the required packages for the Momentum Trader project
-in development mode, allowing for live editing of the source code.
-"""
+"""Install Momentum Trader packages in editable mode."""
 
 import subprocess
 import sys
@@ -13,22 +8,22 @@ from pathlib import Path
 
 def run_command(cmd, description):
     """Run a command and return success status."""
-    print(f"📦 {description}...")
+    print(f"[install] {description}...")
     try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        print(f"✅ {description} completed successfully")
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        print(f"[ok] {description}")
         return True
     except subprocess.CalledProcessError as e:
-        print(f"❌ {description} failed:")
-        print(f"   Command: {' '.join(cmd)}")
-        print(f"   Error: {e.stderr}")
+        print(f"[error] {description}")
+        print(f"  Command: {' '.join(cmd)}")
+        print(f"  Error: {e.stderr}")
         return False
 
 
 def install_package(package_path, package_name):
     """Install a single package in editable mode."""
     if not package_path.exists():
-        print(f"❌ Package directory not found: {package_path}")
+        print(f"[error] Package directory not found: {package_path}")
         return False
 
     cmd = [sys.executable, "-m", "pip", "install", "-e", str(package_path)]
@@ -37,46 +32,41 @@ def install_package(package_path, package_name):
 
 def verify_installation():
     """Verify that all packages can be imported."""
-    print("🔍 Verifying package installation...")
+    print("[verify] Checking package imports...")
 
     packages_to_check = [
         "momentum_core",
         "momentum_env",
         "momentum_agent",
         "momentum_train",
-        "momentum_live"
+        "momentum_live",
     ]
 
-    failed_imports = []
-
+    failed = []
     for package in packages_to_check:
         try:
             __import__(package)
-            print(f"✅ {package} imported successfully")
+            print(f"  [ok] {package}")
         except ImportError as e:
-            print(f"❌ Failed to import {package}: {e}")
-            failed_imports.append(package)
+            print(f"  [error] {package}: {e}")
+            failed.append(package)
 
-    if failed_imports:
-        print(f"\n❌ Failed to import {len(failed_imports)} package(s): {', '.join(failed_imports)}")
+    if failed:
+        print(f"\n[error] Failed to import: {', '.join(failed)}")
         return False
 
-    print("✅ All packages imported successfully!")
+    print("[ok] All packages imported successfully")
     return True
 
 
 def main():
-    """Main installation function."""
-    print("=" * 60)
-    print("📦 MOMENTUM TRADER PACKAGE INSTALLER")
-    print("=" * 60)
-    print()
+    print("Momentum Trader Package Installer")
+    print("=" * 40)
 
-    # Check if virtual environment is activated
-    if not hasattr(sys, 'real_prefix') and not (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix):
-        print("⚠️  Warning: Virtual environment not detected!")
-        print("   Make sure to activate your venv before running this script.")
-        print("   Run: source venv/bin/activate")
+    if not hasattr(sys, "real_prefix") and not (
+        hasattr(sys, "base_prefix") and sys.base_prefix != sys.prefix
+    ):
+        print("[warn] Virtual environment not detected. Run: source venv/bin/activate")
         print()
 
     project_root = Path(__file__).parent
@@ -89,31 +79,17 @@ def main():
         ("momentum_live", project_root / "packages" / "momentum_live"),
     ]
 
-    print("🚀 Installing packages in editable mode...")
-    print()
-
     success = True
     for package_name, package_path in packages:
         if not install_package(package_path, package_name):
             success = False
             break
 
-    if success:
-        print()
-        if verify_installation():
-            print()
-            print("🎉 Installation completed successfully!")
-            print("   You can now run training with: python train.py")
-            return 0
-        else:
-            print()
-            print("❌ Installation verification failed!")
-            print("   Try running this script again or check the error messages above.")
-            return 1
+    if success and verify_installation():
+        print("\nInstallation complete.")
+        return 0
     else:
-        print()
-        print("❌ Installation failed!")
-        print("   Check the error messages above for details.")
+        print("\nInstallation failed.")
         return 1
 
 

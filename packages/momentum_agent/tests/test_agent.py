@@ -36,7 +36,7 @@ def default_config():
         "beta_frames": 100,  # Short annealing for tests
         "n_steps": 3,
         "window_size": 10,
-        "n_features": 5,
+        "n_features": 12,
         "hidden_dim": 64,
         "num_actions": 3,  # e.g., Hold, Buy, Sell
         "debug": True,  # Enable debug checks
@@ -86,8 +86,10 @@ def test_agent_initialization(agent, default_config):
     """Tests if the agent initializes components correctly."""
     assert agent is not None
     assert agent.config == default_config
-    assert isinstance(agent.network, RainbowNetwork)
-    assert isinstance(agent.target_network, RainbowNetwork)
+    net = getattr(agent.network, "_orig_mod", agent.network)
+    tgt = getattr(agent.target_network, "_orig_mod", agent.target_network)
+    assert isinstance(net, RainbowNetwork)
+    assert isinstance(tgt, RainbowNetwork)
     assert agent.optimizer is not None
     assert isinstance(agent.buffer, PrioritizedReplayBuffer)
     assert agent.buffer.capacity == default_config["replay_buffer_size"]
@@ -256,9 +258,10 @@ def test_target_network_update(agent, default_config):
     final_target_params = [p.clone().detach() for p in agent.target_network.parameters()]
     online_params = [p.clone().detach() for p in agent.network.parameters()]
 
-    # Check if target params match online params after update
-    for p_target, p_online in zip(final_target_params, online_params):
-        assert torch.equal(p_target, p_online), "Target network parameters did not match online network after update."
+    tau = agent.polyak_tau
+    for p_initial, p_final, p_online in zip(initial_target_params, final_target_params, online_params):
+        expected = (1.0 - tau) * p_initial + tau * p_online
+        assert torch.allclose(p_final, expected, atol=1e-6), "Polyak soft update did not produce expected result."
 
     # Check if target params are different from initial target params
     params_updated = False
@@ -326,14 +329,13 @@ def test_save_load_model(agent, default_config, tmp_path):
     # Compare target network weights (should also be loaded/synced)
     # Note: After load, target network should be synced to match the online network
     loaded_target_state_dict = new_agent.target_network.state_dict()
-    for key in original_state_dict:  # Target should match original online after load->sync
+    for key in original_state_dict:
+        if "epsilon" in key:
+            continue
         original_tensor = original_state_dict[key]
         loaded_tensor = loaded_target_state_dict[key]
         if original_tensor.device != loaded_tensor.device:
             loaded_tensor = loaded_tensor.to(original_tensor.device)
-        # Use allclose for floating-point comparison to account for numerical precision
-        # Note: Target network may have slightly different values due to save/load rounding
-        # Use more lenient tolerance for target network comparison
         assert torch.allclose(original_tensor, loaded_tensor, atol=1e-3, rtol=1e-3), f"Target network parameter mismatch for key: {key}"
 
     # Compare optimizer state (tricky due to internal structure)
@@ -414,7 +416,79 @@ def test_set_training_mode(agent):
     assert agent.target_network.training is False  # Target network remains eval
 
 
-# Add more tests as needed, e.g., for specific components like _project_target_distribution
+@pytest.mark.unit
+def test_compute_loss_returns_scalar_and_td_errors(agent, default_config):
+    """Test that _compute_loss returns a scalar loss and correct-shaped TD errors."""
+    batch_size = default_config["batch_size"]
+    n_steps = default_config["n_steps"]
+
+    for _ in range(batch_size + n_steps):
+        obs = generate_dummy_observation(default_config)
+        agent.store_transition(obs, 1, 0.5, obs, False)
+
+    assert len(agent.buffer) >= batch_size
+
+    agent.buffer.update_beta(agent.total_steps)
+    batch_tuple, tree_indices, weights = agent.buffer.sample(batch_size)
+
+    loss, td_errors = agent._compute_loss(batch_tuple, weights)
+
+    assert loss.ndim == 0
+    assert td_errors.shape == (batch_size,)
+    assert torch.isfinite(loss)
+    assert torch.isfinite(td_errors).all()
+
+
+@pytest.mark.unit
+def test_select_action_with_action_mask(agent, default_config):
+    """Test that action masking forces a specific action."""
+    obs = generate_dummy_observation(default_config)
+
+    mask = np.zeros(default_config["num_actions"], dtype=bool)
+    mask[2] = True
+
+    for _ in range(10):
+        action = agent.select_action(obs, action_mask=mask)
+        assert action == 2
+
+
+@pytest.mark.unit
+def test_n_step_partial_storage(default_config):
+    """Test that partial n-step transitions are stored at episode end."""
+    config = default_config.copy()
+    config["store_partial_n_step"] = True
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    agent = RainbowDQNAgent(config=config, device=device)
+
+    obs = generate_dummy_observation(config)
+    agent.store_transition(obs, 0, 1.0, obs, False)
+    agent.store_transition(obs, 1, 0.5, obs, False)
+    pre_done_count = len(agent.buffer)
+
+    agent.store_transition(obs, 0, -0.5, obs, True)
+    post_done_count = len(agent.buffer)
+
+    assert post_done_count > pre_done_count
+
+
+@pytest.mark.unit
+def test_load_state_dict_path(agent, default_config, tmp_path):
+    """Test loading agent state via the load_state dict path."""
+    agent.total_steps = 99
+
+    save_prefix = str(tmp_path / "test_state")
+    agent.save_model(save_prefix)
+
+    checkpoint_path = f"{save_prefix}_agent_state.pt"
+    checkpoint = torch.load(checkpoint_path, map_location=agent.device, weights_only=False)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    new_agent = RainbowDQNAgent(config=default_config, device=device)
+    assert new_agent.total_steps == 0
+
+    success = new_agent.load_state(checkpoint)
+    assert success
+    assert new_agent.total_steps == 99
 # or edge cases in PER interaction.
 
 # Note: Testing the numerical correctness of _project_target_distribution

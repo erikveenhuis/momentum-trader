@@ -17,8 +17,7 @@ import yaml  # Added for config loading
 from momentum_core.logging import get_logger, setup_package_logging
 from momentum_env import TradingEnv, TradingEnvConfig
 
-# --- Add AMP imports ---
-from torch.amp import GradScaler
+# AMP uses bfloat16 autocast (no GradScaler needed)
 
 # --- Add TensorBoard import ---
 from torch.utils.tensorboard import SummaryWriter
@@ -209,12 +208,7 @@ def run_training(
         raise RuntimeError(error_msg)
     logger.info(f"Using {device} device")
 
-    # --- Initialize GradScaler for AMP if using CUDA ---
-    scaler = None
-    if device.type == "cuda":
-        scaler = GradScaler("cuda")
-        logger.info("Initialized GradScaler for Automatic Mixed Precision (AMP).")
-    # --------------------------------------------------
+    scaler = None  # GradScaler removed; bfloat16 autocast handles mixed precision
 
     # Agent class is fixed for this script
     AgentClass = RainbowDQNAgent
@@ -299,7 +293,14 @@ def run_training(
                     agent_loaded = agent.load_state(checkpoint_data)  # Pass the whole dict
 
                     if agent_loaded:
-                        # Prefer the trainer's recorded step count for resume consistency
+                        buf_state = checkpoint_data.get("buffer_state")
+                        if buf_state and hasattr(agent.buffer, "load_state_dict"):
+                            try:
+                                agent.buffer.load_state_dict(buf_state)
+                                logger.info(f"Replay buffer restored ({len(agent.buffer)} transitions).")
+                            except Exception as e:
+                                logger.warning(f"Could not restore replay buffer: {e}")
+
                         start_total_steps = trainer_steps_from_checkpoint
                         if agent.total_steps != trainer_steps_from_checkpoint:
                             logger.warning(
@@ -348,63 +349,27 @@ def run_training(
     logger.info(f"Agent instantiated with {sum(p.numel() for p in agent.network.parameters()):,} parameters.")
 
     # --- Initialize TensorBoard Writer ---
-    configured_log_dir_base = Path(model_dir) / "runs"
-    configured_log_dir_base.mkdir(parents=True, exist_ok=True)
-    if configured_log_dir_base.is_absolute():
-        log_dir_base = configured_log_dir_base
-    else:
-        log_dir_base = (Path.cwd() / configured_log_dir_base).resolve()
+    log_dir_base = (Path(model_dir) / "runs").resolve()
+    log_dir_base.mkdir(parents=True, exist_ok=True)
 
     resume_log_dir_str = checkpoint_data.get("tensorboard_log_dir") if checkpoint_data else None
     log_dir_path: Path
 
     if resume_training_flag and resume_log_dir_str:
-        raw_log_dir_path = Path(resume_log_dir_str)
-        if raw_log_dir_path.is_absolute():
-            log_dir_path = raw_log_dir_path
-        else:
-            normalized_path = raw_log_dir_path
-            matched_prefix = False
-            for base_candidate in (configured_log_dir_base, Path("runs"), Path(model_dir)):
-                try:
-                    normalized_path = raw_log_dir_path.relative_to(base_candidate)
-                except ValueError:
-                    continue
-                else:
-                    matched_prefix = True
-                    break
-
-            if matched_prefix:
-                if normalized_path == Path("."):
-                    logger.warning(
-                        "TensorBoard log directory from checkpoint %s did not include a run subdirectory; using base directory %s.",
-                        resume_log_dir_str,
-                        log_dir_base,
-                    )
-                    log_dir_path = log_dir_base
-                else:
-                    log_dir_path = (log_dir_base / normalized_path).resolve()
-            elif raw_log_dir_path.parent == Path("."):
-                log_dir_path = (log_dir_base / raw_log_dir_path).resolve()
-            else:
-                log_dir_path = (Path.cwd() / raw_log_dir_path).resolve()
+        resumed = Path(resume_log_dir_str)
+        log_dir_path = resumed if resumed.is_absolute() else (Path.cwd() / resumed).resolve()
         log_dir_path.mkdir(parents=True, exist_ok=True)
         writer_kwargs: dict[str, Any] = {"log_dir": str(log_dir_path)}
         if start_total_steps > 0:
             writer_kwargs["purge_step"] = start_total_steps
         writer = SummaryWriter(**writer_kwargs)
-        logger.info(f"Resuming TensorBoard logging in existing directory: {log_dir_path}")
+        logger.info(f"Resuming TensorBoard logging in: {log_dir_path}")
     else:
-        if resume_training_flag:
-            if checkpoint_data is None:
-                logger.info("No checkpoint data available; creating a new TensorBoard run directory.")
-            else:
-                logger.warning("Checkpoint did not include TensorBoard log directory; creating a new run directory.")
         current_time = time.strftime("%Y%m%d-%H%M%S")
-        log_dir_path = (log_dir_base / current_time).resolve()
+        log_dir_path = log_dir_base / current_time
         log_dir_path.mkdir(parents=True, exist_ok=True)
         writer = SummaryWriter(log_dir=str(log_dir_path))
-        logger.info(f"TensorBoard logs will be saved to: {log_dir_path}")
+        logger.info(f"TensorBoard logs: {log_dir_path}")
 
     # Store log dir for downstream components if needed
     config.setdefault("run", {})["tensorboard_log_dir"] = str(log_dir_path)

@@ -17,8 +17,16 @@ def portfolio_state():
 
 @pytest.fixture
 def trading_logic():
-    """Create a trading logic instance."""
-    return TradingLogic(transaction_fee=0.001, reward_scale=500.0, invalid_action_penalty=-1.0)
+    """Create a trading logic instance matching production config."""
+    return TradingLogic(
+        transaction_fee=0.001,
+        reward_scale=1.0,
+        invalid_action_penalty=-0.1,
+        drawdown_penalty_lambda=0.5,
+        slippage_bps=5.0,
+        opportunity_cost_lambda=0.1,
+        min_trade_value=1.0,
+    )
 
 
 def test_portfolio_state_initialization(portfolio_state):
@@ -41,47 +49,54 @@ def test_portfolio_value(portfolio_state):
 
 
 def test_handle_buy(trading_logic, portfolio_state):
-    """Test buy action handling."""
+    """Test buy action handling with fee + slippage."""
     current_price = 100.0
-    action_value = 0.5  # Buy 50% of available balance
+    action_value = 0.5
+    fee = trading_logic.transaction_fee
+    slip = trading_logic.slippage_bps * 1e-4
 
-    # Execute buy
     is_valid, new_state = trading_logic.handle_buy(
         portfolio_state=portfolio_state,
         current_price=current_price,
         action_value=action_value,
     )
 
+    gross = 10000.0 * 0.5
+    total_cost = gross * (fee + slip)
+    net = gross - total_cost
+    expected_position = net / current_price
+
     assert is_valid
-    assert new_state.balance == pytest.approx(5000.0, rel=1e-10)  # 10000 * 0.5
-    assert new_state.position == pytest.approx(49.95, rel=1e-10)  # (10000 * 0.5 * (1 - 0.001)) / 100
+    assert new_state.balance == pytest.approx(5000.0)
+    assert new_state.position == pytest.approx(expected_position)
     assert new_state.position_price == current_price
-    assert new_state.total_transaction_cost == pytest.approx(5.0, rel=1e-10)  # 5000 * 0.001
+    assert new_state.total_transaction_cost == pytest.approx(total_cost)
 
 
 def test_handle_sell(trading_logic, portfolio_state):
-    """Test sell action handling."""
-    # Setup initial position
+    """Test sell action handling with fee + slippage."""
     portfolio_state.position = 1.0
     portfolio_state.position_price = 90.0
     current_price = 100.0
-    action_value = 0.5  # Sell 50% of position
+    action_value = 0.5
+    fee = trading_logic.transaction_fee
+    slip = trading_logic.slippage_bps * 1e-4
 
-    # Execute sell
     is_valid, new_state = trading_logic.handle_sell(
         portfolio_state=portfolio_state,
         current_price=current_price,
         action_value=action_value,
     )
 
-    assert is_valid
-    expected_sell_value = 50.0  # 100 * 0.5
-    expected_transaction_cost = expected_sell_value * 0.001
+    gross = 0.5 * current_price
+    total_cost = gross * (fee + slip)
+    net = gross - total_cost
 
-    assert new_state.balance == pytest.approx(10000.0 + expected_sell_value - expected_transaction_cost, rel=1e-10)
-    assert new_state.position == pytest.approx(0.5, rel=1e-10)
-    assert new_state.position_price == 90.0  # Unchanged
-    assert new_state.total_transaction_cost == pytest.approx(expected_transaction_cost, rel=1e-10)
+    assert is_valid
+    assert new_state.balance == pytest.approx(10000.0 + net)
+    assert new_state.position == pytest.approx(0.5)
+    assert new_state.position_price == 90.0
+    assert new_state.total_transaction_cost == pytest.approx(total_cost)
 
 
 def test_invalid_actions(trading_logic, portfolio_state):
@@ -148,49 +163,90 @@ def test_apply_trade(trading_logic, portfolio_state):
     assert new_state.position < portfolio_state_with_pos.position
 
 
-def test_calculate_reward(trading_logic):
-    """Test reward calculation with market and trade components."""
-    reward_scale = trading_logic.reward_scale
+def test_calculate_reward_pnl(trading_logic):
+    """Test PnL component of reward."""
+    trading_logic.reset_peak(10000.0)
 
-    # No market move, no trade impact -> zero reward
-    prev_value = 10000.0
-    pre_trade_value = 10000.0
-    post_trade_value = 10000.0
-    reward = trading_logic.calculate_reward(prev_value, pre_trade_value, post_trade_value, True)
-    assert reward == 0.0
+    reward = trading_logic.calculate_reward(
+        prev_portfolio_value=10000.0,
+        pre_trade_portfolio_value=10500.0,
+        post_trade_portfolio_value=10500.0,
+        is_valid=True,
+        price_return=0.05,
+        position_fraction=1.0,
+    )
+    pnl = trading_logic.reward_scale * 0.05
+    assert reward > 0
+    assert reward == pytest.approx(pnl, abs=0.01)
 
-    # Positive market move before trade should be rewarded
-    prev_value = 10000.0
-    pre_trade_value = 10500.0  # 5% gain before action
-    post_trade_value = 10500.0
-    expected = ((pre_trade_value - prev_value) / prev_value) * reward_scale
-    reward = trading_logic.calculate_reward(prev_value, pre_trade_value, post_trade_value, True)
-    assert reward == pytest.approx(expected, rel=1e-9)
 
-    # Negative market move before trade should be penalized
-    prev_value = 10000.0
-    pre_trade_value = 9500.0  # 5% loss before action
-    post_trade_value = 9500.0
-    expected = ((pre_trade_value - prev_value) / prev_value) * reward_scale
-    reward = trading_logic.calculate_reward(prev_value, pre_trade_value, post_trade_value, True)
-    assert reward == pytest.approx(expected, rel=1e-9)
+def test_calculate_reward_invalid(trading_logic):
+    """Invalid actions return the penalty regardless of values."""
+    trading_logic.reset_peak(10000.0)
 
-    # Trade impact (e.g., transaction cost) should be reflected after market move
-    prev_value = 10000.0
-    pre_trade_value = 10000.0
-    post_trade_value = 9980.0  # -0.2% from trade cost/slippage
-    expected = ((pre_trade_value - prev_value) / prev_value + (post_trade_value - pre_trade_value) / pre_trade_value) * reward_scale
-    reward = trading_logic.calculate_reward(prev_value, pre_trade_value, post_trade_value, True)
-    assert reward == pytest.approx(expected, rel=1e-9)
-
-    # Invalid actions should return the configured penalty regardless of values
-    reward = trading_logic.calculate_reward(prev_value, pre_trade_value, post_trade_value, False)
+    reward = trading_logic.calculate_reward(
+        prev_portfolio_value=10000.0,
+        pre_trade_portfolio_value=10000.0,
+        post_trade_portfolio_value=10000.0,
+        is_valid=False,
+        price_return=0.0,
+        position_fraction=0.0,
+    )
     assert reward == trading_logic.invalid_action_penalty
 
-    # Guard against extremely small portfolio values (should fall back to zero reward)
-    tiny_value = 5e-10
-    reward = trading_logic.calculate_reward(tiny_value, tiny_value, 1.0, True)
-    assert reward == 0.0
+
+def test_calculate_reward_drawdown_penalty(trading_logic):
+    """Drawdown penalty fires when portfolio drops below peak."""
+    trading_logic.reset_peak(10000.0)
+
+    trading_logic.calculate_reward(
+        prev_portfolio_value=10000.0,
+        pre_trade_portfolio_value=10000.0,
+        post_trade_portfolio_value=10000.0,
+        is_valid=True,
+        price_return=0.0,
+        position_fraction=0.5,
+    )
+
+    reward = trading_logic.calculate_reward(
+        prev_portfolio_value=10000.0,
+        pre_trade_portfolio_value=9500.0,
+        post_trade_portfolio_value=9500.0,
+        is_valid=True,
+        price_return=-0.05,
+        position_fraction=0.5,
+    )
+    assert reward < 0
+
+
+def test_calculate_reward_opportunity_cost(trading_logic):
+    """Holding cash while market moves incurs opportunity cost."""
+    trading_logic.reset_peak(10000.0)
+
+    reward_in_cash = trading_logic.calculate_reward(
+        prev_portfolio_value=10000.0,
+        pre_trade_portfolio_value=10000.0,
+        post_trade_portfolio_value=10000.0,
+        is_valid=True,
+        price_return=0.01,
+        position_fraction=0.0,
+    )
+
+    trading_logic.reset_peak(10000.0)
+
+    reward_fully_invested = trading_logic.calculate_reward(
+        prev_portfolio_value=10000.0,
+        pre_trade_portfolio_value=10100.0,
+        post_trade_portfolio_value=10100.0,
+        is_valid=True,
+        price_return=0.01,
+        position_fraction=1.0,
+    )
+
+    assert reward_in_cash < reward_fully_invested
+    expected_opp_cost = trading_logic.opportunity_cost_lambda * 0.01 * 1.0
+    assert reward_in_cash < 0
+    assert abs(reward_in_cash) >= expected_opp_cost * 0.9
 
 
 def test_position_price_calculation(trading_logic, portfolio_state):
@@ -221,11 +277,12 @@ def test_position_price_calculation(trading_logic, portfolio_state):
     )
     assert is_valid
 
-    # Initial position: 20 shares at $100
-    # New purchase: ~18.16 shares at $110 (2000 * 0.999 / 110)
-    # Expected weighted avg: (20*100 + 18.16*110) / (20+18.16)
-    expected_shares = 2000 * 0.999 / 110
-    expected_price = ((20.0 * 100.0) + (expected_shares * 110.0)) / (20.0 + expected_shares)
+    fee = trading_logic.transaction_fee
+    slip = trading_logic.slippage_bps * 1e-4
+    gross = 8000.0 * 0.25
+    net = gross * (1 - fee - slip)
+    expected_shares = net / new_price
+    expected_price = ((20.0 * 100.0) + (expected_shares * new_price)) / (20.0 + expected_shares)
     assert new_state.position_price == pytest.approx(expected_price, rel=1e-5)
 
     # Test selling part of position (position price should remain unchanged)

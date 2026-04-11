@@ -14,7 +14,7 @@ class StubTrainer:
         self._expected_metrics_call = avg_metrics
         self.collected_metrics = None
 
-    def _validate_single_file(self, file_path):
+    def _validate_single_file(self, file_path, **kwargs):
         return next(self._results_iter)
 
     def _calculate_average_validation_metrics(self, metrics):

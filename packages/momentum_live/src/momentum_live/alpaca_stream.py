@@ -77,7 +77,7 @@ class AlpacaStreamRunner:
         if self._history_primed:
             return
 
-        window_size = getattr(self.trader.config, "window_size", 0)
+        window_size = self.trader.config.window_size
         symbols = list(self.trader.symbols)
 
         if window_size <= 0 or not symbols:

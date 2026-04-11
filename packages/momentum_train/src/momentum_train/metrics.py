@@ -194,10 +194,11 @@ class PerformanceTracker:
 
     def get_action_counts(self) -> Dict[int, int]:
         """Counts the occurrences of each discrete action taken."""
-        counts = {i: 0 for i in range(7)}  # Assuming 7 discrete actions (0-6)
+        num_actions = 6
+        counts = {i: 0 for i in range(num_actions)}
         for action in self.actions:
-            action_int = int(action)  # Ensure action is integer index
-            if 0 <= action_int < 7:
+            action_int = int(action)
+            if 0 <= action_int < num_actions:
                 counts[action_int] += 1
             else:
                 logger.warning(f"Encountered invalid action index {action} in tracker.")

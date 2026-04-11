@@ -76,8 +76,8 @@ class StubTradingEnv:
 
     def reset(self):
         obs = {
-            "market_data": run_training_module.np.zeros((1, 1), dtype=float),
-            "account_state": run_training_module.np.zeros(2, dtype=float),
+            "market_data": run_training_module.np.zeros((1, 12), dtype=float),
+            "account_state": run_training_module.np.zeros(5, dtype=float),
         }
         info = {"portfolio_value": 1000.0}
         return obs, info

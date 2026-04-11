@@ -28,16 +28,22 @@ def _configure_logging(level: str) -> None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the momentum agent against live Alpaca crypto data")
-    parser.add_argument("--symbols", required=True, help="Comma or space separated list of crypto pairs (e.g. 'BTC/USD,ETH/USD')")
+    parser.add_argument("--symbols", required=True, help="Comma-separated crypto pairs (e.g. BTC/USD,ETH/USD)")
     parser.add_argument("--models-dir", default="models", help="Directory containing trained checkpoints")
-    parser.add_argument("--checkpoint", default=None, help="Specific checkpoint file to load. Defaults to best score in models-dir")
-    parser.add_argument("--window-size", type=int, default=60, help="Rolling window size used during training")
-    parser.add_argument("--initial-balance", type=float, default=1000.0, help="Initial virtual balance per symbol")
-    parser.add_argument("--transaction-fee", type=float, default=0.001, help="Transaction fee fraction (e.g. 0.001 = 0.1%)")
-    parser.add_argument("--reward-scale", type=float, default=50.0, help="Reward scale used during training")
-    parser.add_argument("--invalid-penalty", type=float, default=-0.05, help="Penalty applied when the agent proposes an invalid trade")
-    parser.add_argument("--location", default=None, help="Alpaca crypto data feed location (us or us-1)")
-    parser.add_argument("--log-level", default="INFO", help="Python logging level (DEBUG, INFO, WARN, ...)")
+    parser.add_argument("--checkpoint", default=None, help="Specific checkpoint file to load")
+    parser.add_argument("--checkpoint-pattern", default="checkpoint_trainer_best_*.pt", help="Glob pattern for checkpoint files")
+    parser.add_argument("--window-size", type=int, required=True, help="Rolling window size (must match training)")
+    parser.add_argument("--initial-balance", type=float, required=True, help="Initial balance in USD")
+    parser.add_argument("--transaction-fee", type=float, required=True, help="Transaction fee fraction (e.g. 0.001)")
+    parser.add_argument("--reward-scale", type=float, required=True, help="Reward scale (must match training)")
+    parser.add_argument("--invalid-penalty", type=float, required=True, help="Invalid action penalty")
+    parser.add_argument("--drawdown-penalty-lambda", type=float, required=True, help="Drawdown penalty weight")
+    parser.add_argument("--slippage-bps", type=float, required=True, help="Slippage in basis points")
+    parser.add_argument("--opportunity-cost-lambda", type=float, required=True, help="Opportunity cost weight")
+    parser.add_argument("--min-rebalance-pct", type=float, required=True, help="Min allocation delta to trigger trade")
+    parser.add_argument("--min-trade-value", type=float, required=True, help="Min trade notional in USD")
+    parser.add_argument("--location", default=None, help="Alpaca crypto data feed location")
+    parser.add_argument("--log-level", default="INFO", help="Logging level")
     return parser
 
 
@@ -52,11 +58,17 @@ def main(argv: list[str] | None = None) -> int:
         trading_config = LiveTradingConfig(
             symbols=symbols,
             window_size=args.window_size,
-            models_dir=args.models_dir,
             initial_balance=args.initial_balance,
             transaction_fee=args.transaction_fee,
             reward_scale=args.reward_scale,
             invalid_action_penalty=args.invalid_penalty,
+            drawdown_penalty_lambda=args.drawdown_penalty_lambda,
+            slippage_bps=args.slippage_bps,
+            opportunity_cost_lambda=args.opportunity_cost_lambda,
+            min_rebalance_pct=args.min_rebalance_pct,
+            min_trade_value=args.min_trade_value,
+            models_dir=args.models_dir,
+            checkpoint_pattern=args.checkpoint_pattern,
         )
 
         credentials = AlpacaCredentials.from_environment()
@@ -96,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
                     "replay_buffer_size": 500000,
                     "target_update_freq": 2500,
                     "window_size": 60,
-                    "n_features": 5,
+                    "n_features": 12,
                     "hidden_dim": 256,
                     "num_actions": 7,
                     "nhead": 4,
@@ -104,9 +116,9 @@ def main(argv: list[str] | None = None) -> int:
                     "dim_feedforward": 512,
                     "transformer_dropout": 0.2,
                     "n_steps": 3,
-                    "num_atoms": 51,
-                    "v_min": -1.0,
-                    "v_max": 1.0,
+                    "num_atoms": 101,
+                    "v_min": -10.0,
+                    "v_max": 10.0,
                     "alpha": 0.6,
                     "beta_start": 0.5,
                     "beta_frames": 1000000,

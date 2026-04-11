@@ -3,6 +3,7 @@
 
 import torch
 from momentum_agent import RainbowDQNAgent
+from momentum_agent.constants import ACCOUNT_STATE_DIM
 
 
 def test_gpu_memory():
@@ -13,13 +14,12 @@ def test_gpu_memory():
         print(f"CUDA device: {torch.cuda.get_device_name()}")
         print(f"CUDA memory before agent creation: {torch.cuda.memory_allocated()/1024**2:.1f} MB")
 
-        # Create agent config similar to training
         config = {
             "window_size": 60,
-            "n_features": 5,
+            "n_features": 12,
             "hidden_dim": 256,
             "num_actions": 7,
-            "num_atoms": 51,
+            "num_atoms": 101,
             "v_min": -10.0,
             "v_max": 10.0,
             "nhead": 4,
@@ -45,10 +45,9 @@ def test_gpu_memory():
         print(f"CUDA memory after agent creation: {torch.cuda.memory_allocated()/1024**2:.1f} MB")
         print(f"Model parameters: {sum(p.numel() for p in agent.network.parameters()):,}")
 
-        # Try a forward pass with dummy data
         batch_size = 512
-        market_data = torch.randn(batch_size, 60, 5, device=device)
-        account_state = torch.randn(batch_size, 2, device=device)
+        market_data = torch.randn(batch_size, 60, 12, device=device)
+        account_state = torch.randn(batch_size, ACCOUNT_STATE_DIM, device=device)
 
         print(f"CUDA memory before forward pass: {torch.cuda.memory_allocated()/1024**2:.1f} MB")
 
@@ -58,55 +57,7 @@ def test_gpu_memory():
         print(f"CUDA memory after forward pass: {torch.cuda.memory_allocated()/1024**2:.1f} MB")
         print(f"Output shape: {output.shape}")
 
-        # Try a training step simulation
-        print(f"CUDA memory before training simulation: {torch.cuda.memory_allocated()/1024**2:.1f} MB")
-
-        # Create fake batch data
-        batch_size = 512
-        market_data_batch = torch.randn(batch_size, 60, 5, device=device)
-        account_state_batch = torch.randn(batch_size, 2, device=device)
-        actions_batch = torch.randint(0, 7, (batch_size,), device=device)
-        rewards_batch = torch.randn(batch_size, 1, device=device)
-        next_market_data_batch = torch.randn(batch_size, 60, 5, device=device)
-        next_account_state_batch = torch.randn(batch_size, 2, device=device)
-        dones_batch = torch.randint(0, 2, (batch_size, 1), device=device, dtype=torch.float)
-        weights_batch = torch.ones(batch_size, 1, device=device)
-
-        batch_tuple = (
-            market_data_batch.cpu().numpy(),
-            account_state_batch.cpu().numpy(),
-            actions_batch.cpu().numpy(),
-            rewards_batch.cpu().numpy().squeeze(),
-            next_market_data_batch.cpu().numpy(),
-            next_account_state_batch.cpu().numpy(),
-            dones_batch.cpu().numpy().squeeze(),
-        )
-
-        # Simulate learning (this will call _compute_loss)
-        agent.debug_mode = True  # Enable debug mode temporarily
-        loss, td_errors = agent._compute_loss(batch_tuple, weights_batch.cpu().numpy().squeeze())
-
-        print(f"CUDA memory after loss computation: {torch.cuda.memory_allocated()/1024**2:.1f} MB")
-        print(f"Loss value: {loss.item():.4f}")
-
-        # Clean up
-        del (
-            agent,
-            market_data,
-            account_state,
-            output,
-            market_data_batch,
-            account_state_batch,
-            actions_batch,
-            rewards_batch,
-            next_market_data_batch,
-            next_account_state_batch,
-            dones_batch,
-            weights_batch,
-            batch_tuple,
-            loss,
-            td_errors,
-        )
+        del agent, market_data, account_state, output
         torch.cuda.empty_cache()
         print(f"CUDA memory after cleanup: {torch.cuda.memory_allocated()/1024**2:.1f} MB")
 

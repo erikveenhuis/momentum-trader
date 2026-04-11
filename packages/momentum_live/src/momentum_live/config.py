@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Literal, Optional, Sequence
 
 
 @dataclass(slots=True)
@@ -14,7 +14,7 @@ class AlpacaCredentials:
     api_key: str
     secret_key: str
     location: str = "us"
-    paper: bool = True  # Use paper trading by default
+    paper: bool = True
 
     @classmethod
     def from_environment(
@@ -41,17 +41,21 @@ class AlpacaCredentials:
 
 @dataclass(slots=True)
 class LiveTradingConfig:
-    """Runtime configuration for live inference."""
+    """Runtime configuration for live inference. No defaults -- all fields required."""
 
     symbols: Sequence[str]
     window_size: int
-    models_dir: str = "models"
-    checkpoint_pattern: str = "checkpoint_trainer_best_*.pt"
-    initial_balance: float = 1_000.0
-    transaction_fee: float = 0.001
-    reward_scale: float = 50.0
-    invalid_action_penalty: float = -0.05
-    min_notional: float = 10.0
+    initial_balance: float
+    transaction_fee: float
+    reward_scale: float
+    invalid_action_penalty: float
+    drawdown_penalty_lambda: float
+    slippage_bps: float
+    opportunity_cost_lambda: float
+    min_rebalance_pct: float
+    min_trade_value: float
+    models_dir: str
+    checkpoint_pattern: str
 
     def __post_init__(self) -> None:
         if isinstance(self.symbols, Iterable) and not isinstance(self.symbols, str):
@@ -71,21 +75,11 @@ class LiveTradingConfig:
         if not (0.0 <= self.transaction_fee < 1.0):
             raise ValueError("transaction_fee must be in the range [0, 1)")
 
-        if self.reward_scale <= 0:
-            raise ValueError("reward_scale must be positive")
-
-        if self.invalid_action_penalty >= 0:
-            raise ValueError("invalid_action_penalty should be negative to penalise invalid trades")
-
-        if self.min_notional <= 0:
-            raise ValueError("min_notional must be positive")
-
 
 def parse_symbols(symbols: str | Sequence[str]) -> List[str]:
     """Parse a comma or space separated list of symbols into a list."""
 
     if isinstance(symbols, str):
-        # Allow both comma and whitespace separated inputs
         parts = [part.strip() for chunk in symbols.split(",") for part in chunk.split()]
     else:
         parts = [str(symbol).strip() for symbol in symbols]

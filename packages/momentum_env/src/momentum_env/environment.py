@@ -6,118 +6,90 @@ from gymnasium import spaces
 from momentum_env.config import TradingEnvConfig
 from momentum_env.data import MarketDataProcessor, get_observation_at_step
 from momentum_env.trading import PortfolioState, TradingLogic
-from momentum_env.visualization import TradingVisualizer
+
+TARGET_ALLOCATIONS = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+NUM_ACTIONS = len(TARGET_ALLOCATIONS)
 
 
 class TradingEnv(gym.Env):
+    """Trading environment with target-allocation actions.
+
+    Each action sets the desired portfolio exposure:
+        0 = 0%   (all cash)
+        1 = 20%
+        2 = 40%
+        3 = 60%
+        4 = 80%
+        5 = 100% (fully invested)
+
+    The environment computes the buy/sell needed to reach the target.
+    Every action is always valid -- no masking required.
     """
-    A trading environment for reinforcement learning.
 
-    Features:
-    - Normalized OHLCV observations with configurable window size
-    - Discrete action space: 0=Hold, 1=Buy10%, 2=Buy25%, 3=Buy50%, 4=Sell10%, 5=Sell25%, 6=Sell100%
-    - Account state information (position and balance)
-    - Configurable transaction fees and initial balance
-    - Customizable reward function based on PnL and trading costs
-    """
-
-    metadata = {"render_modes": ["human", "terminal"], "render_fps": 60}
-
-    def __init__(self, config: TradingEnvConfig, render_mode: Optional[str] = None) -> None:
-        """Initialize the trading environment.
-
-        Args:
-            config: Environment configuration
-            render_mode: The rendering mode (ignored if set in config)
-        """
+    def __init__(self, config: TradingEnvConfig) -> None:
         super().__init__()
 
-        # Store configuration
         self.config = config
-        # Prioritize render_mode from config, otherwise use the argument (or None)
-        # Check if config has render_mode attribute and it's not None
-        if hasattr(config, "render_mode") and config.render_mode is not None:
-            self.render_mode = config.render_mode
-        else:
-            self.render_mode = render_mode
 
-        # Initialize components
         self.data_processor = MarketDataProcessor(window_size=config.window_size)
         self.trading_logic = TradingLogic(
             transaction_fee=config.transaction_fee,
             reward_scale=config.reward_scale,
             invalid_action_penalty=config.invalid_action_penalty,
+            drawdown_penalty_lambda=config.drawdown_penalty_lambda,
+            slippage_bps=config.slippage_bps,
+            opportunity_cost_lambda=config.opportunity_cost_lambda,
+            min_trade_value=config.min_trade_value,
         )
+        self.min_rebalance_pct = config.min_rebalance_pct
 
-        # Load and process market data
         self.market_data = self.data_processor.load_and_process_data(self.config.data_path)
 
-        # Initialize visualizer if needed
-        self.visualizer = None
-        if self.render_mode == "human":
-            self.visualizer = TradingVisualizer(self.market_data)
-
-        # Define action and observation spaces
-        self.action_space = spaces.Discrete(7)  # 0=Hold, 1=Buy10%, 2=Buy25%, 3=Buy50%, 4=Sell10%, 5=Sell25%, 6=Sell100%
+        self.action_space = spaces.Discrete(NUM_ACTIONS)
         self.observation_space = spaces.Dict(
             {
                 "market_data": spaces.Box(
-                    low=0,  # Normalized features are in [0,1]
-                    high=1,
+                    low=-np.inf,
+                    high=np.inf,
                     shape=(config.window_size, self.market_data.num_features),
                     dtype=np.float32,
                 ),
                 "account_state": spaces.Box(
-                    low=0,
+                    low=-1,
                     high=1,
-                    shape=(2,),
-                    dtype=np.float32,  # Normalized position and balance are in [0,1]
+                    shape=(5,),
+                    dtype=np.float32,
                 ),
             }
         )
 
-        # Initialize state variables
         self.state = None
         self.portfolio_state = None
         self.prev_portfolio_value: Optional[float] = None
+        self.bars_in_position: int = 0
         self.reset()
 
     def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> Tuple[Dict[str, np.ndarray], Dict]:
-        """Reset the environment to initial state.
-
-        Args:
-            seed: Random seed
-            options: Additional options (unused)
-
-        Returns:
-            Tuple of (observation, info)
-        """
         super().reset(seed=seed)
 
-        # Reset state
-        self.state = {
-            "current_step": 0,
-        }
-
-        # Reset portfolio state
+        self.state = {"current_step": 0}
         self.portfolio_state = PortfolioState(
             balance=self.config.initial_balance,
             position=0.0,
             position_price=0.0,
             total_transaction_cost=0.0,
         )
+        self.bars_in_position = 0
 
-        # Get initial observation and info
         observation = self._get_observation()
         info = self._get_info()
 
-        # Initialize previous portfolio value
         self.prev_portfolio_value = info["portfolio_value"]
+        self.trading_logic.reset_peak(info["portfolio_value"])
 
         return observation, info
 
     def _get_info(self, step_override: Optional[int] = None) -> Dict[str, Union[int, float]]:
-        """Get additional information about the specified step (defaults to current state)."""
         target_step = self.state["current_step"] if step_override is None else step_override
         target_step = min(target_step, self.market_data.data_length - 1)
         current_price = self.market_data.close_prices[target_step]
@@ -130,88 +102,106 @@ class TradingEnv(gym.Env):
             "position": self.portfolio_state.position,
             "portfolio_value": portfolio_value,
             "transaction_cost": self.portfolio_state.total_transaction_cost,
-            "action": None,  # Will be set in step method
-            "step_transaction_cost": 0.0,  # Will be set in step method
+            "action": None,
+            "step_transaction_cost": 0.0,
         }
 
     def step(self, action: int) -> Tuple[Dict[str, np.ndarray], float, bool, bool, Dict]:
-        """Execute one step in the environment.
-
-        Args:
-            action: Trading action to execute (0=Hold, 1=Buy10%, 2=Buy25%, 3=Buy50%, 4=Sell10%, 5=Sell25%, 6=Sell100%)
-
-        Returns:
-            Tuple of (observation, reward, terminated, truncated, info)
-        """
+        """Execute one step. Action is a target allocation index (0-5)."""
         if self.state["current_step"] >= self.market_data.data_length:
             raise RuntimeError("Episode is done, call reset() first")
 
-        # Get current price
         current_price = self.market_data.close_prices[self.state["current_step"]]
 
-        # Store old portfolio state for transaction cost info calculation
         old_portfolio_state = self.portfolio_state
         pre_trade_portfolio_value = old_portfolio_state.portfolio_value(current_price)
 
-        # Map action to type and value
-        if action == 0:  # Hold
-            action_type = 0
-            action_value = 0.0
-        elif 1 <= action <= 3:  # Buy (1=10%, 2=25%, 3=50%)
-            action_type = 1
-            action_value = {1: 0.10, 2: 0.25, 3: 0.50}[action]
-        else:  # Sell (4=10%, 5=25%, 6=100%)
-            action_type = 2
-            action_value = {4: 0.10, 5: 0.25, 6: 1.00}[action]
-
-        # Apply trading action and get validity flag
-        new_portfolio_state, is_valid = self.trading_logic.apply_trade(
-            portfolio_state=self.portfolio_state,
-            current_price=current_price,
-            action=action_type,
-            action_value=action_value,
+        target_frac = TARGET_ALLOCATIONS[action]
+        self.portfolio_state, is_valid = self._execute_target_allocation(
+            target_frac, current_price, pre_trade_portfolio_value
         )
 
-        # Update portfolio state
-        self.portfolio_state = new_portfolio_state
-
-        # Calculate current portfolio value (after action, using current price)
         post_trade_portfolio_value = self.portfolio_state.portfolio_value(current_price)
 
-        # Calculate reward using previous, pre-trade, and post-trade portfolio values
+        prev_step = max(0, self.state["current_step"] - 1)
+        prev_price = self.market_data.close_prices[prev_step]
+        price_return = (current_price / prev_price - 1.0) if prev_price > 1e-20 else 0.0
+
+        position_value = max(0.0, old_portfolio_state.position * current_price)
+        position_fraction = position_value / max(pre_trade_portfolio_value, 1e-9)
+
         reward = float(
             self.trading_logic.calculate_reward(
                 prev_portfolio_value=self.prev_portfolio_value,
                 pre_trade_portfolio_value=pre_trade_portfolio_value,
                 post_trade_portfolio_value=post_trade_portfolio_value,
                 is_valid=is_valid,
+                price_return=price_return,
+                position_fraction=position_fraction,
             )
         )
 
-        # Determine next step index and done flags
         next_step = self.state["current_step"] + 1
         terminated, truncated = self._check_termination(post_trade_portfolio_value, next_step)
 
-        # Build next observation and info from the upcoming step (clamped if beyond data end)
         observation = self._get_observation(step_override=next_step)
         info = self._get_info(step_override=next_step)
         info["action"] = action
+        info["target_allocation"] = target_frac
         info["invalid_action"] = not is_valid
         info["step_transaction_cost"] = self.portfolio_state.total_transaction_cost - old_portfolio_state.total_transaction_cost
 
-        # Advance pointer (clamp to end-of-data once exhausted)
         if next_step >= self.market_data.data_length:
             self.state["current_step"] = self.market_data.data_length
         else:
             self.state["current_step"] = next_step
 
-        # Update previous portfolio value for the next step
         self.prev_portfolio_value = post_trade_portfolio_value
+
+        if self.portfolio_state.position > 1e-9:
+            self.bars_in_position += 1
+        else:
+            self.bars_in_position = 0
 
         return observation, reward, terminated, truncated, info
 
+    def _execute_target_allocation(
+        self, target_frac: float, current_price: float, portfolio_value: float
+    ) -> Tuple[PortfolioState, bool]:
+        """Adjust position to reach the target allocation fraction.
+
+        Returns (new_portfolio_state, is_valid). All targets are always valid;
+        is_valid=False only if a trade is needed but below min notional.
+        """
+        if current_price <= 1e-20 or portfolio_value <= 1e-9:
+            return self.portfolio_state, True
+
+        current_position_value = max(0.0, self.portfolio_state.position * current_price)
+        current_frac = current_position_value / portfolio_value
+        delta_frac = target_frac - current_frac
+
+        if abs(delta_frac) < self.min_rebalance_pct:
+            return self.portfolio_state, True
+
+        target_position_value = target_frac * portfolio_value
+        delta_value = target_position_value - current_position_value
+
+        if delta_frac > 0:
+            buy_cash = min(delta_value, self.portfolio_state.balance)
+            if buy_cash / portfolio_value < self.min_rebalance_pct:
+                return self.portfolio_state, True
+            buy_fraction = buy_cash / max(self.portfolio_state.balance, 1e-9)
+            is_valid, new_state = self.trading_logic.handle_buy(self.portfolio_state, current_price, buy_fraction)
+            return new_state, is_valid
+        else:
+            sell_value = abs(delta_value)
+            if current_position_value < 1e-9:
+                return self.portfolio_state, True
+            sell_fraction = min(sell_value / current_position_value, 1.0)
+            is_valid, new_state = self.trading_logic.handle_sell(self.portfolio_state, current_price, sell_fraction)
+            return new_state, is_valid
+
     def _get_observation(self, step_override: Optional[int] = None) -> Dict[str, np.ndarray]:
-        """Get the observation at the specified step (defaults to current state)."""
         target_step = self.state["current_step"] if step_override is None else step_override
         target_step = min(target_step, self.market_data.data_length - 1)
         current_price = self.market_data.close_prices[target_step]
@@ -222,10 +212,12 @@ class TradingEnv(gym.Env):
             balance=self.portfolio_state.balance,
             initial_balance=self.config.initial_balance,
             current_price=current_price,
+            position_price=self.portfolio_state.position_price,
+            bars_in_position=self.bars_in_position,
+            cumulative_fees_frac=self.portfolio_state.total_transaction_cost,
         )
 
     def _check_termination(self, current_portfolio_value: float, next_step: int) -> Tuple[bool, bool]:
-        """Determine termination (portfolio depleted or data exhausted) and truncation flags."""
         data_finished = next_step >= self.market_data.data_length
         portfolio_depleted = current_portfolio_value < self.config.initial_balance * 0.01
 
@@ -234,19 +226,3 @@ class TradingEnv(gym.Env):
 
         return terminated, truncated
 
-    def render(self) -> None:
-        """Render the environment."""
-        if self.render_mode is None:
-            return
-
-        info = self._get_info()
-
-        if self.render_mode == "human":
-            self.visualizer.update(info)
-        elif self.render_mode == "terminal":
-            print(f"Step {info['step']}: Price=${info['price']:.2f}, PV=${info['portfolio_value']:.2f}")
-
-    def close(self) -> None:
-        """Clean up environment resources."""
-        if self.visualizer is not None:
-            self.visualizer.close()

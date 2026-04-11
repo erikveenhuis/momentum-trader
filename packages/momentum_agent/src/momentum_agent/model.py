@@ -148,8 +148,8 @@ class RainbowNetwork(nn.Module):
         # Check validity
         if self.hidden_dim % self.nhead != 0:
             raise ValueError(f"hidden_dim ({self.hidden_dim}) must be divisible by nhead ({self.nhead})")
-        if ACCOUNT_STATE_DIM != 2:
-            raise ValueError("ACCOUNT_STATE_DIM mismatch")
+        if ACCOUNT_STATE_DIM < 2:
+            raise ValueError(f"ACCOUNT_STATE_DIM must be >= 2, got {ACCOUNT_STATE_DIM}")
 
         logger.info(f"Initializing RainbowNetwork with hidden_dim={self.hidden_dim}")
 
@@ -170,35 +170,38 @@ class RainbowNetwork(nn.Module):
         )
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.hidden_dim,
-            nhead=self.nhead,  # Use config value
-            dim_feedforward=self.dim_feedforward,  # Use config value
-            dropout=self.transformer_dropout,  # Use config value
-            activation="relu",
+            nhead=self.nhead,
+            dim_feedforward=self.dim_feedforward,
+            dropout=self.transformer_dropout,
+            activation="gelu",
             batch_first=True,
+            norm_first=True,
         )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=self.num_encoder_layers)  # Use config value
-        self.account_processor = nn.Sequential(nn.Linear(2, self.hidden_dim // 4), nn.ReLU(), nn.Dropout(self.transformer_dropout))
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=self.num_encoder_layers)
+        self.account_processor = nn.Sequential(nn.Linear(ACCOUNT_STATE_DIM, self.hidden_dim // 4), nn.GELU(), nn.Dropout(self.transformer_dropout))
         # --- End Shared Feature Extractor ---
 
-        # --- Dueling Network Heads (Using Noisy Layers) ---
-        # Calculate input dimension for heads after feature extraction and aggregation
         shared_feature_dim = self.hidden_dim + self.hidden_dim // 4
-        head_hidden_dim = self.hidden_dim // 2  # Hidden dimension for value/advantage streams
+        self.head_norm = nn.LayerNorm(shared_feature_dim)
+        head_hidden_dim = self.hidden_dim // 2
 
-        # Value Stream
         self.value_stream = nn.Sequential(
             NoisyLinear(shared_feature_dim, head_hidden_dim, debug=self.debug_mode),
             nn.ReLU(),
             NoisyLinear(head_hidden_dim, self.num_atoms, debug=self.debug_mode),
         )
 
-        # Advantage Stream
         self.advantage_stream = nn.Sequential(
             NoisyLinear(shared_feature_dim, head_hidden_dim, debug=self.debug_mode),
             nn.ReLU(),
             NoisyLinear(head_hidden_dim, self.num_actions * self.num_atoms, debug=self.debug_mode),
         )
-        # --- End Dueling Network Heads ---
+
+        self.aux_return_head = nn.Sequential(
+            nn.Linear(self.hidden_dim, head_hidden_dim),
+            nn.GELU(),
+            nn.Linear(head_hidden_dim, 1),
+        )
 
         self._initialize_weights()
 
@@ -223,7 +226,7 @@ class RainbowNetwork(nn.Module):
             if market_data.shape[2] != self.n_features:
                 raise ValueError(f"Input market_data feat dim ({market_data.shape[2]}) != n_features ({self.n_features})")
             if account_state.ndim != 2:
-                raise ValueError(f"Input account_state must be 2D (Batch, Feat=2), got shape {account_state.shape}")
+                raise ValueError(f"Input account_state must be 2D (Batch, Feat={ACCOUNT_STATE_DIM}), got shape {account_state.shape}")
             if account_state.shape[1] != ACCOUNT_STATE_DIM:
                 raise ValueError(f"Input account_state must have {ACCOUNT_STATE_DIM} features, got {account_state.shape[1]}")
             if market_data.shape[0] != account_state.shape[0]:
@@ -261,6 +264,8 @@ class RainbowNetwork(nn.Module):
         if self.debug_mode and shared_features.shape != (batch_size, expected_shared_dim):
             raise ValueError("shared_features shape mismatch")
 
+        shared_features = self.head_norm(shared_features)
+
         value_logits = self.value_stream(shared_features)
         if self.debug_mode and value_logits.shape != (batch_size, self.num_atoms):
             raise ValueError("value_logits shape mismatch")
@@ -294,6 +299,17 @@ class RainbowNetwork(nn.Module):
                 raise ValueError("Inf detected in final log_probs")
 
         return log_probs
+
+    def predict_return(self, market_data: torch.Tensor) -> torch.Tensor:
+        """Auxiliary head: predict next-step log return from CLS features."""
+        market_emb = self.feature_embedding(market_data)
+        batch_size = market_data.shape[0]
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        market_emb = torch.cat([cls_tokens, market_emb], dim=1)
+        market_emb = self.pos_encoder(market_emb)
+        market_features = self.transformer_encoder(market_emb)
+        cls_out = market_features[:, 0, :]
+        return self.aux_return_head(cls_out).squeeze(-1)
 
     def get_q_values(self, market_data: torch.Tensor, account_state: torch.Tensor) -> torch.Tensor:
         """Helper function to get expected Q-values for action selection."""

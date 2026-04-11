@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # Use absolute imports from src
+from momentum_agent.constants import ACCOUNT_STATE_DIM
 from momentum_agent.model import NoisyLinear, PositionalEncoding, RainbowNetwork
 
 # Remove sys.path manipulation
@@ -30,7 +31,7 @@ def default_config():
     return {
         "seed": 42,
         "window_size": 10,
-        "n_features": 5,
+        "n_features": 12,
         "hidden_dim": 64,
         "num_actions": 3,
         "num_atoms": 51,
@@ -238,7 +239,7 @@ def test_rainbow_network_forward_pass(network, default_config, device):
     n_features = default_config["n_features"]
     num_actions = default_config["num_actions"]
     num_atoms = default_config["num_atoms"]
-    account_dim = 2  # Assuming ACCOUNT_STATE_DIM is 2
+    account_dim = ACCOUNT_STATE_DIM
 
     # Create dummy input tensors
     market_data = torch.randn(batch_size, window_size, n_features).to(device)
@@ -264,7 +265,7 @@ def test_rainbow_network_get_q_values(network, default_config, device):
     window_size = default_config["window_size"]
     n_features = default_config["n_features"]
     num_actions = default_config["num_actions"]
-    account_dim = 2  # Assuming ACCOUNT_STATE_DIM is 2
+    account_dim = ACCOUNT_STATE_DIM
 
     # Create dummy input tensors
     market_data = torch.randn(batch_size, window_size, n_features).to(device)
@@ -308,9 +309,8 @@ def test_rainbow_network_train_eval_modes(network, default_config, device):
     batch_size = default_config["batch_size"]
     window_size = default_config["window_size"]
     n_features = default_config["n_features"]
-    account_dim = 2
     market_data = torch.randn(batch_size, window_size, n_features).to(device)
-    account_state = torch.randn(batch_size, account_dim).to(device)
+    account_state = torch.randn(batch_size, ACCOUNT_STATE_DIM).to(device)
 
     # Eval mode (default from fixture)
     network.eval()
@@ -335,7 +335,46 @@ def test_rainbow_network_train_eval_modes(network, default_config, device):
 def _generate_rainbow_input(config, batch_size, device):
     window_size = config["window_size"]
     n_features = config["n_features"]
-    account_dim = 2  # Assuming ACCOUNT_STATE_DIM is 2
     market_data = torch.randn(batch_size, window_size, n_features).to(device)
-    account_state = torch.randn(batch_size, account_dim).to(device)
+    account_state = torch.randn(batch_size, ACCOUNT_STATE_DIM).to(device)
     return market_data, account_state
+
+
+@pytest.mark.unit
+def test_predict_return_output_shape(default_config, device):
+    """Test that the auxiliary return prediction head outputs correct shape."""
+    net = RainbowNetwork(config=default_config, device=device).to(device)
+    batch_size = 4
+    market_data, _ = _generate_rainbow_input(default_config, batch_size, device)
+
+    pred = net.predict_return(market_data)
+    assert pred.shape == (batch_size,)
+    assert torch.isfinite(pred).all()
+
+
+@pytest.mark.unit
+def test_debug_mode_catches_wrong_account_dim(default_config, device):
+    """Test that debug mode raises ValueError on wrong account state dimensions."""
+    config = {**default_config, "debug": True}
+    net = RainbowNetwork(config=config, device=device).to(device)
+
+    batch_size = 2
+    market_data = torch.randn(batch_size, config["window_size"], config["n_features"]).to(device)
+    wrong_account = torch.randn(batch_size, 2).to(device)
+
+    with pytest.raises(ValueError, match="account_state must have"):
+        net.forward(market_data, wrong_account)
+
+
+@pytest.mark.unit
+def test_debug_mode_catches_wrong_market_dim(default_config, device):
+    """Test that debug mode raises ValueError on wrong market data dimensions."""
+    config = {**default_config, "debug": True}
+    net = RainbowNetwork(config=config, device=device).to(device)
+
+    batch_size = 2
+    wrong_market = torch.randn(batch_size, config["window_size"], 3).to(device)
+    account = torch.randn(batch_size, ACCOUNT_STATE_DIM).to(device)
+
+    with pytest.raises(ValueError, match="market_data feat dim"):
+        net.forward(wrong_market, account)

@@ -13,7 +13,8 @@ from momentum_agent import RainbowDQNAgent
 from momentum_train.data import DataManager
 from momentum_train.run_training import evaluate_on_test_data
 from momentum_train.trainer import RainbowTrainerModule
-from torch.amp import GradScaler
+
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
@@ -29,9 +30,11 @@ def _copy_random_files(
     if not src_dir.is_dir():
         pytest.skip(f"Source directory not found: {src_dir}")
 
-    source_files = sorted(src_dir.glob("*.csv"))
+    source_files = sorted(src_dir.glob("*.npz"))
+    if not source_files:
+        source_files = sorted(src_dir.glob("*.csv"))
     if len(source_files) < count:
-        pytest.skip(f"Not enough CSV files in {src_dir} (needed {count}, found {len(source_files)})")
+        pytest.skip(f"Not enough data files in {src_dir} (needed {count}, found {len(source_files)})")
 
     dst_dir.mkdir(parents=True, exist_ok=True)
     selected = rng.sample(source_files, count)
@@ -122,16 +125,13 @@ def test_end_to_end_training_validation_and_testing(tmp_path):
     assert len(data_manager.get_validation_files()) == val_file_count
     assert len(data_manager.get_test_files()) == test_file_count
 
-    scaler = GradScaler("cuda")
-
-    agent = RainbowDQNAgent(config=config["agent"], device="cuda", scaler=scaler)
+    agent = RainbowDQNAgent(config=config["agent"], device="cuda")
 
     trainer = RainbowTrainerModule(
         agent=agent,
         device=torch.device("cuda"),
         data_manager=data_manager,
         config=config,
-        scaler=scaler,
         writer=None,
     )
 

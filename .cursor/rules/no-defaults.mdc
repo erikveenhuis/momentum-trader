@@ -1,0 +1,32 @@
+---
+description: All hyperparameters must come from training_config.yaml -- never hardcode defaults in Python
+globs: "**/*.py"
+alwaysApply: false
+---
+
+# No Default Hyperparameters in Code
+
+Code contains logic. Config contains values. Any value that affects model behavior, training dynamics, or trading execution must be set in `config/training_config.yaml` and passed through the config chain.
+
+## What goes in config
+
+- Learning rates, batch sizes, gamma, n_steps, etc.
+- Reward shaping weights (drawdown_lambda, opportunity_cost_lambda)
+- Environment params (fees, slippage, min_rebalance_pct)
+- Feature engineering params (feature_rolling_window)
+- Action space definitions (target allocation levels)
+
+## What stays in code
+
+- Numerical stability guards (1e-9, 1e-20) that prevent division by zero or log(0)
+- Array shapes and dimension constants derived from config (N_RAW_FEATURES, ACCOUNT_STATE_DIM)
+- Python/PyTorch API defaults (dtype=np.float32)
+
+## Rules
+
+- Function signatures: `float` not `float = 0.5` for any tunable parameter
+- Dataclass fields: no defaults on any field that affects behavior (only `None` for optional toggles like render_mode)
+- Config access: `config.param` not `getattr(config, "param", fallback)`
+- Missing config must fail loudly with TypeError/AttributeError/KeyError at startup
+- No magic numbers: if a value could reasonably be changed, it belongs in config
+- Runtime state (e.g. `self.step_count = 0`) is fine -- it's initialization, not configuration

@@ -1,6 +1,6 @@
 """Trading Environment for Reinforcement Learning."""
 
-__version__ = "0.1.6"
+__version__ = "0.2.0"
 
 from .config import TradingEnvConfig
 from .environment import TradingEnv

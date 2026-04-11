@@ -21,17 +21,24 @@ class PortfolioState:
 class TradingLogic:
     """Handle trading logic and portfolio management."""
 
-    def __init__(self, transaction_fee: float, reward_scale: float, invalid_action_penalty: float) -> None:
-        """Initialize trading logic.
-
-        Args:
-            transaction_fee: Transaction fee as a fraction of trade value
-            reward_scale: Scaling factor for PnL in rewards
-            invalid_action_penalty: Penalty for invalid actions
-        """
+    def __init__(
+        self,
+        transaction_fee: float,
+        reward_scale: float,
+        invalid_action_penalty: float,
+        drawdown_penalty_lambda: float,
+        slippage_bps: float,
+        opportunity_cost_lambda: float,
+        min_trade_value: float,
+    ) -> None:
         self.transaction_fee = transaction_fee
         self.reward_scale = reward_scale
         self.invalid_action_penalty = invalid_action_penalty
+        self.drawdown_penalty_lambda = drawdown_penalty_lambda
+        self.slippage_bps = slippage_bps
+        self.opportunity_cost_lambda = opportunity_cost_lambda
+        self.min_trade_value: float = min_trade_value
+        self.peak_portfolio_value: float = 0.0
 
     def handle_buy(
         self,
@@ -55,26 +62,23 @@ class TradingLogic:
         if portfolio_state.balance <= 1e-9 or current_price <= 1e-20:
             return False, portfolio_state
 
-        # Define a minimum cash value for a buy transaction to be considered valid
-        MINIMUM_BUY_CASH_VALUE = 1.0  # $1 USD minimum buy
-
-        # Calculate gross transaction value and fee
         gross_transaction_value_cash = portfolio_state.balance * action_value
 
-        # Check if the intended buy value is too small
-        if gross_transaction_value_cash < MINIMUM_BUY_CASH_VALUE:
+        if gross_transaction_value_cash < self.min_trade_value:
             return False, portfolio_state
 
         transaction_cost = gross_transaction_value_cash * self.transaction_fee
+        slippage_cost = gross_transaction_value_cash * self.slippage_bps * 1e-4
+        total_cost = transaction_cost + slippage_cost
 
-        # Calculate net transaction value and resulting position change
-        net_transaction_value_cash = gross_transaction_value_cash - transaction_cost
+        net_transaction_value_cash = gross_transaction_value_cash - total_cost
+        if net_transaction_value_cash <= 0:
+            return False, portfolio_state
         position_change = net_transaction_value_cash / current_price
 
-        # Update state
         new_balance = portfolio_state.balance - gross_transaction_value_cash
         new_position = portfolio_state.position + position_change
-        new_total_cost = portfolio_state.total_transaction_cost + transaction_cost
+        new_total_cost = portfolio_state.total_transaction_cost + total_cost
 
         # Calculate position price as weighted average (cost basis)
         if portfolio_state.position <= 1e-9:
@@ -115,28 +119,23 @@ class TradingLogic:
         if portfolio_state.position <= 1e-9:
             return False, portfolio_state
 
-        # Define a minimum cash value for a sell transaction to be considered valid
-        MINIMUM_SELL_CASH_VALUE = 1.0  # $1 USD minimum sell value
-
-        # Calculate shares to sell and gross transaction value
         sell_amount_shares = portfolio_state.position * action_value
         gross_transaction_value_cash = sell_amount_shares * current_price
 
-        # Check if the intended sell value is too small
-        if gross_transaction_value_cash < MINIMUM_SELL_CASH_VALUE:
+        if gross_transaction_value_cash < self.min_trade_value:
             return False, portfolio_state
 
-        # Calculate fee and net transaction value (cash received)
         transaction_cost = gross_transaction_value_cash * self.transaction_fee
-        net_transaction_value_cash = gross_transaction_value_cash - transaction_cost
+        slippage_cost = gross_transaction_value_cash * self.slippage_bps * 1e-4
+        total_cost = transaction_cost + slippage_cost
+        net_transaction_value_cash = gross_transaction_value_cash - total_cost
 
         if net_transaction_value_cash < 0:
             return False, portfolio_state
 
-        # Update state
-        new_balance = portfolio_state.balance + net_transaction_value_cash  # Add net amount
+        new_balance = portfolio_state.balance + net_transaction_value_cash
         new_position = portfolio_state.position - sell_amount_shares
-        new_total_cost = portfolio_state.total_transaction_cost + transaction_cost
+        new_total_cost = portfolio_state.total_transaction_cost + total_cost
 
         return True, PortfolioState(
             balance=new_balance,
@@ -187,15 +186,25 @@ class TradingLogic:
 
         return new_state, is_valid  # Return the state and validity
 
-    # Potential modification to calculate_reward
+    def reset_peak(self, initial_value: float) -> None:
+        """Reset peak portfolio value for drawdown tracking (call on env reset)."""
+        self.peak_portfolio_value = initial_value
+
     def calculate_reward(
         self,
         prev_portfolio_value: float,
         pre_trade_portfolio_value: float,
         post_trade_portfolio_value: float,
         is_valid: bool,
+        price_return: float,
+        position_fraction: float,
     ) -> float:
-        """Calculate reward separating market movement from trade impact."""
+        """Risk-adjusted reward with opportunity cost for uninvested capital.
+
+        Args:
+            price_return: The asset's price return this step (close_t / close_{t-1} - 1).
+            position_fraction: Fraction of portfolio in the asset (0 = all cash, 1 = fully invested).
+        """
         if not is_valid:
             return self.invalid_action_penalty
 
@@ -209,5 +218,15 @@ class TradingLogic:
         else:
             trade_return = 0.0
 
-        reward = self.reward_scale * (market_return + trade_return)
+        pnl_reward = self.reward_scale * (market_return + trade_return)
+
+        self.peak_portfolio_value = max(self.peak_portfolio_value, post_trade_portfolio_value)
+        drawdown = 0.0
+        if self.peak_portfolio_value > 1e-9:
+            drawdown = (self.peak_portfolio_value - post_trade_portfolio_value) / self.peak_portfolio_value
+
+        cash_fraction = max(0.0, 1.0 - position_fraction)
+        opportunity_cost = self.opportunity_cost_lambda * abs(price_return) * cash_fraction
+
+        reward = pnl_reward - self.drawdown_penalty_lambda * drawdown - opportunity_cost
         return reward

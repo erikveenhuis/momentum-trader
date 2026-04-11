@@ -27,9 +27,13 @@ def main():
             window_size=60,
             initial_balance=10000.0,
             transaction_fee=0.001,
-            reward_scale=10.0,
-            invalid_action_penalty=-1.0,
-            render_mode="human",
+            reward_scale=1.0,
+            invalid_action_penalty=-0.1,
+            drawdown_penalty_lambda=0.5,
+            slippage_bps=5.0,
+            opportunity_cost_lambda=0.1,
+            min_rebalance_pct=0.02,
+            min_trade_value=1.0,
         ),
     )
 

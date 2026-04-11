@@ -6,23 +6,36 @@ from typing import Dict, List
 import numpy as np
 import pandas as pd
 
+N_RAW_FEATURES = 6
+FEATURE_NAMES = [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "transactions",
+    "log_return_1",
+    "log_return_5",
+    "log_return_10",
+    "realized_vol",
+    "volume_ratio",
+    "hl_range_ratio",
+]
+
 
 @dataclass
 class MarketData:
     """Container for market data."""
 
-    # Raw data
     close_prices: np.ndarray
-    normalized_features: np.ndarray
+    features: np.ndarray
     feature_names: List[str]
 
-    # Metadata
     data_length: int
     window_size: int
 
     @property
     def num_features(self) -> int:
-        """Get the number of features."""
         return len(self.feature_names)
 
 
@@ -30,72 +43,63 @@ class MarketDataProcessor:
     """Process market data for the trading environment."""
 
     REQUIRED_COLUMNS = ["open", "high", "low", "close", "volume"]
-    FEATURE_NAMES = [f"norm_{col}" for col in REQUIRED_COLUMNS]
 
     def __init__(self, window_size: int) -> None:
-        """Initialize the data processor.
-
-        Args:
-            window_size: Size of the rolling window for normalization
-        """
         self.window_size = window_size
 
     def load_and_process_data(self, data_path: str) -> MarketData:
-        """Load and process market data from a CSV file.
+        """Load market data from .npz (preferred) or CSV (fallback)."""
+        if data_path.endswith(".npz"):
+            return self._load_npz(data_path)
+        return self._load_csv(data_path)
 
-        Args:
-            data_path: Path to the CSV file containing market data
-
-        Returns:
-            Processed market data
-
-        Raises:
-            ValueError: If the data is invalid or missing required columns
-        """
-        # Load data
-        data_df = pd.read_csv(data_path).dropna()
-
-        # Validate columns
-        self._validate_columns(data_df)
-
-        # Extract close prices
-        close_prices = data_df["close"].values.astype(np.float32)
-
-        # Normalize features
-        norm_data_df = self._normalize_data(data_df)
-        normalized_features = norm_data_df[self.FEATURE_NAMES].values.astype(np.float32)
+    def _load_npz(self, data_path: str) -> MarketData:
+        """Load preprocessed .npz file."""
+        data = np.load(data_path)
+        close_prices = data["close_prices"].astype(np.float32)
+        features = data["features"].astype(np.float32)
 
         return MarketData(
             close_prices=close_prices,
-            normalized_features=normalized_features,
-            feature_names=self.FEATURE_NAMES,
-            data_length=len(normalized_features),
+            features=features,
+            feature_names=FEATURE_NAMES[: features.shape[1]],
+            data_length=len(close_prices),
+            window_size=self.window_size,
+        )
+
+    def _load_csv(self, data_path: str) -> MarketData:
+        """Fallback: load raw CSV, compute features on the fly."""
+        data_df = pd.read_csv(data_path).dropna()
+        self._validate_columns(data_df)
+
+        close_prices = data_df["close"].values.astype(np.float32)
+
+        if "transactions" not in data_df.columns:
+            data_df["transactions"] = 0.0
+
+        raw_cols = ["open", "high", "low", "close", "volume", "transactions"]
+        raw = data_df[raw_cols].values.astype(np.float32)
+
+        from scripts.data_processing.preprocess_npz import compute_derived_features
+
+        derived = compute_derived_features(data_df)
+        features = np.concatenate([raw, derived], axis=1).astype(np.float32)
+
+        return MarketData(
+            close_prices=close_prices,
+            features=features,
+            feature_names=FEATURE_NAMES[: features.shape[1]],
+            data_length=len(close_prices),
             window_size=self.window_size,
         )
 
     def _validate_columns(self, df: pd.DataFrame) -> None:
-        """Validate that the dataframe has the required columns."""
         missing_cols = set(self.REQUIRED_COLUMNS) - set(df.columns)
         if missing_cols:
             raise ValueError(f"Missing required columns: {missing_cols}")
-
         for col in self.REQUIRED_COLUMNS:
             if not pd.api.types.is_numeric_dtype(df[col]):
                 raise ValueError(f"Column '{col}' must be numeric")
-
-    def _normalize_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Normalize OHLCV data using min-max scaling with forward-fill for initial window."""
-        result_df = pd.DataFrame()
-
-        for col in self.REQUIRED_COLUMNS:
-            rolling_min = df[col].rolling(window=self.window_size, min_periods=1).min()
-            rolling_max = df[col].rolling(window=self.window_size, min_periods=1).max()
-            result_df[f"norm_{col}"] = (df[col] - rolling_min) / (rolling_max - rolling_min + 1e-8)
-
-        if len(result_df) == 0:
-            raise ValueError("No data remaining after normalization")
-
-        return result_df
 
 
 def get_observation_at_step(
@@ -105,32 +109,43 @@ def get_observation_at_step(
     balance: float,
     initial_balance: float,
     current_price: float,
+    position_price: float,
+    bars_in_position: int,
+    cumulative_fees_frac: float,
 ) -> Dict[str, np.ndarray]:
     """Get the observation at a specific step.
 
-    Args:
-        market_data: Market data container
-        step: Current step
-        position: Current position size
-        balance: Current balance
-        initial_balance: Initial balance for normalization
-        current_price: Current price for position value calculation
+    Raw features (columns 0:N_RAW_FEATURES) receive window-level z-score
+    normalization so all timesteps share a consistent reference frame.
+    Derived features are already approximately stationary and are passed
+    through with light clipping.
 
-    Returns:
-        Dictionary containing market data and account state arrays
+    Account state is a 5-D vector:
+      [0] position_value / portfolio_value
+      [1] cash / portfolio_value
+      [2] unrealized PnL fraction: (price - cost_basis) / cost_basis
+      [3] bars_in_position / 60 (normalized time-in-position)
+      [4] cumulative_fees / initial_balance
     """
-    # Get market data window
     observation_step = min(step, market_data.data_length - 1)
     start_index = max(0, observation_step - market_data.window_size + 1)
-    market_window = market_data.normalized_features[start_index : observation_step + 1]
+    market_window = market_data.features[start_index : observation_step + 1].copy()
 
-    # Pad if necessary
     if len(market_window) < market_data.window_size:
         padding_shape = (market_data.window_size - len(market_window), market_data.num_features)
         padding = np.zeros(padding_shape, dtype=market_window.dtype)
         market_window = np.vstack((padding, market_window))
 
-    # Calculate portfolio value components and normalize account state as fractions
+    n_raw = min(N_RAW_FEATURES, market_window.shape[1])
+    raw_part = market_window[:, :n_raw]
+    w_mean = raw_part.mean(axis=0, keepdims=True)
+    w_std = raw_part.std(axis=0, keepdims=True) + 1e-8
+    market_window[:, :n_raw] = (raw_part - w_mean) / w_std
+
+    if market_window.shape[1] > n_raw:
+        derived_part = market_window[:, n_raw:]
+        np.clip(derived_part, -10.0, 10.0, out=derived_part)
+
     position_value = max(0.0, position * current_price)
     portfolio_value = max(0.0, balance + position * current_price)
     safe_portfolio_value = max(portfolio_value, 1e-9)
@@ -138,13 +153,24 @@ def get_observation_at_step(
     normalized_position = position_value / safe_portfolio_value
     normalized_balance = balance / safe_portfolio_value
 
-    account_state = np.clip(
-        np.array([normalized_position, normalized_balance], dtype=np.float32),
-        0.0,
-        1.0,
+    unrealized_pnl = 0.0
+    if position > 1e-9 and position_price > 1e-9:
+        unrealized_pnl = (current_price - position_price) / position_price
+
+    safe_initial = max(initial_balance, 1e-9)
+
+    account_state = np.array(
+        [
+            np.clip(normalized_position, 0.0, 1.0),
+            np.clip(normalized_balance, 0.0, 1.0),
+            np.clip(unrealized_pnl, -1.0, 1.0),
+            np.clip(bars_in_position / 60.0, 0.0, 1.0),
+            np.clip(cumulative_fees_frac / safe_initial, 0.0, 1.0),
+        ],
+        dtype=np.float32,
     )
 
     return {
-        "market_data": market_window,
+        "market_data": market_window.astype(np.float32),
         "account_state": account_state,
     }

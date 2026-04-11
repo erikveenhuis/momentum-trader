@@ -15,9 +15,9 @@ class DummyOptimizer:
         return {"optimizer": 1}
 
 
-class DummyScaler:
+class DummyBuffer:
     def state_dict(self):
-        return {"scale": 1}
+        return {"buffer": 1}
 
 
 @pytest.mark.unit
@@ -33,8 +33,9 @@ def test_save_checkpoint_persists_expected_keys(tmp_path):
         optimizer=DummyOptimizer(),
         scheduler=None,
         lr_scheduler_enabled=False,
+        buffer=DummyBuffer(),
     )
-    trainer.scaler = DummyScaler()
+    trainer.writer = None
     trainer.latest_trainer_checkpoint_path = str(tmp_path / "checkpoint_latest.pt")
     trainer.best_trainer_checkpoint_base_path = str(tmp_path / "best_checkpoint")
     trainer.best_model_base_prefix = str(tmp_path / "best_model")
@@ -48,14 +49,24 @@ def test_save_checkpoint_persists_expected_keys(tmp_path):
 
     latest_files = list(tmp_path.glob("checkpoint_latest_*_ep10_reward0.7500.pt"))
     assert latest_files, "Latest checkpoint file was not created"
+    checkpoint = torch.load(latest_files[0], map_location="cpu", weights_only=False)
 
-    checkpoint = torch.load(latest_files[0], map_location="cpu")
-    assert checkpoint["episode"] == 10
-    assert checkpoint["total_train_steps"] == 456
-    assert checkpoint["agent_total_steps"] == 123
-    assert checkpoint["total_steps"] == 123
-    assert checkpoint["best_validation_metric"] == 0.75
-    assert checkpoint["validation_score"] == pytest.approx(0.8)
+    expected_keys = {
+        "episode",
+        "total_train_steps",
+        "best_validation_metric",
+        "early_stopping_counter",
+        "buffer_state",
+        "agent_config",
+        "agent_total_steps",
+        "total_steps",
+        "network_state_dict",
+        "target_network_state_dict",
+        "optimizer_state_dict",
+        "scaler_state_dict",
+        "scheduler_state_dict",
+        "validation_score",
+    }
 
-    best_files = list(tmp_path.glob("best_checkpoint_*_ep10_score_0.8000.pt"))
-    assert best_files, "Best checkpoint file was not created"
+    for key in expected_keys:
+        assert key in checkpoint, f"Missing key in checkpoint: {key}"

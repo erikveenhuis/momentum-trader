@@ -2,27 +2,28 @@
 
 import os
 from dataclasses import dataclass
-from typing import Literal, Optional
 
 
 @dataclass
 class TradingEnvConfig:
-    """Configuration for the trading environment."""
+    """Configuration for the trading environment.
 
-    # Data configuration
+    All fields are required (no defaults) to ensure every value
+    is explicitly set from training_config.yaml. The only exception
+    is render_mode which defaults to None (no rendering).
+    """
+
     data_path: str
-    window_size: int = 60
-
-    # Trading parameters
-    initial_balance: float = 1000.0
-    transaction_fee: float = 0.001  # 0.1% fee
-
-    # Reward parameters
-    reward_scale: float = 10.0
-    invalid_action_penalty: float = -1.0
-
-    # Environment parameters
-    render_mode: Optional[Literal["human", "terminal"]] = None
+    window_size: int
+    initial_balance: float
+    transaction_fee: float
+    reward_scale: float
+    invalid_action_penalty: float
+    drawdown_penalty_lambda: float
+    slippage_bps: float
+    opportunity_cost_lambda: float
+    min_rebalance_pct: float
+    min_trade_value: float
 
     def __post_init__(self) -> None:
         """Validate configuration parameters."""
@@ -36,5 +37,3 @@ class TradingEnvConfig:
             raise ValueError(f"transaction_fee must be in [0,1), got {self.transaction_fee}")
         if self.reward_scale <= 0:
             raise ValueError(f"reward_scale must be > 0, got {self.reward_scale}")
-        if self.render_mode is not None and self.render_mode not in ["human", "terminal"]:
-            raise ValueError(f"Invalid render_mode: {self.render_mode}. Must be one of: human, terminal, or None")

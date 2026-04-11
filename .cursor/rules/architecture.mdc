@@ -1,0 +1,46 @@
+---
+description: Architecture decisions and constraints for the Rainbow DQN + Transformer momentum trading agent
+alwaysApply: true
+---
+
+# Architecture Reference
+
+## Model (1.99M params)
+- Transformer: 3 encoder layers, 4 heads, hidden_dim=256, FFN=512, pre-norm + GELU
+- CLS token pooling -> concat with account MLP -> LayerNorm -> NoisyLinear dueling heads (C51)
+- Auxiliary return-prediction head on CLS output (0.1 weight MSE loss on log_return_1 feature)
+- Polyak soft target updates (tau=0.005, every learner step)
+
+## Features (12 channels)
+- Columns 0-5 (raw): open, high, low, close, volume, transactions -> window-level z-score at observation time
+- Columns 6-11 (derived, precomputed in .npz): log_return_1, log_return_5, log_return_10, realized_vol, volume_ratio, hl_range_ratio -> clipped to [-10, 10]
+- ACCOUNT_STATE_DIM = 5: position_frac, cash_frac, unrealized_pnl, bars_in_position/60, cumulative_fees/initial_balance
+
+## Data Pipeline
+- Raw CSV -> extract_raw.py -> split_data.py -> preprocess_npz.py --clean -> .npz files (required before training)
+- Each .npz: close_prices (float32) + features (float32, [T, 12])
+- DataManager prefers .npz, falls back to CSV
+- Current data: train 2017-01 to 2024-09, val 2024-10, test 2024-11 to 2025-04 (stale as of Apr 2026 -- refresh from Massive/Polygon after baseline training run)
+- Source: Massive (formerly Polygon) minute-bar aggregates for USD crypto pairs
+
+## Training
+- bfloat16 autocast (no GradScaler), torch.compile required
+- C51 support [-10, 10] with 101 atoms; reward_scale=1.0 keeps n-step returns in range
+- No action masking needed (target allocation actions are always valid)
+- Curriculum learning: training file pool ramps from 30% to 100% over episodes
+- Progress tracked in models/progress.jsonl (one JSONL line per episode/validation)
+- Replay buffer checkpointed on save/resume
+
+## Environment
+- 6 target-allocation actions: 0%, 20%, 40%, 60%, 80%, 100% exposure
+- Agent picks desired position size; environment computes the buy/sell delta
+- Every action is always valid (no action masking needed)
+- Risk-adjusted reward: reward_scale * (market_return + trade_return) - lambda * drawdown - opportunity_cost_lambda * abs(price_return) * cash_fraction
+- min_trade_notional: $10 minimum (matches Alpaca live requirement)
+- Slippage: configurable basis points on all trades
+- Termination: portfolio < 1% of initial balance
+
+## Key Constraints
+- torch.compile wraps networks in OptimizedModule; always use `is not None` checks, never truthiness
+- Old checkpoints incompatible after architecture changes (different dims)
+- Live trader (momentum_live) must match training normalization exactly (window-level z-score + derived features)

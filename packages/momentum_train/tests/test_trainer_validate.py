@@ -60,7 +60,7 @@ def test_validate_aggregates_metrics_and_writes_results(tmp_path, monkeypatch):
         for i in range(len(metrics_sequence))
     )
 
-    trainer._validate_single_file = lambda path: next(iterator)
+    trainer._validate_single_file = lambda path, **kwargs: next(iterator)
 
     saved_records = []
     original_save = RainbowTrainerModule._save_validation_results

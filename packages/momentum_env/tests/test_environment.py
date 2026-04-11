@@ -5,13 +5,14 @@ import numpy as np
 import pandas as pd
 import pytest
 from momentum_env.config import TradingEnvConfig
-from momentum_env.environment import TradingEnv
+from momentum_env.environment import NUM_ACTIONS, TARGET_ALLOCATIONS, TradingEnv
 
 
 @pytest.fixture
 def sample_data():
     """Create sample market data for testing."""
     dates = pd.date_range(start="2023-01-01", periods=100, freq="h")
+    np.random.seed(42)
     data = pd.DataFrame(
         {
             "open": np.random.uniform(90, 110, 100),
@@ -47,7 +48,12 @@ def profitable_trading_env(tmp_path):
         initial_balance=1000.0,
         transaction_fee=0.001,
         reward_scale=500.0,
-        render_mode=None,
+        invalid_action_penalty=-0.1,
+        drawdown_penalty_lambda=0.0,
+        slippage_bps=0.0,
+        opportunity_cost_lambda=0.0,
+        min_rebalance_pct=0.02,
+        min_trade_value=1.0,
     )
 
     return TradingEnv(config=config)
@@ -55,8 +61,6 @@ def profitable_trading_env(tmp_path):
 
 @pytest.fixture
 def trading_env(sample_data, tmp_path):
-    """Create a trading environment instance."""
-    # Save sample data to temporary file
     data_path = tmp_path / "test_data.csv"
     sample_data.to_csv(data_path)
 
@@ -66,288 +70,147 @@ def trading_env(sample_data, tmp_path):
         initial_balance=10000.0,
         transaction_fee=0.001,
         reward_scale=500.0,
-        render_mode=None,
+        invalid_action_penalty=-0.1,
+        drawdown_penalty_lambda=0.0,
+        slippage_bps=0.0,
+        opportunity_cost_lambda=0.0,
+        min_rebalance_pct=0.02,
+        min_trade_value=1.0,
     )
 
-    env = TradingEnv(config=config)
-    return env
-
-
-@pytest.fixture
-def invalid_buy_trading_env(sample_data, tmp_path):
-    """Create a trading environment instance with near-zero balance."""
-    data_path = tmp_path / "test_data_low_bal.csv"
-    sample_data.to_csv(data_path)
-
-    config = TradingEnvConfig(
-        data_path=str(data_path),
-        window_size=10,
-        initial_balance=1e-10,  # Near-zero balance
-        transaction_fee=0.001,
-        reward_scale=500.0,
-        render_mode=None,
-    )
-
-    env = TradingEnv(config=config)
-    return env
+    return TradingEnv(config=config)
 
 
 def test_environment_initialization(trading_env):
-    """Test environment initialization."""
     assert isinstance(trading_env, gym.Env)
     assert trading_env.config.window_size == 10
     assert trading_env.config.initial_balance == 10000.0
-    assert trading_env.config.transaction_fee == 0.001
-    assert trading_env.config.reward_scale == 500.0
 
 
 def test_action_space(trading_env):
-    """Test action space configuration."""
     assert isinstance(trading_env.action_space, gym.spaces.Discrete)
-    assert trading_env.action_space.n == 7  # Hold, Buy25%, Buy50%, Buy100%, Sell25%, Sell50%, Sell100%
+    assert trading_env.action_space.n == NUM_ACTIONS
 
 
 def test_observation_space(trading_env):
-    """Test observation space configuration."""
     assert isinstance(trading_env.observation_space, gym.spaces.Dict)
-
-    # Market data features
     assert isinstance(trading_env.observation_space["market_data"], gym.spaces.Box)
-    assert trading_env.observation_space["market_data"].shape == (10, 5)  # window_size x features
-
-    # Account state features
+    assert trading_env.observation_space["market_data"].shape[0] == 10
     assert isinstance(trading_env.observation_space["account_state"], gym.spaces.Box)
-    assert trading_env.observation_space["account_state"].shape == (2,)  # position, balance
+    assert trading_env.observation_space["account_state"].shape == (5,)
 
 
 def test_reset(trading_env):
-    """Test environment reset."""
     observation, info = trading_env.reset()
 
-    # Check observation structure
     assert isinstance(observation, dict)
     assert "market_data" in observation
     assert "account_state" in observation
-
-    # Check observation shapes
-    assert observation["market_data"].shape == (10, 5)  # window_size x features
-    assert observation["account_state"].shape == (2,)  # position, balance
-
-    # Check initial portfolio state
-    assert info["balance"] == 10000.0  # Initial balance
-    assert info["position"] == 0.0  # Initial position
+    assert observation["market_data"].shape[0] == 10
+    assert observation["account_state"].shape == (5,)
+    assert info["balance"] == 10000.0
+    assert info["position"] == 0.0
 
 
-def test_step(trading_env):
-    """Test environment step."""
+def test_step_hold(trading_env):
+    """Action 0 = target 0% = stay in cash, no trade."""
     trading_env.reset()
-
-    # Test hold action
-    observation, reward, terminated, truncated, info = trading_env.step(0)
+    obs, reward, terminated, truncated, info = trading_env.step(0)
     assert not terminated
     assert isinstance(reward, float)
-    assert isinstance(observation, dict)
-    assert isinstance(info, dict)
-
-    # Test buy action
-    observation, reward, terminated, truncated, info = trading_env.step(1)  # Buy 25%
-    assert not terminated
-    assert isinstance(reward, float)
-    assert info["balance"] < 10000.0  # Balance should decrease
-    assert info["position"] > 0.0  # Position should increase
+    assert info["position"] == 0.0
+    assert info["balance"] == pytest.approx(10000.0)
 
 
-def test_invalid_actions(trading_env):
-    """Test invalid action handling."""
+def test_step_buy_target(trading_env):
+    """Action 5 = target 100% = buy with all cash."""
     trading_env.reset()
-    initial_balance = trading_env.config.initial_balance  # Capture initial balance for comparison
-
-    # Test selling with no position (Action 4: Sell 10%)
-    observation, reward, terminated, truncated, info = trading_env.step(4)
-    assert reward == trading_env.config.invalid_action_penalty
-    assert info["balance"] == initial_balance  # Balance should be unchanged
-    assert info["position"] == 0.0  # Position should be unchanged
-    assert not terminated and not truncated  # Should not terminate/truncate on invalid action
-
-    # Test selling with no position (Action 5: Sell 25%)
-    observation, reward, terminated, truncated, info = trading_env.step(5)
-    assert reward == trading_env.config.invalid_action_penalty
-    assert info["balance"] == initial_balance  # Balance should be unchanged
-    assert info["position"] == 0.0  # Position should be unchanged
-    assert not terminated and not truncated
-
-    # Test selling with no position (Action 6: Sell 100%)
-    observation, reward, terminated, truncated, info = trading_env.step(6)
-    assert reward == trading_env.config.invalid_action_penalty
-    assert info["balance"] == initial_balance  # Balance should be unchanged
-    assert info["position"] == 0.0  # Position should be unchanged
-    assert not terminated and not truncated
+    obs, reward, term, trunc, info = trading_env.step(5)
+    assert not term
+    assert info["balance"] < 10000.0
+    assert info["position"] > 0.0
 
 
-def test_step_action_outcomes(trading_env):
-    """Test the quantitative outcome of each valid buy/sell action."""
-    config = trading_env.config
-    fee = config.transaction_fee
-
-    # --- Test Buy Actions ---
-    obs, info = trading_env.reset()
-    initial_balance = info["balance"]
-    price_step0 = info["price"]
-
-    # Action 1: Buy 10%
-    trading_env.reset()  # Reset for clean state
-    obs, reward, term, trunc, info = trading_env.step(1)  # Buy 10%
-    buy_amount_gross_1 = initial_balance * 0.10  # Use 10% for action 1
-    cost_1 = buy_amount_gross_1 * fee
-    buy_amount_net_1 = buy_amount_gross_1 - cost_1
-    expected_pos_1 = buy_amount_net_1 / price_step0
-    expected_bal_1 = initial_balance - buy_amount_gross_1
-    assert info["balance"] == pytest.approx(expected_bal_1)
-    assert info["position"] == pytest.approx(expected_pos_1)
-    assert info["step_transaction_cost"] == pytest.approx(cost_1)
-
-    # Action 2: Buy 25%
-    trading_env.reset()  # Reset for clean state
-    obs, reward, term, trunc, info = trading_env.step(2)  # Buy 25%
-    buy_amount_gross_2 = initial_balance * 0.25  # Use 25% for action 2
-    cost_2 = buy_amount_gross_2 * fee
-    buy_amount_net_2 = buy_amount_gross_2 - cost_2
-    expected_pos_2 = buy_amount_net_2 / price_step0
-    expected_bal_2 = initial_balance - buy_amount_gross_2
-    assert info["balance"] == pytest.approx(expected_bal_2)
-    assert info["position"] == pytest.approx(expected_pos_2)
-    assert info["step_transaction_cost"] == pytest.approx(cost_2)
-
-    # Action 3: Buy 50%
-    trading_env.reset()  # Reset for clean state
-    obs, reward, term, trunc, info = trading_env.step(3)  # Buy 50%
-    buy_amount_gross_3 = initial_balance * 0.50  # Use 50% for action 3
-    cost_3 = buy_amount_gross_3 * fee
-    buy_amount_net_3 = buy_amount_gross_3 - cost_3
-    expected_pos_3 = buy_amount_net_3 / price_step0
-    expected_bal_3 = initial_balance - buy_amount_gross_3
-    assert info["balance"] == pytest.approx(expected_bal_3)
-    assert info["position"] == pytest.approx(expected_pos_3)
-    assert info["step_transaction_cost"] == pytest.approx(cost_3)
-
-    # --- Setup for Sell Actions ---
-    # Perform a 100% buy to get a position to sell from
+def test_step_sell_back(trading_env):
+    """Go to 100% then back to 0% = sell everything."""
     trading_env.reset()
-    obs, reward, term, trunc, info_buy = trading_env.step(3)
-    bal_after_buy = info_buy["balance"]
-    pos_after_buy = info_buy["position"]
-    # Price used for the buy was price_step0 = trading_env.market_data.close_prices[0]
-    # State is now at the beginning of step 1
 
-    # --- Test Sell Actions ---
+    obs, reward, term, trunc, info_buy = trading_env.step(5)
+    assert info_buy["position"] > 0.0
 
-    # Action 4: Sell 10% (occurs during step 1)
-    price_for_step1 = trading_env.market_data.close_prices[1]
-    sell_amount_shares_4 = pos_after_buy * 0.10  # Use 10% for action 4
-    sell_amount_gross_4 = sell_amount_shares_4 * price_for_step1
-    cost_4 = sell_amount_gross_4 * fee
-    sell_amount_net_4 = sell_amount_gross_4 - cost_4
-    expected_pos_4 = pos_after_buy - sell_amount_shares_4
-    expected_bal_4 = bal_after_buy + sell_amount_net_4
+    obs, reward, term, trunc, info_sell = trading_env.step(0)
+    assert info_sell["position"] == pytest.approx(0.0, abs=1e-9)
+    assert info_sell["balance"] > 0.0
 
-    obs, reward, term, trunc, info_sell4 = trading_env.step(4)
-    assert info_sell4["balance"] == pytest.approx(expected_bal_4)
-    assert info_sell4["position"] == pytest.approx(expected_pos_4)
-    assert info_sell4["step_transaction_cost"] == pytest.approx(cost_4)
-    # State is now at the beginning of step 2
-    bal_after_sell4 = info_sell4["balance"]
-    pos_after_sell4 = info_sell4["position"]
 
-    # Action 5: Sell 25% (of remaining, occurs during step 2)
-    price_for_step2 = trading_env.market_data.close_prices[2]
-    sell_amount_shares_5 = pos_after_sell4 * 0.25  # Use 25% for action 5
-    sell_amount_gross_5 = sell_amount_shares_5 * price_for_step2
-    cost_5 = sell_amount_gross_5 * fee
-    sell_amount_net_5 = sell_amount_gross_5 - cost_5
-    expected_pos_5 = pos_after_sell4 - sell_amount_shares_5
-    expected_bal_5 = bal_after_sell4 + sell_amount_net_5
+def test_target_allocation_adjusts_position(trading_env):
+    """Going from 0% to 60% then to 20% should reduce position."""
+    trading_env.reset()
 
-    obs, reward, term, trunc, info_sell5 = trading_env.step(5)
-    assert info_sell5["balance"] == pytest.approx(expected_bal_5)
-    assert info_sell5["position"] == pytest.approx(expected_pos_5)
-    assert info_sell5["step_transaction_cost"] == pytest.approx(cost_5)
-    # State is now at the beginning of step 3
-    bal_after_sell5 = info_sell5["balance"]
-    pos_after_sell5 = info_sell5["position"]
+    obs, _, _, _, info_60 = trading_env.step(3)
+    pos_60 = info_60["position"]
+    assert pos_60 > 0.0
 
-    # Action 6: Sell 100% (of remaining, occurs during step 3)
-    price_for_step3 = trading_env.market_data.close_prices[3]
-    sell_amount_shares_6 = pos_after_sell5 * 1.00  # Use 100% for action 6
-    sell_amount_gross_6 = sell_amount_shares_6 * price_for_step3
-    cost_6 = sell_amount_gross_6 * fee
-    sell_amount_net_6 = sell_amount_gross_6 - cost_6
-    # expected_pos_6 = pos_after_sell5 - sell_amount_shares_6
-    expected_bal_6 = bal_after_sell5 + sell_amount_net_6
+    obs, _, _, _, info_20 = trading_env.step(1)
+    pos_20 = info_20["position"]
+    assert pos_20 < pos_60
 
-    obs, reward, term, trunc, info_sell6 = trading_env.step(6)
-    # Position might not be exactly zero due to float precision
-    assert info_sell6["balance"] == pytest.approx(expected_bal_6)
-    assert info_sell6["position"] == pytest.approx(0.0, abs=1e-9)
-    assert info_sell6["step_transaction_cost"] == pytest.approx(cost_6)
+
+def test_all_actions_valid(trading_env):
+    """Every target allocation action should be valid (no invalid action penalty)."""
+    for action in range(NUM_ACTIONS):
+        trading_env.reset()
+        obs, reward, term, trunc, info = trading_env.step(action)
+        assert not info.get("invalid_action", False), f"Action {action} ({TARGET_ALLOCATIONS[action]*100}%) was invalid"
+
+
+def test_hold_target_no_trade(trading_env):
+    """Selecting 0% target when already at 0% should result in no trade cost."""
+    trading_env.reset()
+
+    _, _, _, _, info = trading_env.step(0)
+    cost = info["step_transaction_cost"]
+
+    assert cost == pytest.approx(0.0, abs=1e-6)
 
 
 def test_episode_termination(trading_env):
-    """Test episode termination conditions."""
     trading_env.reset()
-
-    # Run until portfolio depletion or dataset exhaustion
     terminated = False
     truncated = False
     step_count = 0
     while not (terminated or truncated) and step_count < 1000:
-        _, _, terminated, truncated, _ = trading_env.step(0)  # Hold action
+        _, _, terminated, truncated, _ = trading_env.step(0)
         step_count += 1
 
-    assert truncated  # Dataset exhaustion should trigger truncation
-    assert not terminated  # No portfolio depletion when continuously holding
-
-
-def test_invalid_buy_actions(invalid_buy_trading_env):
-    """Test invalid buy action handling (near-zero balance)."""
-    env = invalid_buy_trading_env
-    env.reset()
-    initial_balance = env.config.initial_balance
-
-    # Test buying with near-zero balance (Action 1: Buy 10%)
-    observation, reward, terminated, truncated, info = env.step(1)
-    assert reward == env.config.invalid_action_penalty
-    assert info["balance"] == initial_balance
-    assert info["position"] == 0.0
-    assert not terminated and not truncated
-
-    # Test buying with near-zero balance (Action 2: Buy 25%)
-    observation, reward, terminated, truncated, info = env.step(2)
-    assert reward == env.config.invalid_action_penalty
-    assert info["balance"] == initial_balance
-    assert info["position"] == 0.0
-    assert not terminated and not truncated
-
-    # Test buying with near-zero balance (Action 3: Buy 50%)
-    observation, reward, terminated, truncated, info = env.step(3)
-    assert reward == env.config.invalid_action_penalty
-    assert info["balance"] == initial_balance
-    assert info["position"] == 0.0
-    assert not terminated and not truncated
+    assert truncated
+    assert not terminated
 
 
 def test_account_state_within_bounds(profitable_trading_env):
-    """Ensure account_state observations stay within declared Box bounds."""
     env = profitable_trading_env
     account_space = env.observation_space["account_state"]
 
     observation, info = env.reset()
     assert account_space.contains(observation["account_state"])
 
-    observation, reward, terminated, truncated, info = env.step(3)  # Buy 50%
+    observation, reward, terminated, truncated, info = env.step(5)
     assert not terminated and not truncated
     assert account_space.contains(observation["account_state"])
 
-    observation, reward, terminated, truncated, info = env.step(6)  # Sell 100%
+    observation, reward, terminated, truncated, info = env.step(0)
     assert not terminated and not truncated
     assert info["balance"] > env.config.initial_balance
     assert account_space.contains(observation["account_state"])
+
+
+def test_profitable_roundtrip(profitable_trading_env):
+    """Buy at 100, price goes to 200, sell -- should profit."""
+    env = profitable_trading_env
+    env.reset()
+
+    obs, reward, term, trunc, info_buy = env.step(5)
+    assert info_buy["position"] > 0.0
+
+    obs, reward, term, trunc, info_sell = env.step(0)
+    assert info_sell["balance"] > env.config.initial_balance

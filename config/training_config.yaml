@@ -18,87 +18,84 @@ logging:
 
 agent:
   # Core RL params
-  gamma: 0.95
-  lr: 0.0005 # Learning rate
-  batch_size: 16384
-  replay_buffer_size: 500000
-  target_update_freq: 600 # Learner steps per target sync (~1-2 trading days)
+  gamma: 0.99           # Increased from 0.95; minute-scale trades still care about future bars
+  lr: 0.0003            # Reduced from 5e-4; more stable with large batch + Polyak updates
+  batch_size: 8192      # Reduced from 16384; better PER prioritization, still GPU-saturating
+  replay_buffer_size: 1000000  # Doubled from 500k; more diverse replay with 24k training files
+  target_update_freq: 1000     # Logging frequency only (Polyak updates every step regardless)
 
   # Network architecture
-  window_size: 60 # Window size for the agent same as the environment
-  n_features: 5
+  window_size: 60
+  n_features: 12
   hidden_dim: 256
-  num_actions: 7 # Needs to match environment action space
+  num_actions: 6  # Target allocation: 0%, 20%, 40%, 60%, 80%, 100%
 
-  # Transformer specific params (add if missing)
-  nhead: 4 # Number of attention heads
-  num_encoder_layers: 3 # Example: Number of Transformer encoder layers
-  dim_feedforward: 512 # Example: Feedforward dimension
-  transformer_dropout: 0.1 # Example: Dropout within transformer
+  # Transformer params
+  nhead: 4
+  num_encoder_layers: 3
+  dim_feedforward: 512
+  transformer_dropout: 0.1
 
-  # Rainbow specific params
-  n_steps: 5          # Multi-step returns
-  num_atoms: 51       # Distributional RL atoms
-  v_min: -2.0       # Distributional RL support min value (wider to cover scaled rewards)
-  v_max: 2.0        # Distributional RL support max value (wider to cover scaled rewards)
-  categorical_logging_interval: 2000 # Learner steps between categorical target histogram logs
-  categorical_logging_percentiles: [5, 25, 50, 75, 95] # Percentiles reported for categorical targets
-  alpha: 0.6          # PER priority exponent
-  beta_start: 0.3     # PER importance sampling exponent (initial)
-  beta_frames: 400000 # PER beta annealing frames (steps)
+  # Rainbow params
+  n_steps: 3            # Reduced from 5; shorter horizon for minute-scale momentum trades
+  num_atoms: 101
+  v_min: -10.0
+  v_max: 10.0
+  categorical_logging_interval: 2000
+  categorical_logging_percentiles: [5, 25, 50, 75, 95]
+  alpha: 0.6            # PER priority exponent
+  beta_start: 0.4       # Increased from 0.3; less bias early on
+  beta_frames: 200000   # Reduced from 400k; reach full IS correction sooner
 
-  # Learning rate scheduler params
-  lr_scheduler_enabled: true # Enable/disable LR scheduler
-  lr_scheduler_type: 'ReduceLROnPlateau' # e.g., 'StepLR', 'CosineAnnealingLR', 'ReduceLROnPlateau'
-  lr_scheduler_params: # Parameters specific to the chosen scheduler
-    mode: 'max'        # 'max' because higher validation score is better
-    factor: 0.5        # Factor by which the learning rate will be reduced. new_lr = lr * factor
-    patience: 3        # Number of epochs with no improvement after which learning rate will be reduced
-    threshold: 0.0001  # Threshold for measuring the new optimum, to only focus on significant changes
-    min_lr: 0.000001   # A lower bound on the learning rate
+  # LR scheduler
+  lr_scheduler_enabled: true
+  lr_scheduler_type: 'CosineAnnealingLR'  # Smoother than ReduceLROnPlateau for long runs
+  lr_scheduler_params:
+    T_max: 500000       # Cosine period in learner steps (~full training run)
+    eta_min: 0.00001    # Floor LR
 
   # Other agent params
-  grad_clip_norm: 1.0 # Gradient clipping norm
-  debug: False        # Enable debug checks (e.g., gradient checks)
+  grad_clip_norm: 1.0
+  polyak_tau: 0.005
+  store_partial_n_step: true
+  debug: false
 
 environment:
-  window_size: 60 # Window size for the environment same as the agent
+  window_size: 60
   initial_balance: 1000.0
-  transaction_fee: 0.001 # Percentage fee
-  reward_scale: 10.0  # Scale factor for PnL component of reward
-  invalid_action_penalty: -0.05 # Penalty for invalid actions
-  render_mode:  # Set to 'human' or 'terminal' to enable visualization
+  transaction_fee: 0.001
+  reward_scale: 1.0         # Reduced from 10; keeps n-step returns well within C51 support [-10,10]
+  invalid_action_penalty: -0.1   # Slightly stronger signal for masked-but-still-penalized actions
+  drawdown_penalty_lambda: 0.5
+  slippage_bps: 5.0
+  opportunity_cost_lambda: 0.1  # Penalizes holding cash when asset moves; scales with abs(price_return) * cash_fraction
+  min_rebalance_pct: 0.02      # Minimum allocation delta to trigger a trade (2% of portfolio)
+  min_trade_value: 1.0         # Minimum trade notional in USD (Alpaca crypto minimum)
+
+# Data processing params (used by preprocess_npz.py, not passed to TradingEnvConfig)
+feature_rolling_window: 20   # Lookback bars for derived features (realized vol, volume ratio, HL range)
 
 trainer:
   seed: 42
-  warmup_steps: 50000     # Steps with random actions before training
-  update_freq: 10          # Agent learning update frequency (steps)
-  gradient_updates_per_step: 3  # Number of learner updates to run when update condition is met; increase to better utilize GPU
-  log_freq: 60            # Logging frequency (steps)
-  per_stats_log_freq: 0 # Frequency (env steps) for PER stats between episode summaries; set to 0 for episode-only logs
-  validation_freq: 20     # Validation frequency (episodes)
-  checkpoint_save_freq: 30 # Checkpoint save frequency (episodes)
-  reward_window: 10       # Window for averaging episode rewards in logs
-  reward_clip: 10.0       # Absolute clip applied to per-step rewards before learning
-  early_stopping_patience: 4 # Episodes without validation improvement to stop
-  final_phase_lr_start_frac: 0.7  # Fraction of training after which to force a terminal LR decay
-  final_phase_lr_multiplier: 0.5  # Multiplier applied to the LR once the final phase begins
-  min_validation_threshold: 0.0 # Minimum score change considered improvement
-  render_training: false # Enable live rendering during training episodes
-  render_training_every_n_steps: 10 # Render frequency (in environment steps) when enabled
-  render_validation: false # Enable live rendering during validation episodes
-  render_validation_every_n_steps: 1 # Render frequency during validation when enabled
-  render_evaluation: false # Enable live rendering during final evaluation runs
-  render_evaluation_every_n_steps: 1 # Render frequency during evaluation when enabled
-  render_on_reset: false # Render immediately after each env.reset() when rendering is enabled
+  warmup_steps: 20000       # With action masking, warmup produces cleaner transitions
+  update_freq: 20           # Learn every 20 env steps (~20 min of bars); more diverse recent experience
+  gradient_updates_per_step: 3  # 3 gradient updates per trigger; 216 updates per 1440-bar episode
+  log_freq: 60
+  per_stats_log_freq: 0
+  validation_freq: 50       # Increased from 20; less validation overhead, each validates 246 files
+  checkpoint_save_freq: 50
+  reward_window: 20
+  reward_clip: 5.0          # Tighter clip to match reward_scale=1 and C51 support
+  early_stopping_patience: 6  # Increased from 4; more patience with cosine LR
+  final_phase_lr_start_frac: 0.85  # Later start since cosine already decays smoothly
+  final_phase_lr_multiplier: 0.3
+  min_validation_threshold: 0.001
 
 # --- Run Configuration --- #
 run:
-  mode: 'train'              # 'train' or 'eval'
-  episodes: 50000            # Number of training episodes
-  model_dir: 'models'        # Directory to save models and logs
-  resume: false             # Resume training from latest checkpoint if true
-  specific_file: null       # Path to a specific training file (relative to data root) or null/None
-  skip_evaluation: false    # Skip final evaluation on test set after training
-  # data_base_dir: 'data'   # Optional: Override base data directory (defaults to 'data')
-  # eval_model_prefix: 'models/rainbow_transformer_best' # Optional: Model prefix for eval mode
+  mode: 'train'
+  episodes: 50000
+  model_dir: 'models'
+  resume: false
+  specific_file: null
+  skip_evaluation: false

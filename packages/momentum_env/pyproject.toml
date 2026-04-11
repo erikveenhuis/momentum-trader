@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "momentum_env"
-version = "0.1.6"
+version = "0.2.0"
 description = "A flexible trading environment for reinforcement learning"
 authors = [
   { name="Erik Veenhuis" },
@@ -20,8 +20,7 @@ dependencies = [
     "gymnasium==1.2.1",
     "numpy==2.3.4",
     "pandas==2.3.3",
-    "matplotlib==3.10.7",
-    "momentum-core==0.1.0"
+    "momentum-core==0.1.0",
 ]
 
 [project.optional-dependencies]
@@ -31,7 +30,7 @@ dev = [
     "flake8==7.3.0",
     "isort==7.0.0",
     "mypy==1.18.2",
-    "pytest==8.4.2",
+    "pytest==9.0.0",
     "twine==6.2.0",
 ]
 

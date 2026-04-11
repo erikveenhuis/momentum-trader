@@ -1,15 +1,14 @@
-import json  # Keep for saving results
+import json
 import os
-from collections import deque  # Keep deque for performance_tracker
-from datetime import datetime  # Added datetime back
+from collections import deque
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Set, Tuple  # Added Dict for cached envs
+from typing import Dict, List, Set, Tuple
 
 import numpy as np
 import torch
 from momentum_core.logging import get_logger
 from momentum_env import TradingEnv, TradingEnvConfig  # Use installed package
-from torch.cuda.amp import GradScaler
 from torch.utils.tensorboard import SummaryWriter
 
 from momentum_agent import RainbowDQNAgent  # Updated import path
@@ -32,7 +31,7 @@ class RainbowTrainerModule:
         device: torch.device,
         data_manager: DataManager,
         config: dict,
-        scaler: GradScaler | None = None,
+        scaler=None,
         writer: SummaryWriter | None = None,
     ):
         assert isinstance(agent, RainbowDQNAgent), "Agent must be an instance of RainbowDQNAgent"
@@ -47,7 +46,6 @@ class RainbowTrainerModule:
         self.env_config = config["environment"]
         self.trainer_config = config["trainer"]
         self.run_config = config.get("run", {})
-        self.scaler = scaler
         self.best_validation_metric = -np.inf
         self.writer = writer
         # Adjust path prefix for Rainbow models
@@ -58,6 +56,11 @@ class RainbowTrainerModule:
         self.best_trainer_checkpoint_base_path = str(Path(self.run_config.get("model_dir", "models")) / "checkpoint_trainer_best")
         self.validation_metrics = []
         self.performance_tracker = PerformanceTracker()
+
+        progress_path = Path(self.run_config.get("model_dir", "models")) / "progress.jsonl"
+        progress_path.parent.mkdir(parents=True, exist_ok=True)
+        self._progress_path = str(progress_path)
+        logger.info(f"Training progress log: {self._progress_path}")
         self.early_stopping_patience = self.trainer_config.get("early_stopping_patience", 10)
         self.early_stopping_counter = 0
         self.min_validation_threshold = self.trainer_config.get("min_validation_threshold", -np.inf)
@@ -150,14 +153,6 @@ class RainbowTrainerModule:
         self.warmup_steps = self.trainer_config.get("warmup_steps", 50000)
         self.invalid_action_window = self.trainer_config.get("invalid_action_window", 20)
         self.invalid_action_rate_window: deque[float] = deque(maxlen=self.invalid_action_window)
-        self.render_training_enabled = bool(self.trainer_config.get("render_training", False))
-        self.render_validation_enabled = bool(self.trainer_config.get("render_validation", False))
-        self.render_evaluation_enabled = bool(self.trainer_config.get("render_evaluation", False))
-        self.render_on_reset = bool(self.trainer_config.get("render_on_reset", False))
-        self.render_training_every_n_steps = self._parse_render_frequency("render_training_every_n_steps", default=1)
-        self.render_validation_every_n_steps = self._parse_render_frequency("render_validation_every_n_steps", default=1)
-        self.render_evaluation_every_n_steps = self._parse_render_frequency("render_evaluation_every_n_steps", default=1)
-        self._render_error_logged: Set[str] = set()
         # Extract run parameters
         self.model_dir = self.run_config.get("model_dir", "models")
         os.makedirs(self.model_dir, exist_ok=True)
@@ -178,6 +173,14 @@ class RainbowTrainerModule:
         # Removed complex logic based on improvement_rate and stability
         # Simplified to validate purely based on frequency
         return (episode + 1) % self.validation_freq == 0
+
+    @staticmethod
+    def _render_on_reset_if_enabled(env, context):
+        pass
+
+    @staticmethod
+    def _invoke_render(env, context, step_idx):
+        pass
 
     def _parse_render_frequency(self, key: str, default: int = 1) -> int:
         """Parse render frequency from trainer config with validation."""
@@ -207,62 +210,18 @@ class RainbowTrainerModule:
 
         return value_int
 
-    def _is_render_context_enabled(self, context: str) -> bool:
-        """Check if rendering is enabled for the given context."""
-        if context == "train":
-            return self.render_training_enabled
-        if context == "validation":
-            return self.render_validation_enabled
-        if context == "eval":
-            return self.render_evaluation_enabled
-        return False
-
-    def _should_render(self, context: str, step_idx: int) -> bool:
-        """Determine whether rendering should occur for the given context and step."""
-        if step_idx < 1:
-            return False
-
-        if context == "train":
-            return self.render_training_enabled and step_idx % self.render_training_every_n_steps == 0
-        if context == "validation":
-            return self.render_validation_enabled and step_idx % self.render_validation_every_n_steps == 0
-        if context == "eval":
-            return self.render_evaluation_enabled and step_idx % self.render_evaluation_every_n_steps == 0
-        return False
-
-    def _render_on_reset_if_enabled(self, env: TradingEnv, context: str) -> None:
-        """Render immediately after reset if configured for the context."""
-        if not self.render_on_reset or not self._is_render_context_enabled(context):
-            return
-
-        if getattr(env, "render_mode", None) is None:
-            return
-
-        self._invoke_render(env, context, step_idx=0)
-
-    def _invoke_render(self, env: TradingEnv, context: str, step_idx: int) -> None:
-        """Safely invoke env.render(), logging only the first failure per context."""
+    def _log_progress(self, event: str, **kwargs) -> None:
+        """Append a JSON line to the progress log file."""
+        record = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "event": event,
+        }
+        record.update(kwargs)
         try:
-            env.render()
-        except Exception as exc:  # pragma: no cover - defensive logging
-            if context not in self._render_error_logged:
-                logger.warning(
-                    "Environment render failed during %s at step %s: %s",
-                    context,
-                    step_idx,
-                    exc,
-                )
-                self._render_error_logged.add(context)
-
-    def _maybe_render(self, env: TradingEnv, context: str, step_idx: int) -> None:
-        """Render the environment if enabled and supported."""
-        if not self._should_render(context, step_idx):
-            return
-
-        if getattr(env, "render_mode", None) is None:
-            return
-
-        self._invoke_render(env, context, step_idx)
+            with open(self._progress_path, "a") as f:
+                f.write(json.dumps(record, default=str) + "\n")
+        except Exception:
+            pass
 
     def _save_checkpoint(
         self,
@@ -286,18 +245,15 @@ class RainbowTrainerModule:
             "total_train_steps": total_steps,  # Store steps from trainer perspective
             "best_validation_metric": self.best_validation_metric,
             "early_stopping_counter": self.early_stopping_counter,
-            # Replay buffer state is generally not saved due to size and complexity.
-            # 'buffer_state': ... ,
-            # 'n_step_buffer_state': ...,
-            # We can optionally save agent config hash or version here for compatibility checks
+            "buffer_state": self.agent.buffer.state_dict() if hasattr(self.agent.buffer, "state_dict") else None,
             # --- ADDED Agent State ---
             "agent_config": self.agent.config,
             "agent_total_steps": self.agent.total_steps,
             "total_steps": self.agent.total_steps,
-            "network_state_dict": self.agent.network.state_dict() if self.agent.network else None,
-            "target_network_state_dict": (self.agent.target_network.state_dict() if self.agent.target_network else None),
+            "network_state_dict": self.agent.network.state_dict() if self.agent.network is not None else None,
+            "target_network_state_dict": (self.agent.target_network.state_dict() if self.agent.target_network is not None else None),
             "optimizer_state_dict": (self.agent.optimizer.state_dict() if self.agent.optimizer else None),
-            "scaler_state_dict": self.scaler.state_dict() if self.scaler else None,
+            "scaler_state_dict": None,
             # --- ADDED Scheduler State ---
             "scheduler_state_dict": (
                 self.agent.scheduler.state_dict() if self.agent.scheduler and self.agent.lr_scheduler_enabled else None
@@ -375,8 +331,13 @@ class RainbowTrainerModule:
     ) -> Tuple[TradingEnv | None, dict | None, dict | None, PerformanceTracker | None]:
         """Sets up the environment and performance tracker for a new episode. Returns env, obs, info, tracker."""
         try:
-            episode_file_path = Path(specific_file) if specific_file else self.data_manager.get_random_training_file()
-            logger.info(f"--- Starting Episode {episode + 1}/{num_episodes} using file: {episode_file_path.name} ---")
+            curriculum_frac = min(1.0, 0.3 + 0.7 * (episode / max(num_episodes, 1)))
+            episode_file_path = (
+                Path(specific_file)
+                if specific_file
+                else self.data_manager.get_random_training_file(curriculum_frac=curriculum_frac)
+            )
+            logger.info(f"--- Starting Episode {episode + 1}/{num_episodes} using file: {episode_file_path.name} (curriculum={curriculum_frac:.2f}) ---")
         except Exception as e:
             logger.error(f"Error getting data file for episode {episode+1}: {e}")
             return None, None, None, None  # Indicate failure
@@ -741,7 +702,21 @@ class RainbowTrainerModule:
             logger.info(f"  Metrics - Max Exposure: {metrics.get('max_exposure_pct', np.nan):.2f}%")
             logger.info(f"  Metrics - Avg Position: {metrics.get('avg_position', np.nan):.4f}")
             logger.info(f"  Metrics - Avg Balance: ${metrics.get('avg_balance', np.nan):.2f}")
-        # ------------------------- #
+
+        self._log_progress(
+            "episode",
+            episode=episode + 1,
+            steps=steps_in_episode,
+            total_steps=total_train_steps,
+            reward=round(episode_reward, 4),
+            avg_reward=round(avg_reward_window, 4),
+            total_return=round(metrics.get("total_return", 0.0), 2) if metrics else 0.0,
+            sharpe=round(metrics.get("sharpe_ratio", 0.0), 4) if metrics else 0.0,
+            max_dd=round(metrics.get("max_drawdown", 0.0) * 100, 2) if metrics else 0.0,
+            invalid_pct=round(invalid_action_rate * 100, 1),
+            lr=self.agent.optimizer.param_groups[0]["lr"],
+            pv=round(final_info.get("portfolio_value", 0.0), 2),
+        )
 
         # --- Log Episode Summary to TensorBoard --- #
         if self.writer:
@@ -1121,7 +1096,6 @@ class RainbowTrainerModule:
                     )
                     total_reward += reward
                     obs = next_obs
-                    self._maybe_render(env, context, step_index)
                 else:
                     # Error already logged in helper. Add penalty reward. Loop will terminate.
                     total_reward += reward  # Add the penalty reward returned by helper
@@ -1459,6 +1433,17 @@ class RainbowTrainerModule:
             logger.info(f"Average Balance: ${avg_metrics['avg_balance']:.2f}")
             logger.info("============================================")
 
+            self._log_progress(
+                "validation",
+                score=round(validation_score, 4),
+                best=round(self.best_validation_metric, 4),
+                avg_return=round(avg_metrics["total_return"], 2),
+                sharpe=round(avg_metrics["sharpe_ratio"], 4),
+                max_dd=round(avg_metrics["max_drawdown"] * 100, 2),
+                pv=round(avg_metrics["portfolio_value"], 2),
+                early_stop_counter=self.early_stopping_counter,
+            )
+
             # 5. Save validation results
             self._save_validation_results(validation_score, avg_metrics, detailed_results)
 
@@ -1610,8 +1595,6 @@ class RainbowTrainerModule:
             steps_in_episode += 1
             total_train_steps += 1
 
-            # Optionally render the environment for visualization
-            self._maybe_render(env, "train", steps_in_episode)
 
             # Log PER statistics based on total training steps
             self._maybe_log_per_stats(total_train_steps)
