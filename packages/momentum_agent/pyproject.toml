@@ -18,7 +18,7 @@ classifiers = [
 ]
 dependencies = [
     "torch>=2.11.0",
-    "numpy==2.3.4",
+    "numpy==2.4.4",
     "momentum_env==0.2.0",
     "momentum-core==0.1.0",
 ]

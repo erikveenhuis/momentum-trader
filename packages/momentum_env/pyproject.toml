@@ -17,9 +17,9 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "gymnasium==1.2.1",
-    "numpy==2.3.4",
-    "pandas==2.3.3",
+    "gymnasium==1.2.3",
+    "numpy==2.4.4",
+    "pandas==3.0.2",
     "momentum-core==0.1.0",
 ]
 
