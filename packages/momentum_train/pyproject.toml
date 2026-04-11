@@ -28,24 +28,13 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "black==25.9.0",
-    "flake8==7.3.0",
-    "isort==7.0.0",
-    "mypy==1.18.2",
     "pytest==9.0.0",
     "pytest-cov==7.0.0",
+    "ruff",
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.black]
-line-length = 128
-target-version = ['py313']
-
-[tool.isort]
-profile = "black"
-multi_line_output = 3
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -55,13 +44,3 @@ markers = [
     "integration: marks tests as integration tests",
     "unittest: marks tests as unit tests",
 ]
-
-[tool.ruff]
-line-length = 128
-
-[tool.ruff.lint]
-select = ["E", "F", "W"]
-ignore = ["E501"]
-
-[tool.ruff.lint.per-file-ignores]
-"tests/**.py" = ["F841", "E501"]

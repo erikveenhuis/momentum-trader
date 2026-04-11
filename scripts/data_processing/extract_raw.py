@@ -11,7 +11,7 @@ from multiprocessing import Manager
 from pathlib import Path
 
 # Import Any for type hinting queues
-from typing import Any, List, Optional, Tuple
+from typing import Any
 
 import pandas as pd
 import yaml
@@ -51,7 +51,7 @@ class DiskWriteError(RuntimeError):
     pass
 
 
-def configure_logging(log_level: Optional[str] = None) -> None:
+def configure_logging(log_level: str | None = None) -> None:
     """Configure logging for the extract_raw script."""
 
     if "setup_package_logging" not in globals():
@@ -96,8 +96,8 @@ def extract_gz_and_split_by_ticker(
     ohlc_range_anomaly_threshold: float,
     ohlc_range_anomaly_occurrence_threshold: int,
     # Add exclude_tickers list parameter
-    exclude_tickers: List[str],
-) -> Tuple[int, int, int, int, int, int, int]:
+    exclude_tickers: list[str],
+) -> tuple[int, int, int, int, int, int, int]:
     """
     Reads a compressed CSV, cleans tickers, optionally filters USD pairs,
     complete days, anomalies, and excluded tickers, and saves one raw CSV per ticker for that day.
@@ -259,7 +259,7 @@ def extract_gz_and_split_by_ticker(
                             reason_parts.append(f"Z-score (std_dev>{anomaly_threshold})")
                         if is_anomalous_ohlc_range:
                             reason_parts.append(
-                                f"OHLC range (range>{ohlc_range_anomaly_threshold*100}% in >{ohlc_range_anomaly_occurrence_threshold} candles)"
+                                f"OHLC range (range>{ohlc_range_anomaly_threshold * 100}% in >{ohlc_range_anomaly_occurrence_threshold} candles)"
                             )
                         skipped_reasons[index] = f"Anomaly ({'; '.join(reason_parts)})"
                         # The skipped_anomalous_count will be incremented later if this is the primary skip reason
@@ -394,9 +394,9 @@ def run_extraction(
     # Add anomaly filter parameters
     filter_anomalies: bool,
     anomaly_threshold: float,
-    year_filter: Optional[str],
+    year_filter: str | None,
     # Add exclude_tickers list parameter
-    exclude_tickers: List[str],
+    exclude_tickers: list[str],
     ohlc_range_anomaly_threshold: float,
     ohlc_range_anomaly_occurrence_threshold: int,
 ):
@@ -564,7 +564,7 @@ if __name__ == "__main__":
     config = {}
     try:
         if config_path.exists():
-            with open(config_path, "r") as f:
+            with open(config_path) as f:
                 config = yaml.safe_load(f)
             if config is None:
                 config = {}  # Handle empty config file

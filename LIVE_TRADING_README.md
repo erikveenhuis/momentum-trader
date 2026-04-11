@@ -13,14 +13,14 @@ export ALPACA_API_SECRET=your_secret_here
 export ALPACA_PAPER_TRADING=true
 
 # Run live trading
-python -m momentum_live.cli --symbols BTC/USD,ETH/USD --log-level INFO
+python -m momentum_live.cli --symbols BTC/USD,ETH/USD --models-dir models --log-level INFO
 ```
 
 ## What It Does
 
 - Connects to Alpaca's live crypto data stream
 - Processes real-time bars and computes 12-feature observations (OHLCV + transactions + derived momentum/volatility features)
-- Makes decisions using a Rainbow DQN agent with action masking
+- Makes decisions using a Rainbow DQN agent with target allocation actions
 - Executes orders on your Alpaca paper trading account
 - Tracks portfolio with shared balance across symbols
 
@@ -86,7 +86,7 @@ Press `Ctrl+C` to gracefully stop. The system will close connections and save fi
 - Paper trading only (never uses real money unless explicitly configured)
 - Position limits (cannot sell more than owned)
 - Cash checks (cannot buy with insufficient balance)
-- Action masking (agent never proposes invalid actions)
+- Target allocation actions (all 6 exposure levels are always valid)
 - Minimum order sizes (prevents tiny, costly orders)
 - Slippage-aware execution (basis-point slippage modeled during training)
 - Graceful error recovery
@@ -94,9 +94,7 @@ Press `Ctrl+C` to gracefully stop. The system will close connections and save fi
 ## Architecture
 
 ```
-Alpaca Stream -> Feature Window (60-bar) -> Z-Score Norm + Derived Features -> Rainbow Agent -> Order Execution
-                                                                                    |
-                                                            Action Mask (valid actions only)
+Alpaca Stream -> Feature Window (60-bar) -> Z-Score Norm + Derived Features -> Rainbow Agent -> Target Allocation -> Order Execution
 ```
 
 Features: 12 channels (OHLCV + transactions + log returns at 1/5/10 lag + realized vol + volume ratio + HL range ratio).

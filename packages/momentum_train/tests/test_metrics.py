@@ -1,6 +1,5 @@
 """Tests for the metrics module."""
 
-import numpy as np
 import pytest
 from momentum_train.metrics import (
     PerformanceTracker,
@@ -95,12 +94,9 @@ class TestPerformanceTracker:
     def test_update_and_get_metrics(self):
         tracker = PerformanceTracker()
         tracker.add_initial_value(1000.0)
-        tracker.update(1010.0, action=1, reward=0.01, transaction_cost=0.5,
-                       position=0.5, balance=500.0, price=1010.0)
-        tracker.update(1020.0, action=0, reward=0.005, transaction_cost=0.0,
-                       position=0.5, balance=500.0, price=1020.0)
-        tracker.update(1015.0, action=5, reward=-0.003, transaction_cost=0.3,
-                       position=0.0, balance=1015.0, price=1015.0)
+        tracker.update(1010.0, action=1, reward=0.01, transaction_cost=0.5, position=0.5, balance=500.0, price=1010.0)
+        tracker.update(1020.0, action=0, reward=0.005, transaction_cost=0.0, position=0.5, balance=500.0, price=1020.0)
+        tracker.update(1015.0, action=5, reward=-0.003, transaction_cost=0.3, position=0.0, balance=1015.0, price=1015.0)
 
         metrics = tracker.get_metrics()
         assert "total_return" in metrics

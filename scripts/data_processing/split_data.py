@@ -3,7 +3,6 @@ import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple
 
 import yaml
 
@@ -56,7 +55,7 @@ def configure_logging(log_level: str | None = None) -> None:
 
 
 def perform_train_val_test_split(
-    all_files: List[Path],
+    all_files: list[Path],
     output_base_dir: Path,  # Base directory where subdirs will be created
     train_subdir: str,
     val_subdir: str,
@@ -124,7 +123,7 @@ def perform_train_val_test_split(
         return
 
     # Build ordered list of distinct (year, month) pairs
-    distinct_months: List[Tuple[int, int]] = []
+    distinct_months: list[tuple[int, int]] = []
     for _, date in valid_entries:
         month_key = (date.year, date.month)
         if not distinct_months or distinct_months[-1] != month_key:
@@ -153,9 +152,9 @@ def perform_train_val_test_split(
     test_month_set = set(test_month_keys)
     validation_month_set = set(validation_month_keys)
 
-    train_files: List[Path] = list(invalid_date_files)
-    validation_files: List[Path] = []
-    test_files: List[Path] = []
+    train_files: list[Path] = list(invalid_date_files)
+    validation_files: list[Path] = []
+    test_files: list[Path] = []
 
     for file_path, file_date in valid_entries:
         month_key = (file_date.year, file_date.month)
@@ -210,7 +209,7 @@ def perform_train_val_test_split(
     copied_train, copied_val, copied_test = 0, 0, 0
     errors_copying = 0
 
-    def copy_files(file_list: List[Path], dest_path: Path) -> Tuple[int, int]:
+    def copy_files(file_list: list[Path], dest_path: Path) -> tuple[int, int]:
         count = 0
         err_count = 0
         dest_path.mkdir(parents=True, exist_ok=True)  # Ensure destination exists
@@ -318,7 +317,7 @@ if __name__ == "__main__":
     config = {}
     try:
         if config_path.exists():
-            with open(config_path, "r") as f:
+            with open(config_path) as f:
                 config = yaml.safe_load(f)
             if config is None:
                 config = {}

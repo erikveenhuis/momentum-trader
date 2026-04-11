@@ -2,7 +2,6 @@ import csv
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 LOG_ROOT = Path("logs")
 REPORTS_ROOT = Path("reports")
@@ -21,7 +20,7 @@ def parse_timestamp(ts_str: str) -> datetime:
     return datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S,%f")
 
 
-def _ordered_training_logs() -> List[Path]:
+def _ordered_training_logs() -> list[Path]:
     """Get all training log files in chronological order."""
     if not LOG_ROOT.exists():
         return []
@@ -38,7 +37,7 @@ def _ordered_training_logs() -> List[Path]:
     return [path for _, path in logs]
 
 
-def _write_csv(path: Path, rows: List[Dict[str, Optional[str]]], fieldnames: List[str]) -> None:
+def _write_csv(path: Path, rows: list[dict[str, str | None]], fieldnames: list[str]) -> None:
     """Write rows to CSV file."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
@@ -50,12 +49,12 @@ def _write_csv(path: Path, rows: List[Dict[str, Optional[str]]], fieldnames: Lis
 
 def extract_training_performance() -> None:
     """Extract training performance metrics from logs."""
-    performance_data: List[Dict[str, Optional[str]]] = []
-    episode_starts: Dict[int, Tuple[str, str]] = {}  # episode_num -> (timestamp, dataset_file)
+    performance_data: list[dict[str, str | None]] = []
+    episode_starts: dict[int, tuple[str, str]] = {}  # episode_num -> (timestamp, dataset_file)
 
     for log_path in _ordered_training_logs():
-        current_episode_start: Optional[str] = None
-        current_dataset: Optional[str] = None
+        current_episode_start: str | None = None
+        current_dataset: str | None = None
 
         with log_path.open(encoding="utf-8") as f:
             for raw_line in f:
@@ -168,7 +167,7 @@ def extract_training_performance() -> None:
             min_duration = min(durations)
             max_duration = max(durations)
 
-            print(f"Average episode duration: {avg_duration:.3f} seconds ({avg_duration/60:.3f} minutes)")
+            print(f"Average episode duration: {avg_duration:.3f} seconds ({avg_duration / 60:.3f} minutes)")
             print(f"Min episode duration: {min_duration:.3f} seconds")
             print(f"Max episode duration: {max_duration:.3f} seconds")
 

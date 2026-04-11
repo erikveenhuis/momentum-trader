@@ -1,7 +1,6 @@
 import argparse
 import logging
 import os
-from typing import Optional
 
 import mplfinance as mpf  # For financial plotting
 import pandas as pd
@@ -20,7 +19,7 @@ except ImportError:  # pragma: no cover - fallback when runtime package missing
 logger = get_logger("scripts.plot_csv")
 
 
-def configure_logging(log_level: Optional[str] = None) -> None:
+def configure_logging(log_level: str | None = None) -> None:
     """Configure logging for the plot_csv utility."""
 
     if "setup_package_logging" not in globals():

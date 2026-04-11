@@ -1,8 +1,7 @@
-from typing import Dict, Optional, Tuple, Union
-
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
+
 from momentum_env.config import TradingEnvConfig
 from momentum_env.data import MarketDataProcessor, get_observation_at_step
 from momentum_env.trading import PortfolioState, TradingLogic
@@ -65,11 +64,11 @@ class TradingEnv(gym.Env):
 
         self.state = None
         self.portfolio_state = None
-        self.prev_portfolio_value: Optional[float] = None
+        self.prev_portfolio_value: float | None = None
         self.bars_in_position: int = 0
         self.reset()
 
-    def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> Tuple[Dict[str, np.ndarray], Dict]:
+    def reset(self, seed: int | None = None, options: dict | None = None) -> tuple[dict[str, np.ndarray], dict]:
         super().reset(seed=seed)
 
         self.state = {"current_step": 0}
@@ -89,7 +88,7 @@ class TradingEnv(gym.Env):
 
         return observation, info
 
-    def _get_info(self, step_override: Optional[int] = None) -> Dict[str, Union[int, float]]:
+    def _get_info(self, step_override: int | None = None) -> dict[str, int | float]:
         target_step = self.state["current_step"] if step_override is None else step_override
         target_step = min(target_step, self.market_data.data_length - 1)
         current_price = self.market_data.close_prices[target_step]
@@ -106,7 +105,7 @@ class TradingEnv(gym.Env):
             "step_transaction_cost": 0.0,
         }
 
-    def step(self, action: int) -> Tuple[Dict[str, np.ndarray], float, bool, bool, Dict]:
+    def step(self, action: int) -> tuple[dict[str, np.ndarray], float, bool, bool, dict]:
         """Execute one step. Action is a target allocation index (0-5)."""
         if self.state["current_step"] >= self.market_data.data_length:
             raise RuntimeError("Episode is done, call reset() first")
@@ -117,9 +116,7 @@ class TradingEnv(gym.Env):
         pre_trade_portfolio_value = old_portfolio_state.portfolio_value(current_price)
 
         target_frac = TARGET_ALLOCATIONS[action]
-        self.portfolio_state, is_valid = self._execute_target_allocation(
-            target_frac, current_price, pre_trade_portfolio_value
-        )
+        self.portfolio_state, is_valid = self._execute_target_allocation(target_frac, current_price, pre_trade_portfolio_value)
 
         post_trade_portfolio_value = self.portfolio_state.portfolio_value(current_price)
 
@@ -165,9 +162,7 @@ class TradingEnv(gym.Env):
 
         return observation, reward, terminated, truncated, info
 
-    def _execute_target_allocation(
-        self, target_frac: float, current_price: float, portfolio_value: float
-    ) -> Tuple[PortfolioState, bool]:
+    def _execute_target_allocation(self, target_frac: float, current_price: float, portfolio_value: float) -> tuple[PortfolioState, bool]:
         """Adjust position to reach the target allocation fraction.
 
         Returns (new_portfolio_state, is_valid). All targets are always valid;
@@ -201,7 +196,7 @@ class TradingEnv(gym.Env):
             is_valid, new_state = self.trading_logic.handle_sell(self.portfolio_state, current_price, sell_fraction)
             return new_state, is_valid
 
-    def _get_observation(self, step_override: Optional[int] = None) -> Dict[str, np.ndarray]:
+    def _get_observation(self, step_override: int | None = None) -> dict[str, np.ndarray]:
         target_step = self.state["current_step"] if step_override is None else step_override
         target_step = min(target_step, self.market_data.data_length - 1)
         current_price = self.market_data.close_prices[target_step]
@@ -217,7 +212,7 @@ class TradingEnv(gym.Env):
             cumulative_fees_frac=self.portfolio_state.total_transaction_cost,
         )
 
-    def _check_termination(self, current_portfolio_value: float, next_step: int) -> Tuple[bool, bool]:
+    def _check_termination(self, current_portfolio_value: float, next_step: int) -> tuple[bool, bool]:
         data_finished = next_step >= self.market_data.data_length
         portfolio_depleted = current_portfolio_value < self.config.initial_balance * 0.01
 
@@ -225,4 +220,3 @@ class TradingEnv(gym.Env):
         truncated = bool(data_finished and not terminated)
 
         return terminated, truncated
-

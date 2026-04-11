@@ -1,7 +1,6 @@
 """Trading logic for the trading environment."""
 
 from dataclasses import dataclass
-from typing import Tuple
 
 
 @dataclass
@@ -45,7 +44,7 @@ class TradingLogic:
         portfolio_state: PortfolioState,
         current_price: float,
         action_value: float,
-    ) -> Tuple[bool, PortfolioState]:
+    ) -> tuple[bool, PortfolioState]:
         """Handle buy action logic.
 
         Args:
@@ -102,7 +101,7 @@ class TradingLogic:
         portfolio_state: PortfolioState,
         current_price: float,
         action_value: float,
-    ) -> Tuple[bool, PortfolioState]:
+    ) -> tuple[bool, PortfolioState]:
         """Handle sell action logic.
 
         Args:
@@ -150,7 +149,7 @@ class TradingLogic:
         current_price: float,
         action: int,
         action_value: float,
-    ) -> Tuple[PortfolioState, bool]:
+    ) -> tuple[PortfolioState, bool]:
         """Apply a trading action.
 
         Args:

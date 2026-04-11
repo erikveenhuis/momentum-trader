@@ -9,20 +9,18 @@ import sys  # Added sys module
 import time  # Added for timestamping log directories
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 import numpy as np
 import torch
 import yaml  # Added for config loading
+from momentum_agent import RainbowDQNAgent
 from momentum_core.logging import get_logger, setup_package_logging
 from momentum_env import TradingEnv, TradingEnvConfig
 
 # AMP uses bfloat16 autocast (no GradScaler needed)
-
 # --- Add TensorBoard import ---
 from torch.utils.tensorboard import SummaryWriter
-
-from momentum_agent import RainbowDQNAgent
 
 from .data import DataManager
 from .trainer import RainbowTrainerModule
@@ -42,7 +40,7 @@ sys.path.insert(0, str(project_root))
 logger = get_logger("momentum_train.Main")
 
 
-DEFAULT_LOG_LEVEL_OVERRIDES: Dict[str, Any] = {
+DEFAULT_LOG_LEVEL_OVERRIDES: dict[str, Any] = {
     "momentum_train.Main": logging.INFO,
     "Trainer": logging.INFO,
     "Agent": logging.INFO,
@@ -54,7 +52,7 @@ DEFAULT_LOG_LEVEL_OVERRIDES: Dict[str, Any] = {
 }
 
 
-def configure_logging(cli_log_level: str | None = None, config: Dict[str, Any] | None = None) -> None:
+def configure_logging(cli_log_level: str | None = None, config: dict[str, Any] | None = None) -> None:
     """Configure logging for the momentum_train package."""
 
     config = config or {}
@@ -144,7 +142,7 @@ def evaluate_on_test_data(agent: RainbowDQNAgent, trainer: RainbowTrainerModule,
         logger.info(f"Average Portfolio: ${avg_metrics['portfolio_value']:.2f}")
         logger.info(f"Average Return: {avg_metrics['total_return']:.2f}%")
         logger.info(f"Average Sharpe: {avg_metrics['sharpe_ratio']:.4f}")
-        logger.info(f"Average Max Drawdown: {avg_metrics['max_drawdown']*100:.2f}%")
+        logger.info(f"Average Max Drawdown: {avg_metrics['max_drawdown'] * 100:.2f}%")
         logger.info(f"Average Transaction Costs: ${avg_metrics['transaction_costs']:.2f}")
         logger.info("============================================")
 
@@ -203,7 +201,7 @@ def run_training(
     elif torch.backends.mps.is_available():
         device = torch.device("mps")
     else:
-        error_msg = "GPU required: neither CUDA nor MPS devices detected. " "Aborting to prevent running training on CPU."
+        error_msg = "GPU required: neither CUDA nor MPS devices detected. Aborting to prevent running training on CPU."
         logger.error(error_msg)
         raise RuntimeError(error_msg)
     logger.info(f"Using {device} device")
@@ -433,7 +431,7 @@ def run_training(
     try:
         initial_env.close()
     except Exception:
-        pass  # Ignore errors closing env that might already be closed
+        logger.debug("Error closing initial environment (may already be closed)", exc_info=True)
 
     # --- Close TensorBoard Writer ---
     writer.close()
@@ -485,7 +483,7 @@ def main():  # Remove default config_path
 
     # --- Load Configuration --- # Use parsed config_path
     try:
-        with open(config_path, "r") as f:
+        with open(config_path, encoding="utf-8") as f:
             config = yaml.safe_load(f)
     except FileNotFoundError:
         logger.error(f"Configuration file not found at {config_path}. Exiting.")

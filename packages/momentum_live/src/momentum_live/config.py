@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Iterable, List, Literal, Optional, Sequence
 
 
 @dataclass(slots=True)
@@ -23,7 +23,7 @@ class AlpacaCredentials:
         secret_key_var: str = "ALPACA_API_SECRET",
         location_var: str = "ALPACA_CRYPTO_FEED",
         paper_var: str = "ALPACA_PAPER_TRADING",
-    ) -> "AlpacaCredentials":
+    ) -> AlpacaCredentials:
         """Build credentials from environment variables."""
 
         api_key = os.getenv(api_key_var)
@@ -32,9 +32,9 @@ class AlpacaCredentials:
         paper = os.getenv(paper_var, "true").lower() in ("true", "1", "yes")
 
         if not api_key:
-            raise EnvironmentError(f"Missing Alpaca API key in environment variable '{api_key_var}'.")
+            raise OSError(f"Missing Alpaca API key in environment variable '{api_key_var}'.")
         if not secret_key:
-            raise EnvironmentError(f"Missing Alpaca API secret in environment variable '{secret_key_var}'.")
+            raise OSError(f"Missing Alpaca API secret in environment variable '{secret_key_var}'.")
 
         return cls(api_key=api_key, secret_key=secret_key, location=location, paper=paper)
 
@@ -76,7 +76,7 @@ class LiveTradingConfig:
             raise ValueError("transaction_fee must be in the range [0, 1)")
 
 
-def parse_symbols(symbols: str | Sequence[str]) -> List[str]:
+def parse_symbols(symbols: str | Sequence[str]) -> list[str]:
     """Parse a comma or space separated list of symbols into a list."""
 
     if isinstance(symbols, str):

@@ -1,7 +1,6 @@
 import logging
 import shutil
 from pathlib import Path
-from typing import List, Optional
 
 import numpy as np
 import pandas as pd
@@ -10,7 +9,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)  # Use __name__ for logger
 
 # --- Constants ---
-PRICE_COLS: List[str] = ["open", "close", "high", "low"]
+PRICE_COLS: list[str] = ["open", "close", "high", "low"]
 EXPECTED_DAILY_ENTRIES: int = 1440
 
 # --- Helper Functions ---
@@ -49,7 +48,7 @@ def clear_directory(directory_path: Path):
         logger.error(f"Could not create directory {directory_path}: {e}")
 
 
-def calculate_return(file_path: Path) -> Optional[float]:
+def calculate_return(file_path: Path) -> float | None:
     """
     Calculate buy-and-hold return (last_close / first_close - 1) for a CSV file.
     """

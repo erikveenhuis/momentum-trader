@@ -37,7 +37,7 @@ The agent is a full **Rainbow DQN** (C51 distributional + PER + dueling + noisy 
 - **bfloat16 AMP**: native Blackwell tensor core support, no GradScaler needed
 - **Polyak soft target updates** (tau=0.005) instead of hard copy
 - **Auxiliary return-prediction head** on the Transformer CLS output
-- **Action masking** for invalid actions (replaces penalty-only approach)
+- **Target allocation actions**: 6 discrete exposure levels (0%--100% in 20% steps) where every action is always valid
 - **Curriculum learning**: progressively expands training data pool over the training run
 - **Pre-norm Transformer + GELU** activation for better gradient flow
 
@@ -72,7 +72,7 @@ Historical data lives in `data/` and is organized by stage:
 
 ```
 data/
-├── raw/        # Original vendor files (e.g. Polygon aggregates)
+├── raw/        # Original vendor files (Massive / formerly Polygon aggregates)
 ├── extracted/  # One file per symbol/day after cleaning
 └── processed/  # Train/validation/test splits (CSV and/or .npz)
 ```

@@ -27,21 +27,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "black==25.9.0",
-    "flake8==7.3.0",
-    "isort==7.0.0",
     "pytest==9.0.0",
+    "ruff",
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.black]
-line-length = 128
-target-version = ['py313']
-
-[tool.isort]
-profile = "black"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

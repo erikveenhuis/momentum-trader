@@ -1,5 +1,3 @@
-from typing import Dict, List
-
 import numpy as np
 from momentum_core.logging import get_logger
 
@@ -7,7 +5,7 @@ from momentum_core.logging import get_logger
 logger = get_logger("Metrics")
 
 
-def calculate_sharpe_ratio(returns: List[float], risk_free_rate: float = 0.02) -> float:
+def calculate_sharpe_ratio(returns: list[float], risk_free_rate: float = 0.02) -> float:
     """Calculate the Sharpe ratio of returns."""
     assert isinstance(returns, list), "Input returns must be a list"
     assert all(isinstance(r, (float, np.float32, np.float64)) for r in returns), "All elements in returns must be floats"
@@ -33,7 +31,7 @@ def calculate_sharpe_ratio(returns: List[float], risk_free_rate: float = 0.02) -
     return sharpe
 
 
-def calculate_max_drawdown(portfolio_values: List[float]) -> float:
+def calculate_max_drawdown(portfolio_values: list[float]) -> float:
     """Calculate the maximum drawdown from portfolio values."""
     assert isinstance(portfolio_values, list), "Input portfolio_values must be a list"
     assert all(isinstance(v, (float, np.float32, np.float64)) for v in portfolio_values), "All elements in portfolio_values must be floats"
@@ -50,7 +48,7 @@ def calculate_max_drawdown(portfolio_values: List[float]) -> float:
     return max_dd
 
 
-def calculate_avg_trade_return(returns: List[float]) -> float:
+def calculate_avg_trade_return(returns: list[float]) -> float:
     """Calculate the average return per trade."""
     assert isinstance(returns, list), "Input returns must be a list"
     assert all(isinstance(r, (float, np.float32, np.float64)) for r in returns), "All elements in returns must be floats"
@@ -62,7 +60,7 @@ def calculate_avg_trade_return(returns: List[float]) -> float:
     return avg_return
 
 
-def calculate_episode_score(metrics: Dict[str, float]) -> float:
+def calculate_episode_score(metrics: dict[str, float]) -> float:
     """
     Calculate a normalized episode-level score focusing on risk-adjusted return and drawdown.
 
@@ -192,7 +190,7 @@ class PerformanceTracker:
             assert not np.isnan(ret) and not np.isinf(ret), "Return calculation resulted in NaN/Inf"
             self.returns.append(ret)
 
-    def get_action_counts(self) -> Dict[int, int]:
+    def get_action_counts(self) -> dict[int, int]:
         """Counts the occurrences of each discrete action taken."""
         num_actions = 6
         counts = {i: 0 for i in range(num_actions)}
@@ -204,7 +202,7 @@ class PerformanceTracker:
                 logger.warning(f"Encountered invalid action index {action} in tracker.")
         return counts
 
-    def get_metrics(self) -> Dict[str, float]:
+    def get_metrics(self) -> dict[str, float]:
         """Calculate all metrics from current data."""
         if not self.portfolio_values:
             return {}
@@ -233,17 +231,19 @@ class PerformanceTracker:
         if self.exposures:
             metrics["avg_exposure_pct"] = float(np.mean(self.exposures) * 100.0)
             metrics["max_exposure_pct"] = float(np.max(self.exposures) * 100.0)
-        assert all(
-            isinstance(v, (float, np.float32, np.float64, dict)) for v in metrics.values()
-        ), "Not all calculated metrics are floats or dict"
+        assert all(isinstance(v, (float, np.float32, np.float64, dict)) for v in metrics.values()), (
+            "Not all calculated metrics are floats or dict"
+        )
         assert 0.0 <= metrics["max_drawdown"] <= 1.0, "Max drawdown out of range [0, 1]"
         # Check for NaN/Inf only in numeric values
         assert not any(
-            np.isnan(v) or np.isinf(v) for k, v in metrics.items() if isinstance(v, (float, np.number))  # Check only numeric types
+            np.isnan(v) or np.isinf(v)
+            for k, v in metrics.items()
+            if isinstance(v, (float, np.number))  # Check only numeric types
         ), "NaN or Inf found in calculated numeric metrics"
         return metrics
 
-    def get_recent_metrics(self) -> Dict[str, float]:
+    def get_recent_metrics(self) -> dict[str, float]:
         """Calculate metrics using only recent data."""
         if len(self.portfolio_values) < 2:
             return self.get_metrics()

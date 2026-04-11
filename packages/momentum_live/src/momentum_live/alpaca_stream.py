@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from momentum_core.logging import get_logger
 
@@ -92,7 +92,7 @@ class AlpacaStreamRunner:
         feed = self._resolve_feed()
 
         lookback = max(window_size * 2, window_size + 10)
-        end = datetime.now(timezone.utc)
+        end = datetime.now(UTC)
 
         bars_by_symbol = self._collect_historical_bars(symbols, lookback, end, feed)
 
@@ -220,7 +220,7 @@ class AlpacaStreamRunner:
                     low=float(getattr(raw_bar, "low")),
                     close=float(getattr(raw_bar, "close")),
                     volume=float(getattr(raw_bar, "volume", 0.0)),
-                    timestamp=getattr(raw_bar, "timestamp", datetime.utcnow()),
+                    timestamp=getattr(raw_bar, "timestamp", datetime.now(UTC)),
                 )
             except Exception as exc:
                 LOGGER.debug("Skipping malformed historical bar: %s", exc)

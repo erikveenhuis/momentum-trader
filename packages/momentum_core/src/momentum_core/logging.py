@@ -7,7 +7,6 @@ import logging.handlers
 import os
 import sys
 from pathlib import Path
-from typing import Dict, Optional, Union
 
 LOG_DIR_ENV_VAR = "MOMENTUM_LOG_DIR"
 GLOBAL_LEVEL_ENV_VAR = "MOMENTUM_LOG_LEVEL"
@@ -18,7 +17,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_LOGS_DIR = _PROJECT_ROOT / "logs"
 
 
-def _coerce_level(level: Optional[Union[int, str]]) -> Optional[int]:
+def _coerce_level(level: int | str | None) -> int | None:
     """Convert a string/int log level to the logging module constant."""
 
     if level is None:
@@ -40,7 +39,7 @@ def _coerce_level(level: Optional[Union[int, str]]) -> Optional[int]:
     raise TypeError(f"Unsupported log level type: {type(level)!r}")
 
 
-def _resolve_logs_dir(logs_dir: Optional[Union[str, Path]]) -> Path:
+def _resolve_logs_dir(logs_dir: str | Path | None) -> Path:
     """Determine the logs directory, respecting override and environment variables."""
 
     if logs_dir is not None:
@@ -54,12 +53,12 @@ def _resolve_logs_dir(logs_dir: Optional[Union[str, Path]]) -> Path:
     return resolved
 
 
-def _resolve_log_level(package_name: Optional[str], requested_level: Optional[Union[int, str]]) -> int:
+def _resolve_log_level(package_name: str | None, requested_level: int | str | None) -> int:
     """Resolve the log level using explicit request, package override, and global fallback."""
 
     requested = _coerce_level(requested_level)
 
-    candidates: list[Optional[str]] = []
+    candidates: list[str | None] = []
     if package_name:
         env_name = PACKAGE_LEVEL_ENV_PREFIX + package_name.upper().replace(".", "_")
         candidates.append(os.getenv(env_name))
@@ -75,15 +74,15 @@ def _resolve_log_level(package_name: Optional[str], requested_level: Optional[Un
 
 
 def setup_logging(
-    log_file_path: Optional[Union[str, Path]] = None,
-    root_level: Union[int, str, None] = logging.INFO,
-    level_overrides: Optional[Dict[str, Union[int, str]]] = None,
+    log_file_path: str | Path | None = None,
+    root_level: int | str | None = logging.INFO,
+    level_overrides: dict[str, int | str] | None = None,
     max_bytes: int = 1 * 1024 * 1024,  # 1MB
     backup_count: int = 10,
-    console_level: Union[int, str, None] = logging.INFO,
-    console_stream: Optional[object] = None,
-    logs_dir: Optional[Union[str, Path]] = None,
-    file_level: Union[int, str, None] = None,
+    console_level: int | str | None = logging.INFO,
+    console_stream: object | None = None,
+    logs_dir: str | Path | None = None,
+    file_level: int | str | None = None,
     propagate: bool = False,
 ) -> None:
     """
@@ -176,12 +175,12 @@ def get_logger(name: str) -> logging.Logger:
 
 def setup_package_logging(
     package_name: str,
-    log_filename: Optional[str] = None,
-    root_level: Union[int, str, None] = logging.INFO,
-    level_overrides: Optional[Dict[str, Union[int, str]]] = None,
-    logs_dir: Optional[Union[str, Path]] = None,
-    console_level: Union[int, str, None] = None,
-    file_level: Union[int, str, None] = None,
+    log_filename: str | None = None,
+    root_level: int | str | None = logging.INFO,
+    level_overrides: dict[str, int | str] | None = None,
+    logs_dir: str | Path | None = None,
+    console_level: int | str | None = None,
+    file_level: int | str | None = None,
 ) -> None:
     """
     Convenience function to setup logging for a specific package.

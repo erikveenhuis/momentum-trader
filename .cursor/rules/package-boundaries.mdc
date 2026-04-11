@@ -1,0 +1,36 @@
+---
+description: Import rules and dependency DAG for the monorepo packages
+globs: "packages/**/*.py"
+alwaysApply: false
+---
+
+# Package Boundaries
+
+## Never import across boundaries
+
+Packages under `packages/` must never import from `scripts/` or repo-root modules. If shared logic is needed, move it to `momentum_core` or the owning domain package.
+
+## Dependency DAG (must not be violated)
+
+```
+momentum_core        (no heavy deps -- no torch, no alpaca-py)
+  <- momentum_env    (gymnasium, numpy, pandas)
+  <- momentum_agent  (torch, momentum_env, momentum_core)
+  <- momentum_train  (torch, momentum_agent, momentum_env, momentum_core)
+  <- momentum_live   (alpaca-py, momentum_agent, momentum_env, momentum_core)
+```
+
+## Consolidation pattern
+
+When two packages need the same utility, move it to `momentum_core` and re-export from the domain package for backward compatibility:
+
+```python
+# momentum_core/data.py  -- canonical implementation
+# momentum_train/data.py  -- re-export
+from momentum_core.data import DataManager
+__all__ = ["DataManager"]
+```
+
+## momentum_core stays lightweight
+
+No `torch`, `alpaca-py`, `gymnasium`, or other heavy deps. Only stdlib + minimal packages.

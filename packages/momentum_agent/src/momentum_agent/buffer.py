@@ -95,6 +95,8 @@ class SumTree:
 # --- Start: Prioritized Replay Buffer (PER) ---
 # Simplified PER implementation (SumTree can be more efficient for large buffers)
 class PrioritizedReplayBuffer:
+    """SumTree-backed prioritized experience replay buffer with importance-sampling weight annealing."""
+
     def __init__(self, capacity, alpha=0.6, beta_start=0.4, beta_frames=100000, *, debug: bool = False):
         self.epsilon = 1e-5  # Small constant to ensure non-zero priority
         self.capacity = capacity

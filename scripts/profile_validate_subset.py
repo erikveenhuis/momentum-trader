@@ -21,13 +21,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from momentum_agent import RainbowDQNAgent
 from momentum_train.data import DataManager
 from momentum_train.run_training import configure_logging
 from momentum_train.trainer import RainbowTrainerModule
 from momentum_train.utils.checkpoint_utils import find_latest_checkpoint, load_checkpoint
 from momentum_train.utils.utils import set_seeds
-
-from momentum_agent import RainbowDQNAgent
 
 LOGGER_NAME = "momentum_train.ProfileValidation"
 

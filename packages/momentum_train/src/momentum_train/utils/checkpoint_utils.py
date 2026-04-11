@@ -1,7 +1,7 @@
 import glob
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any
 
 import numpy as np
 import torch
@@ -9,7 +9,7 @@ import torch
 logger = logging.getLogger("CheckpointUtils")
 
 
-def find_latest_checkpoint(model_dir: str = "models", model_prefix: str = "checkpoint_trainer") -> Optional[str]:
+def find_latest_checkpoint(model_dir: str = "models", model_prefix: str = "checkpoint_trainer") -> str | None:
     """Finds the latest checkpoint file based on episode number in filename.
 
     Uses episode number rather than modification time because:
@@ -63,7 +63,7 @@ def find_latest_checkpoint(model_dir: str = "models", model_prefix: str = "check
     return None
 
 
-def load_checkpoint(checkpoint_path: str) -> Optional[Dict[str, Any]]:
+def load_checkpoint(checkpoint_path: str) -> dict[str, Any] | None:
     """Loads a checkpoint file.
 
     Args:

@@ -7,7 +7,6 @@ import numpy as np
 import pytest
 import torch
 from momentum_agent import RainbowDQNAgent
-from momentum_env import TradingEnv, TradingEnvConfig
 from momentum_train.data import DataManager
 from momentum_train.trainer import RainbowTrainerModule
 

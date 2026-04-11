@@ -4,23 +4,21 @@ from __future__ import annotations
 
 import time
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Deque, Dict, Iterable, Optional
 
 import numpy as np
-from momentum_core.logging import get_logger
-from momentum_env.trading import PortfolioState, TradingLogic
-
+import pandas as pd
 from momentum_agent import RainbowDQNAgent
+from momentum_core.logging import get_logger
+from momentum_env.data import N_RAW_FEATURES
+from momentum_env.trading import PortfolioState, TradingLogic
 
 from .config import LiveTradingConfig
 
 LOGGER = get_logger("momentum_live.trader")
-
-from momentum_agent.constants import ACCOUNT_STATE_DIM
-from momentum_env.data import N_RAW_FEATURES, FEATURE_NAMES
 
 RAW_COLS = ("open", "high", "low", "close", "volume")
 N_DERIVED = 6
@@ -41,7 +39,7 @@ class BarData:
     timestamp: datetime
 
     @classmethod
-    def from_alpaca(cls, bar: object) -> "BarData":
+    def from_alpaca(cls, bar: object) -> BarData:
         """Create ``BarData`` from an ``alpaca-py`` bar object."""
 
         return cls(
@@ -51,7 +49,7 @@ class BarData:
             low=float(getattr(bar, "low")),
             close=float(getattr(bar, "close")),
             volume=float(getattr(bar, "volume", 0.0)),
-            timestamp=getattr(bar, "timestamp", datetime.utcnow()),
+            timestamp=getattr(bar, "timestamp", datetime.now(UTC)),
         )
 
 
@@ -60,9 +58,9 @@ class LiveFeatureNormalizer:
 
     def __init__(self, window_size: int):
         self.window_size = window_size
-        self._raw: Deque[np.ndarray] = deque(maxlen=window_size + ROLLING_WINDOW)
-        self._close_history: Deque[float] = deque(maxlen=window_size + ROLLING_WINDOW)
-        self._volume_history: Deque[float] = deque(maxlen=window_size + ROLLING_WINDOW)
+        self._raw: deque[np.ndarray] = deque(maxlen=window_size + ROLLING_WINDOW)
+        self._close_history: deque[float] = deque(maxlen=window_size + ROLLING_WINDOW)
+        self._volume_history: deque[float] = deque(maxlen=window_size + ROLLING_WINDOW)
 
     @property
     def count(self) -> int:
@@ -93,21 +91,19 @@ class LiveFeatureNormalizer:
         if T > 10:
             log_ret_10[10:] = np.log(safe_closes[10:] / safe_closes[:-10]).astype(np.float32)
 
-        import pandas as pd
-
         realized_vol = pd.Series(log_ret_1).rolling(ROLLING_WINDOW, min_periods=1).std().fillna(0).values.astype(np.float32)
         vol_mean = pd.Series(volumes).rolling(ROLLING_WINDOW, min_periods=1).mean().values
         volume_ratio = (volumes / np.where(vol_mean > 1e-20, vol_mean, 1e-20)).astype(np.float32)
-        hl_range = ((raw_arr[:, 1] - raw_arr[:, 2]) / np.where(raw_arr[:, 3] > 0, raw_arr[:, 3], 1e-20))
+        hl_range = (raw_arr[:, 1] - raw_arr[:, 2]) / np.where(raw_arr[:, 3] > 0, raw_arr[:, 3], 1e-20)
         hl_mean = pd.Series(hl_range).rolling(ROLLING_WINDOW, min_periods=1).mean().values
         hl_range_ratio = (hl_range / np.where(hl_mean > 1e-20, hl_mean, 1e-20)).astype(np.float32)
 
         derived = np.column_stack([log_ret_1, log_ret_5, log_ret_10, realized_vol, volume_ratio, hl_range_ratio])
         full = np.concatenate([raw_arr, derived], axis=1)
 
-        window = full[-self.window_size:]
+        window = full[-self.window_size :]
         result = np.zeros((self.window_size, N_TOTAL), dtype=np.float32)
-        result[-len(window):] = window
+        result[-len(window) :] = window
 
         raw_part = result[:, :N_RAW_FEATURES].copy()
         w_mean = raw_part.mean(axis=0, keepdims=True)
@@ -120,6 +116,8 @@ class LiveFeatureNormalizer:
 
 @dataclass(slots=True)
 class SymbolState:
+    """Per-symbol tracking: feature normalizer, portfolio position, and account-state computation."""
+
     symbol: str
     normalizer: LiveFeatureNormalizer
     trading_logic: TradingLogic
@@ -127,7 +125,7 @@ class SymbolState:
     prev_portfolio_value: float
     last_price: float = 0.0
 
-    def observation(self, shared_balance: float) -> Dict[str, np.ndarray]:
+    def observation(self, shared_balance: float) -> dict[str, np.ndarray]:
         account_state = self._account_state(shared_balance)
         market_window = self.normalizer.window()
         return {
@@ -191,7 +189,7 @@ class MomentumLiveTrader:
             opportunity_cost_lambda=config.opportunity_cost_lambda,
             min_trade_value=config.min_trade_value,
         )
-        self.symbol_states: Dict[str, SymbolState] = {}
+        self.symbol_states: dict[str, SymbolState] = {}
         self.trading_client = None  # Will be set by AlpacaStreamRunner
 
         # Shared account balance across all symbols
@@ -252,7 +250,7 @@ class MomentumLiveTrader:
                 state.normalizer.window_size,
             )
 
-    def process_bar(self, bar: BarData) -> Optional[Dict[str, object]]:
+    def process_bar(self, bar: BarData) -> dict[str, object] | None:
         symbol_state = self.symbol_states.get(bar.symbol)
         if symbol_state is None:
             LOGGER.debug("Received bar for untracked symbol %s", bar.symbol)
@@ -334,7 +332,8 @@ class MomentumLiveTrader:
                 if is_valid:
                     self.shared_balance = new_ps.balance
                     symbol_state.portfolio_state = PortfolioState(
-                        balance=0.0, position=new_ps.position,
+                        balance=0.0,
+                        position=new_ps.position,
                         position_price=new_ps.position_price,
                         total_transaction_cost=new_ps.total_transaction_cost,
                     )
@@ -361,7 +360,8 @@ class MomentumLiveTrader:
                 if is_valid:
                     self.shared_balance = new_ps.balance
                     symbol_state.portfolio_state = PortfolioState(
-                        balance=0.0, position=new_ps.position,
+                        balance=0.0,
+                        position=new_ps.position,
                         position_price=new_ps.position_price,
                         total_transaction_cost=new_ps.total_transaction_cost,
                     )
@@ -401,7 +401,7 @@ class MomentumLiveTrader:
                 f" filled={order_result.get('filled_quantity', 0.0):.6f}"
             )
 
-        action_label = f"target_{int(target_frac*100)}pct"
+        action_label = f"target_{int(target_frac * 100)}pct"
         LOGGER.info(
             "Decision summary | symbol=%s | ts=%s | action=%s | price=%.2f | balance=%.2f->%.2f | "
             "position=%.6f->%.6f | portfolio=%.2f->%.2f | valid=%s%s",
@@ -421,7 +421,7 @@ class MomentumLiveTrader:
 
         return decision
 
-    def _execute_order(self, symbol: str, action: str, fraction: float, price: float) -> Optional[Dict[str, object]]:
+    def _execute_order(self, symbol: str, action: str, fraction: float, price: float) -> dict[str, object] | None:
         """Execute a real order on Alpaca and return order details."""
         if not self.trading_client:
             return None
@@ -535,7 +535,10 @@ class MomentumLiveTrader:
             trade_symbol = symbol.replace("/", "") if "/" in symbol else symbol
 
             order_request = MarketOrderRequest(
-                symbol=trade_symbol, qty=quantity, side=side, time_in_force=TimeInForce.GTC  # Good 'til cancelled for crypto
+                symbol=trade_symbol,
+                qty=quantity,
+                side=side,
+                time_in_force=TimeInForce.GTC,  # Good 'til cancelled for crypto
             )
 
             LOGGER.info(
@@ -576,7 +579,7 @@ class MomentumLiveTrader:
             return None
 
     def _update_shared_portfolio_from_order(
-        self, order_result: Dict[str, object], trade_type: int, fraction: float, current_price: float
+        self, order_result: dict[str, object], trade_type: int, fraction: float, current_price: float
     ) -> bool:
         """Update shared portfolio state based on executed order."""
         try:
@@ -734,7 +737,7 @@ class MomentumLiveTrader:
         side: str,
         requested_quantity: float,
         reference_price: float,
-    ) -> Dict[str, object]:
+    ) -> dict[str, object]:
         """Normalize an Alpaca order object into a serializable dict."""
 
         order_id = getattr(order, "id", None)
@@ -786,7 +789,7 @@ class MomentumLiveTrader:
 
         return status_text
 
-    def _order_debug_snapshot(self, order) -> Dict[str, object]:
+    def _order_debug_snapshot(self, order) -> dict[str, object]:
         if order is None:
             return {}
 
@@ -815,7 +818,7 @@ class MomentumLiveTrader:
             "updated_at",
         ]
 
-        snapshot: Dict[str, object] = {}
+        snapshot: dict[str, object] = {}
         for attr in attributes:
             value = getattr(order, attr, None)
             snapshot[attr] = self._serialize_order_value(value)
@@ -850,18 +853,11 @@ class MomentumLiveTrader:
         except (TypeError, ValueError):
             return default
 
-    def _update_portfolio_from_order(
-        self, portfolio_state: PortfolioState, order_result: Dict[str, object], trade_type: int, fraction: float, current_price: float
-    ) -> tuple[PortfolioState, bool]:
-        """Legacy method - kept for compatibility but should not be used."""
-        # This method is deprecated in favor of _update_shared_portfolio_from_order
-        return portfolio_state, False
-
     def _map_action(self, action_index: int) -> tuple[str, float]:
         if action_index not in self.TARGET_ALLOCATIONS:
             raise ValueError(f"Received unsupported action index {action_index}")
         target = self.TARGET_ALLOCATIONS[action_index]
-        return f"target_{int(target*100)}pct", target
+        return f"target_{int(target * 100)}pct", target
 
 
 __all__ = ["BarData", "LiveFeatureNormalizer", "MomentumLiveTrader"]

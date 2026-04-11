@@ -1,0 +1,45 @@
+---
+description: Modern Python 3.13+ style conventions enforced by ruff UP rules
+globs: "**/*.py"
+alwaysApply: false
+---
+
+# Python Style (3.13+)
+
+## Type hints: use built-in generics
+
+```python
+# bad
+from typing import Dict, List, Optional, Tuple
+def f(items: List[str]) -> Optional[Dict[str, int]]: ...
+
+# good
+def f(items: list[str]) -> dict[str, int] | None: ...
+```
+
+## Deprecated APIs
+
+- `datetime.utcnow()` -> `datetime.now(timezone.utc)` (deprecated since 3.12)
+
+## File I/O
+
+- Always `open(path, "r", encoding="utf-8")` -- never rely on platform default encoding
+
+## Imports
+
+- Module-level only; no `import pandas` inside a method body
+- Exception: lazy imports behind `try/except ImportError` for optional deps (e.g. alpaca-py)
+
+## No side effects at import time
+
+```python
+# bad -- creates directory when any module imports this package
+LOGS_DIR = Path("logs")
+LOGS_DIR.mkdir(exist_ok=True)
+
+# good -- defer to explicit setup call
+def ensure_logs_dir() -> Path:
+    d = Path("logs")
+    d.mkdir(exist_ok=True)
+    return d
+```

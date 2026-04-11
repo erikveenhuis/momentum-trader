@@ -1,14 +1,14 @@
-[tool.black]
-line-length = 100
-target-version = ["py38"]
+[tool.ruff]
+line-length = 140
+target-version = "py313"
 
-[tool.isort]
-profile = "black"
-line_length = 100
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = ["E501", "UP038"]
 
-[tool.flake8]
-max-line-length = 100
-extend-ignore = ["E203", "W503"]
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**/*.py" = ["F841", "E501"]
+"scripts/**/*.py" = ["E402"]
 
 [tool.pytest.ini_options]
 norecursedirs = [
@@ -22,7 +22,6 @@ norecursedirs = [
 ]
 addopts = "-ra --color=yes -rP --cov=packages --cov-report=html"
 testpaths = [
-    "tests",
     "packages/momentum_core/tests",
     "packages/momentum_env/tests",
     "packages/momentum_agent/tests",

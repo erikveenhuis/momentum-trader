@@ -1,0 +1,39 @@
+---
+description: Exception handling standards -- never silently swallow errors
+globs: "**/*.py"
+alwaysApply: false
+---
+
+# Error Handling
+
+## Never swallow exceptions silently
+
+```python
+# bad
+try:
+    save_progress(record)
+except Exception:
+    pass
+
+# good
+try:
+    save_progress(record)
+except Exception:
+    logger.debug("Failed to save progress record", exc_info=True)
+```
+
+## Prefer narrow exception types
+
+Use `ValueError`, `FileNotFoundError`, `RuntimeError`, `KeyError`, etc. when the failure mode is known. Reserve `except Exception` for genuinely unknown/defensive paths.
+
+## Production-critical paths must log
+
+Order execution, checkpoint saves, and progress tracking must log at `WARNING` or `ERROR` on failure -- never silently swallow.
+
+## Always capture tracebacks
+
+Use `exc_info=True` on error-level log calls:
+
+```python
+logger.error("Checkpoint save failed: %s", exc, exc_info=True)
+```

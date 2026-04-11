@@ -1,5 +1,5 @@
 import math  # Import math for positional encoding calculation
-from typing import Any, Dict  # Added for type hinting
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -21,7 +21,7 @@ class NoisyLinear(nn.Module):
     """
 
     def __init__(self, in_features: int, out_features: int, std_init: float = 0.5, debug: bool = False):
-        super(NoisyLinear, self).__init__()
+        super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.std_init = std_init
@@ -127,8 +127,10 @@ class PositionalEncoding(nn.Module):
 
 # --- Start: Rainbow Network Definition ---
 class RainbowNetwork(nn.Module):
-    def __init__(self, config: Dict[str, Any], device: torch.device):
-        super(RainbowNetwork, self).__init__()
+    """Rainbow DQN network: Transformer encoder with CLS pooling, dueling C51 heads, and auxiliary return predictor."""
+
+    def __init__(self, config: dict[str, Any], device: torch.device):
+        super().__init__()
 
         # Extract parameters from config - NO DEFAULTS, will raise KeyError if missing
         self.window_size = config["window_size"]
@@ -178,7 +180,9 @@ class RainbowNetwork(nn.Module):
             norm_first=True,
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=self.num_encoder_layers)
-        self.account_processor = nn.Sequential(nn.Linear(ACCOUNT_STATE_DIM, self.hidden_dim // 4), nn.GELU(), nn.Dropout(self.transformer_dropout))
+        self.account_processor = nn.Sequential(
+            nn.Linear(ACCOUNT_STATE_DIM, self.hidden_dim // 4), nn.GELU(), nn.Dropout(self.transformer_dropout)
+        )
         # --- End Shared Feature Extractor ---
 
         shared_feature_dim = self.hidden_dim + self.hidden_dim // 4

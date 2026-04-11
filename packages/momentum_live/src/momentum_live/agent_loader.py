@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Optional
 
 import torch
 from momentum_agent import RainbowDQNAgent
@@ -42,7 +41,7 @@ def find_best_checkpoint(
     return best
 
 
-def _resolve_device(device: Optional[str | torch.device]) -> str:
+def _resolve_device(device: str | torch.device | None) -> str:
     if device is None:
         return "cuda" if torch.cuda.is_available() else "cpu"
     if isinstance(device, torch.device):
@@ -53,7 +52,7 @@ def _resolve_device(device: Optional[str | torch.device]) -> str:
 def load_agent_from_checkpoint(
     checkpoint_path: str | Path,
     *,
-    device: Optional[str | torch.device] = None,
+    device: str | torch.device | None = None,
 ) -> RainbowDQNAgent:
     """Instantiate and load a trained ``RainbowDQNAgent`` from a checkpoint."""
 

@@ -12,13 +12,13 @@ def test_gpu_memory():
 
     if torch.cuda.is_available():
         print(f"CUDA device: {torch.cuda.get_device_name()}")
-        print(f"CUDA memory before agent creation: {torch.cuda.memory_allocated()/1024**2:.1f} MB")
+        print(f"CUDA memory before agent creation: {torch.cuda.memory_allocated() / 1024**2:.1f} MB")
 
         config = {
             "window_size": 60,
             "n_features": 12,
             "hidden_dim": 256,
-            "num_actions": 7,
+            "num_actions": 6,
             "num_atoms": 101,
             "v_min": -10.0,
             "v_max": 10.0,
@@ -42,24 +42,24 @@ def test_gpu_memory():
         device = torch.device("cuda")
         agent = RainbowDQNAgent(config=config, device=device)
 
-        print(f"CUDA memory after agent creation: {torch.cuda.memory_allocated()/1024**2:.1f} MB")
+        print(f"CUDA memory after agent creation: {torch.cuda.memory_allocated() / 1024**2:.1f} MB")
         print(f"Model parameters: {sum(p.numel() for p in agent.network.parameters()):,}")
 
         batch_size = 512
         market_data = torch.randn(batch_size, 60, 12, device=device)
         account_state = torch.randn(batch_size, ACCOUNT_STATE_DIM, device=device)
 
-        print(f"CUDA memory before forward pass: {torch.cuda.memory_allocated()/1024**2:.1f} MB")
+        print(f"CUDA memory before forward pass: {torch.cuda.memory_allocated() / 1024**2:.1f} MB")
 
         with torch.no_grad():
             output = agent.network(market_data, account_state)
 
-        print(f"CUDA memory after forward pass: {torch.cuda.memory_allocated()/1024**2:.1f} MB")
+        print(f"CUDA memory after forward pass: {torch.cuda.memory_allocated() / 1024**2:.1f} MB")
         print(f"Output shape: {output.shape}")
 
         del agent, market_data, account_state, output
         torch.cuda.empty_cache()
-        print(f"CUDA memory after cleanup: {torch.cuda.memory_allocated()/1024**2:.1f} MB")
+        print(f"CUDA memory after cleanup: {torch.cuda.memory_allocated() / 1024**2:.1f} MB")
 
 
 if __name__ == "__main__":

@@ -6,7 +6,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
-import pytest
 from momentum_live.agent_loader import find_best_checkpoint
 from momentum_live.config import LiveTradingConfig, parse_symbols
 from momentum_live.trader import BarData, LiveFeatureNormalizer, MomentumLiveTrader

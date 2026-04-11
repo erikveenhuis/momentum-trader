@@ -14,8 +14,6 @@ from momentum_train.data import DataManager
 from momentum_train.run_training import evaluate_on_test_data
 from momentum_train.trainer import RainbowTrainerModule
 
-
-
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 

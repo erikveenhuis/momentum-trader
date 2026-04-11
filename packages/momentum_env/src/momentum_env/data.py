@@ -1,7 +1,6 @@
 """Data handling for the trading environment."""
 
 from dataclasses import dataclass
-from typing import Dict, List
 
 import numpy as np
 import pandas as pd
@@ -29,7 +28,7 @@ class MarketData:
 
     close_prices: np.ndarray
     features: np.ndarray
-    feature_names: List[str]
+    feature_names: list[str]
 
     data_length: int
     window_size: int
@@ -80,7 +79,7 @@ class MarketDataProcessor:
         raw_cols = ["open", "high", "low", "close", "volume", "transactions"]
         raw = data_df[raw_cols].values.astype(np.float32)
 
-        from scripts.data_processing.preprocess_npz import compute_derived_features
+        from momentum_env.features import compute_derived_features
 
         derived = compute_derived_features(data_df)
         features = np.concatenate([raw, derived], axis=1).astype(np.float32)
@@ -112,7 +111,7 @@ def get_observation_at_step(
     position_price: float,
     bars_in_position: int,
     cumulative_fees_frac: float,
-) -> Dict[str, np.ndarray]:
+) -> dict[str, np.ndarray]:
     """Get the observation at a specific step.
 
     Raw features (columns 0:N_RAW_FEATURES) receive window-level z-score

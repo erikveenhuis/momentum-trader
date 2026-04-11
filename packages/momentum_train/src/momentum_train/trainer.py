@@ -3,16 +3,14 @@ import os
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
 
 import numpy as np
 import torch
+from momentum_agent import RainbowDQNAgent  # Updated import path
+from momentum_agent.constants import ACCOUNT_STATE_DIM  # Import constant
 from momentum_core.logging import get_logger
 from momentum_env import TradingEnv, TradingEnvConfig  # Use installed package
 from torch.utils.tensorboard import SummaryWriter
-
-from momentum_agent import RainbowDQNAgent  # Updated import path
-from momentum_agent.constants import ACCOUNT_STATE_DIM  # Import constant
 
 from .data import DataManager  # Use relative import
 from .metrics import (  # Use relative import
@@ -25,6 +23,8 @@ logger = get_logger("Trainer")
 
 
 class RainbowTrainerModule:
+    """Orchestrates Rainbow DQN training: episode management, validation, checkpointing, and early stopping."""
+
     def __init__(
         self,
         agent: RainbowDQNAgent,
@@ -156,12 +156,12 @@ class RainbowTrainerModule:
         # Extract run parameters
         self.model_dir = self.run_config.get("model_dir", "models")
         os.makedirs(self.model_dir, exist_ok=True)
-        self._validation_env_cache: Dict[str, TradingEnv] = {}
+        self._validation_env_cache: dict[str, TradingEnv] = {}
         self._abort_training = False
         self._abort_reason: str | None = None
         self._abort_step: int | None = None
 
-    def should_stop_early(self, validation_metrics: List[dict]) -> bool:
+    def should_stop_early(self, validation_metrics: list[dict]) -> bool:
         """Check if training should stop early based on validation performance."""
         # Early stopping logic now happens directly in the validate() method
         # based on validation_score compared to self.best_validation_metric.
@@ -218,10 +218,10 @@ class RainbowTrainerModule:
         }
         record.update(kwargs)
         try:
-            with open(self._progress_path, "a") as f:
+            with open(self._progress_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, default=str) + "\n")
         except Exception:
-            pass
+            logger.debug("Failed to append progress record", exc_info=True)
 
     def _save_checkpoint(
         self,
@@ -328,18 +328,18 @@ class RainbowTrainerModule:
 
     def _initialize_episode(
         self, specific_file: str | None, episode: int, num_episodes: int
-    ) -> Tuple[TradingEnv | None, dict | None, dict | None, PerformanceTracker | None]:
+    ) -> tuple[TradingEnv | None, dict | None, dict | None, PerformanceTracker | None]:
         """Sets up the environment and performance tracker for a new episode. Returns env, obs, info, tracker."""
         try:
             curriculum_frac = min(1.0, 0.3 + 0.7 * (episode / max(num_episodes, 1)))
             episode_file_path = (
-                Path(specific_file)
-                if specific_file
-                else self.data_manager.get_random_training_file(curriculum_frac=curriculum_frac)
+                Path(specific_file) if specific_file else self.data_manager.get_random_training_file(curriculum_frac=curriculum_frac)
             )
-            logger.info(f"--- Starting Episode {episode + 1}/{num_episodes} using file: {episode_file_path.name} (curriculum={curriculum_frac:.2f}) ---")
+            logger.info(
+                f"--- Starting Episode {episode + 1}/{num_episodes} using file: {episode_file_path.name} (curriculum={curriculum_frac:.2f}) ---"
+            )
         except Exception as e:
-            logger.error(f"Error getting data file for episode {episode+1}: {e}")
+            logger.error(f"Error getting data file for episode {episode + 1}: {e}")
             return None, None, None, None  # Indicate failure
 
         try:
@@ -380,7 +380,7 @@ class RainbowTrainerModule:
         total_train_steps: int,
         episode: int,
         steps_in_episode: int,
-    ) -> Tuple[dict, float, bool, dict, int, float | None]:
+    ) -> tuple[dict, float, bool, dict, int, float | None]:
         """Performs a single step of interaction with the environment and learning."""
         loss_value = None  # Initialize loss_value
 
@@ -589,11 +589,7 @@ class RainbowTrainerModule:
         total_train_steps: int,
     ) -> bool:
         """Apply a one-time LR decay near the end of training if configured."""
-        if (
-            self.final_phase_lr_start_frac is None
-            or self.final_phase_lr_multiplier is None
-            or self._final_phase_lr_applied
-        ):
+        if self.final_phase_lr_start_frac is None or self.final_phase_lr_multiplier is None or self._final_phase_lr_applied:
             return False
 
         try:
@@ -694,7 +690,7 @@ class RainbowTrainerModule:
         metrics = tracker.get_metrics()
         logger.info(f"  Metrics - Total Return: {metrics.get('total_return', np.nan):.2f}%" if metrics else "Metrics: N/A")
         logger.info(f"  Metrics - Sharpe Ratio: {metrics.get('sharpe_ratio', np.nan):.4f}" if metrics else "Metrics: N/A")
-        logger.info(f"  Metrics - Max Drawdown: {metrics.get('max_drawdown', np.nan)*100:.2f}%" if metrics else "Metrics: N/A")
+        logger.info(f"  Metrics - Max Drawdown: {metrics.get('max_drawdown', np.nan) * 100:.2f}%" if metrics else "Metrics: N/A")
         logger.info(f"  Metrics - Action Counts: {metrics.get('action_counts', {})}" if metrics else "Metrics: N/A")
         logger.info(f"  Metrics - Transaction Costs: ${metrics.get('transaction_costs', np.nan):.2f}" if metrics else "Metrics: N/A")
         if metrics:
@@ -770,7 +766,7 @@ class RainbowTrainerModule:
         self,
         episode: int,
         total_train_steps: int,
-        val_files: List[Path],
+        val_files: list[Path],
         tracker: PerformanceTracker,
     ) -> bool:
         """Handles validation runs and checkpoint saving. Returns True if training should stop."""
@@ -890,9 +886,7 @@ class RainbowTrainerModule:
             # ---------------------------------------------------- #
 
             if should_stop_training and self.early_stopping_counter < self.early_stopping_patience:
-                logger.info(
-                    "[EarlyStopping] Counter reset after scheduler step; deferring stop to observe reduced learning rate."
-                )
+                logger.info("[EarlyStopping] Counter reset after scheduler step; deferring stop to observe reduced learning rate.")
                 should_stop_training = False
 
             # Save checkpoint AFTER validation
@@ -989,7 +983,7 @@ class RainbowTrainerModule:
     # --- END Refactored Helper Methods ---
 
     # --- Added Evaluation Step Helper ---
-    def _perform_evaluation_step(self, env: TradingEnv, obs: dict) -> Tuple[dict, float, bool, dict, int, bool]:  # Added boolean error flag
+    def _perform_evaluation_step(self, env: TradingEnv, obs: dict) -> tuple[dict, float, bool, dict, int, bool]:
         """Performs a single step of evaluation in the environment. Returns (next_obs, reward, done, info, action, error_occurred)."""
         try:
             action = self.agent.select_action(obs)
@@ -1037,7 +1031,7 @@ class RainbowTrainerModule:
 
     def _run_single_evaluation_episode(
         self, env: TradingEnv, context: str = "validation", *, close_env: bool = True
-    ) -> Tuple[float, dict, dict]:
+    ) -> tuple[float, dict, dict]:
         """Evaluate the agent for one episode on a given environment instance."""
         # Removed assert isinstance(env, TradingEnv) because it fails when TradingEnv is patched in tests
         # assert isinstance(
@@ -1205,7 +1199,7 @@ class RainbowTrainerModule:
             logger.debug(f"    Portfolio Value: ${file_metrics.get('portfolio_value', np.nan):.2f}")  # Use .get()
             logger.debug(f"    Total Return: {file_metrics.get('total_return', np.nan):.2f}%")
             logger.debug(f"    Sharpe Ratio: {file_metrics.get('sharpe_ratio', np.nan):.4f}")
-            logger.debug(f"    Max Drawdown: {file_metrics.get('max_drawdown', np.nan)*100:.2f}%")
+            logger.debug(f"    Max Drawdown: {file_metrics.get('max_drawdown', np.nan) * 100:.2f}%")
             logger.debug(f"    Action Counts: {file_metrics.get('action_counts', {})}")
             logger.debug(f"    Transaction Costs: ${file_metrics.get('transaction_costs', np.nan):.2f}")
             logger.debug(f"    Avg Exposure: {file_metrics.get('avg_exposure_pct', np.nan):.2f}%")
@@ -1289,7 +1283,7 @@ class RainbowTrainerModule:
                 logger.warning(f"Failed to close cached environment {env_key}: {exc}")
         self._validation_env_cache.clear()
 
-    def _calculate_average_validation_metrics(self, all_file_metrics: List[dict]) -> dict:
+    def _calculate_average_validation_metrics(self, all_file_metrics: list[dict]) -> dict:
         """Calculates average metrics across all validation files."""
         if not all_file_metrics:
             logger.warning("No file metrics available to calculate averages.")
@@ -1330,7 +1324,7 @@ class RainbowTrainerModule:
             "avg_position_value": float(np.nanmean(avg_position_values)),
         }
 
-    def _save_validation_results(self, validation_score: float, avg_metrics: dict, detailed_results: List[dict]):
+    def _save_validation_results(self, validation_score: float, avg_metrics: dict, detailed_results: list[dict]):
         """Saves the validation results to a JSON file."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         results_file = Path(self.model_dir) / f"validation_results_{timestamp}.json"
@@ -1341,7 +1335,7 @@ class RainbowTrainerModule:
                 "average_metrics": avg_metrics,
                 "detailed_results": detailed_results,
             }
-            with open(results_file, "w") as f:
+            with open(results_file, "w", encoding="utf-8") as f:
                 json.dump(json_results, f, indent=4)
             logger.info(f"Validation results saved to {results_file}")
         except Exception as e:
@@ -1371,7 +1365,7 @@ class RainbowTrainerModule:
 
     # --- End Validation Helper Methods ---
 
-    def validate(self, val_files: List[Path]) -> Tuple[bool, float, dict]:  # MODIFIED: Added dict for avg_metrics
+    def validate(self, val_files: list[Path]) -> tuple[bool, float, dict]:
         """Run validation on validation files using helper methods, log, and check for early stopping."""
 
         # Handle empty validation file list
@@ -1424,7 +1418,7 @@ class RainbowTrainerModule:
             logger.info(f"  Average Portfolio: ${avg_metrics['portfolio_value']:.2f}")
             logger.info(f"  Average Return: {avg_metrics['total_return']:.2f}%")
             logger.info(f"  Average Sharpe: {avg_metrics['sharpe_ratio']:.4f}")
-            logger.info(f"  Average Max Drawdown: {avg_metrics['max_drawdown']*100:.2f}%")
+            logger.info(f"  Average Max Drawdown: {avg_metrics['max_drawdown'] * 100:.2f}%")
             logger.info(f"Average Transaction Costs: ${avg_metrics['transaction_costs']:.2f}")
             logger.info(f"Average Exposure: {avg_metrics['avg_exposure_pct']:.2f}%")
             logger.info(f"Average Max Exposure: {avg_metrics['max_exposure_pct']:.2f}%")
@@ -1520,7 +1514,7 @@ class RainbowTrainerModule:
             logger.info(f"Action stats - Avg: {avg_action:.3f}, Min: {min_action:.3f}, Max: {max_action:.3f}")
             logger.info(f"Action Counts: {action_counts}")  # Log the counts dict
             logger.info(f"Sharpe Ratio: {metrics.get('sharpe_ratio', np.nan):.4f}")
-            logger.info(f"Max Drawdown: {metrics.get('max_drawdown', np.nan)*100:.2f}%")
+            logger.info(f"Max Drawdown: {metrics.get('max_drawdown', np.nan) * 100:.2f}%")
             logger.info(f"Total Transaction Costs: ${metrics.get('transaction_costs', 0.0):.2f}")
 
             # Portfolio vs Price Growth Comparison needs more data in metrics
@@ -1548,7 +1542,7 @@ class RainbowTrainerModule:
         tracker: PerformanceTracker,
         episode: int,
         total_train_steps: int,
-    ) -> Tuple[float, float, int, int, dict, int]:  # Added int for invalid count
+    ) -> tuple[float, float, int, int, dict, int]:
         """Runs the steps within a single training episode using _perform_training_step."""
         done = False
         obs = initial_obs
@@ -1594,7 +1588,6 @@ class RainbowTrainerModule:
             obs = next_obs
             steps_in_episode += 1
             total_train_steps += 1
-
 
             # Log PER statistics based on total training steps
             self._maybe_log_per_stats(total_train_steps)
@@ -1681,7 +1674,7 @@ class RainbowTrainerModule:
                 # 1. Initialize episode environment and tracker
                 episode_env, initial_obs, initial_info, tracker = self._initialize_episode(specific_file, episode, num_episodes)
                 if episode_env is None or tracker is None:
-                    logger.error(f"Failed to initialize episode {episode+1}. Skipping.")
+                    logger.error(f"Failed to initialize episode {episode + 1}. Skipping.")
                     continue  # Skip to next episode
 
                 # 2. Run steps within the episode
