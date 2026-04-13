@@ -76,7 +76,7 @@ def load_agent_from_checkpoint(
         raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
 
     LOGGER.info("Loading checkpoint %s", checkpoint_path)
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     # Try different config key names
     agent_config = None

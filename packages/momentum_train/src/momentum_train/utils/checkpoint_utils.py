@@ -78,8 +78,9 @@ def load_checkpoint(checkpoint_path: str) -> dict[str, Any] | None:
 
     logger.info(f"Attempting to load checkpoint: {checkpoint_path}")
     try:
-        # Load to CPU first to avoid GPU memory issues if loading on different device
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        # Load to CPU first to avoid GPU memory issues if loading on different device.
+        # weights_only=False: PyTorch>=2.6 defaults True; trainer checkpoints pickle buffer objects (e.g. Experience).
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
         # Basic validation of checkpoint structure
         required_keys = [

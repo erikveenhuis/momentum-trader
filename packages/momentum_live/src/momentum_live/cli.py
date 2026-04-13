@@ -96,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
             from momentum_agent import RainbowDQNAgent
 
             # Extract agent config from checkpoint for fresh agent
-            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
             for config_key in ["agent_config", "config"]:
                 if config_key in checkpoint:
                     agent_config = checkpoint[config_key]

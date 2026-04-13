@@ -1316,7 +1316,7 @@ class RainbowDQNAgent:
         try:
             logger.info(f"Attempting to load unified agent checkpoint from: {checkpoint_path}")
             # Ensure map_location is correctly set, especially if loading a CUDA-trained model on CPU
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 
             # Load network and target network
             if "network_state_dict" in checkpoint and self.network is not None:
