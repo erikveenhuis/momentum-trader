@@ -43,8 +43,8 @@ def test_trainer_runs_episodes_and_logs_progress(tmp_path):
         "replay_buffer_size": 500,
         "target_update_freq": 10,
         "num_atoms": 51,
-        "v_min": -10.0,
-        "v_max": 10.0,
+        "v_min": -1.0,
+        "v_max": 1.0,
         "alpha": 0.6,
         "beta_start": 0.4,
         "beta_frames": 100,
@@ -60,6 +60,10 @@ def test_trainer_runs_episodes_and_logs_progress(tmp_path):
         "grad_clip_norm": 1.0,
         "polyak_tau": 0.005,
         "store_partial_n_step": True,
+        "epsilon_start": 0.3,
+        "epsilon_end": 0.01,
+        "epsilon_decay_steps": 1000,
+        "entropy_coeff": 0.03,
     }
 
     config = {
@@ -73,6 +77,7 @@ def test_trainer_runs_episodes_and_logs_progress(tmp_path):
             "drawdown_penalty_lambda": 0.5,
             "slippage_bps": 5.0,
             "opportunity_cost_lambda": 0.1,
+            "benchmark_allocation_frac": 0.5,
             "min_rebalance_pct": 0.02,
             "min_trade_value": 1.0,
         },

@@ -26,6 +26,7 @@ def trading_logic():
         slippage_bps=5.0,
         opportunity_cost_lambda=0.1,
         min_trade_value=1.0,
+        benchmark_allocation_frac=0.5,
     )
 
 

@@ -29,6 +29,7 @@ class TradingLogic:
         slippage_bps: float,
         opportunity_cost_lambda: float,
         min_trade_value: float,
+        benchmark_allocation_frac: float,
     ) -> None:
         self.transaction_fee = transaction_fee
         self.reward_scale = reward_scale
@@ -37,6 +38,7 @@ class TradingLogic:
         self.slippage_bps = slippage_bps
         self.opportunity_cost_lambda = opportunity_cost_lambda
         self.min_trade_value: float = min_trade_value
+        self.benchmark_allocation_frac = benchmark_allocation_frac
         self.peak_portfolio_value: float = 0.0
 
     def handle_buy(
@@ -198,7 +200,7 @@ class TradingLogic:
         price_return: float,
         position_fraction: float,
     ) -> float:
-        """Risk-adjusted reward with opportunity cost for uninvested capital.
+        """Benchmark-relative reward: rewards excess return over a fixed-allocation baseline.
 
         Args:
             price_return: The asset's price return this step (close_t / close_{t-1} - 1).
@@ -217,7 +219,9 @@ class TradingLogic:
         else:
             trade_return = 0.0
 
-        pnl_reward = self.reward_scale * (market_return + trade_return)
+        benchmark_return = self.benchmark_allocation_frac * price_return
+        excess_return = (market_return + trade_return) - benchmark_return
+        pnl_reward = self.reward_scale * excess_return
 
         self.peak_portfolio_value = max(self.peak_portfolio_value, post_trade_portfolio_value)
         drawdown = 0.0

@@ -76,6 +76,7 @@ def test_momentum_live_trader_process_bar_returns_decision():
         drawdown_penalty_lambda=0.0,
         slippage_bps=0.0,
         opportunity_cost_lambda=0.0,
+        benchmark_allocation_frac=0.5,
         min_rebalance_pct=0.02,
         min_trade_value=1.0,
         models_dir="models",

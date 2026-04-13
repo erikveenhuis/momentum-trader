@@ -8,7 +8,7 @@ import sys
 
 from momentum_core.logging import get_logger, setup_package_logging
 
-from .agent_loader import find_best_checkpoint, load_agent_from_checkpoint
+from .agent_loader import find_best_checkpoint, load_agent_from_checkpoint, resolve_live_device
 from .alpaca_stream import AlpacaStreamRunner
 from .config import AlpacaCredentials, LiveTradingConfig, parse_symbols
 from .trader import MomentumLiveTrader
@@ -40,6 +40,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--drawdown-penalty-lambda", type=float, required=True, help="Drawdown penalty weight")
     parser.add_argument("--slippage-bps", type=float, required=True, help="Slippage in basis points")
     parser.add_argument("--opportunity-cost-lambda", type=float, required=True, help="Opportunity cost weight")
+    parser.add_argument("--benchmark-allocation-frac", type=float, required=True, help="Benchmark allocation for relative reward")
     parser.add_argument("--min-rebalance-pct", type=float, required=True, help="Min allocation delta to trigger trade")
     parser.add_argument("--min-trade-value", type=float, required=True, help="Min trade notional in USD")
     parser.add_argument("--location", default=None, help="Alpaca crypto data feed location")
@@ -65,6 +66,7 @@ def main(argv: list[str] | None = None) -> int:
             drawdown_penalty_lambda=args.drawdown_penalty_lambda,
             slippage_bps=args.slippage_bps,
             opportunity_cost_lambda=args.opportunity_cost_lambda,
+            benchmark_allocation_frac=args.benchmark_allocation_frac,
             min_rebalance_pct=args.min_rebalance_pct,
             min_trade_value=args.min_trade_value,
             models_dir=args.models_dir,
@@ -117,8 +119,8 @@ def main(argv: list[str] | None = None) -> int:
                     "transformer_dropout": 0.2,
                     "n_steps": 3,
                     "num_atoms": 101,
-                    "v_min": -10.0,
-                    "v_max": 10.0,
+                    "v_min": -1.0,
+                    "v_max": 1.0,
                     "alpha": 0.6,
                     "beta_start": 0.5,
                     "beta_frames": 1000000,
@@ -126,11 +128,21 @@ def main(argv: list[str] | None = None) -> int:
                     "lr_scheduler_type": "ReduceLROnPlateau",
                     "lr_scheduler_params": {"mode": "max", "factor": 0.1, "patience": 5, "threshold": 0.0001, "min_lr": 1e-06},
                     "grad_clip_norm": 1.0,
+                    "epsilon_start": 0.0,
+                    "epsilon_end": 0.0,
+                    "epsilon_decay_steps": 1,
+                    "entropy_coeff": 0.0,
                     "debug": False,
                     "seed": 42,
                 }
 
-            agent = RainbowDQNAgent(config=agent_config, device="cuda" if torch.cuda.is_available() else "cpu", scaler=None)
+            live_device = resolve_live_device(None)
+            agent = RainbowDQNAgent(
+                config=agent_config,
+                device=live_device,
+                scaler=None,
+                inference_only=True,
+            )
             logger.info(f"Created fresh agent with {sum(p.numel() for p in agent.network.parameters()):,} parameters")
 
         trader = MomentumLiveTrader(agent=agent, config=trading_config)

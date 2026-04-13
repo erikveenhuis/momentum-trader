@@ -188,6 +188,7 @@ class MomentumLiveTrader:
             slippage_bps=config.slippage_bps,
             opportunity_cost_lambda=config.opportunity_cost_lambda,
             min_trade_value=config.min_trade_value,
+            benchmark_allocation_frac=config.benchmark_allocation_frac,
         )
         self.symbol_states: dict[str, SymbolState] = {}
         self.trading_client = None  # Will be set by AlpacaStreamRunner

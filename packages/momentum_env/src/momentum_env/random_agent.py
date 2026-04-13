@@ -33,6 +33,7 @@ def main():
             drawdown_penalty_lambda=0.5,
             slippage_bps=5.0,
             opportunity_cost_lambda=0.1,
+            benchmark_allocation_frac=0.5,
             min_rebalance_pct=0.02,
             min_trade_value=1.0,
         ),

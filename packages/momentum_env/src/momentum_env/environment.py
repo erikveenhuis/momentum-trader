@@ -39,6 +39,7 @@ class TradingEnv(gym.Env):
             slippage_bps=config.slippage_bps,
             opportunity_cost_lambda=config.opportunity_cost_lambda,
             min_trade_value=config.min_trade_value,
+            benchmark_allocation_frac=config.benchmark_allocation_frac,
         )
         self.min_rebalance_pct = config.min_rebalance_pct
 

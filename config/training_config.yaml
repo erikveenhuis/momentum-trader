@@ -19,7 +19,7 @@ logging:
 agent:
   # Core RL params
   gamma: 0.99           # Increased from 0.95; minute-scale trades still care about future bars
-  lr: 0.0003            # Reduced from 5e-4; more stable with large batch + Polyak updates
+  lr: 0.0001            # Reduced from 3e-4; previous run showed policy churn from overshooting
   batch_size: 8192      # Reduced from 16384; better PER prioritization, still GPU-saturating
   replay_buffer_size: 1000000  # Doubled from 500k; more diverse replay with 24k training files
   target_update_freq: 1000     # Logging frequency only (Polyak updates every step regardless)
@@ -39,8 +39,8 @@ agent:
   # Rainbow params
   n_steps: 3            # Reduced from 5; shorter horizon for minute-scale momentum trades
   num_atoms: 101
-  v_min: -10.0
-  v_max: 10.0
+  v_min: -1.0
+  v_max: 1.0
   categorical_logging_interval: 2000
   categorical_logging_percentiles: [5, 25, 50, 75, 95]
   alpha: 0.6            # PER priority exponent
@@ -54,9 +54,17 @@ agent:
     T_max: 500000       # Cosine period in learner steps (~full training run)
     eta_min: 0.00001    # Floor LR
 
+  # Exploration (epsilon-greedy on top of NoisyNets)
+  epsilon_start: 0.3    # Initial random action probability; NoisyNets alone collapse to constant action
+  epsilon_end: 0.05     # Floor epsilon after annealing (higher floor for long-run exploration)
+  epsilon_decay_steps: 2000000  # Anneal over this many env steps (post-warmup)
+
+  # Action entropy regularization
+  entropy_coeff: 0.0    # Disabled; benchmark-relative reward structurally prevents action collapse
+
   # Other agent params
   grad_clip_norm: 1.0
-  polyak_tau: 0.005
+  polyak_tau: 0.001     # Reduced from 0.005; more inertia in target network for stable bootstraps
   store_partial_n_step: true
   debug: false
 
@@ -64,11 +72,12 @@ environment:
   window_size: 60
   initial_balance: 1000.0
   transaction_fee: 0.001
-  reward_scale: 1.0         # Reduced from 10; keeps n-step returns well within C51 support [-10,10]
+  reward_scale: 1.0         # Per-step rewards O(1e-4 to 1e-3); n-step returns well within C51 support [-1, 1]
   invalid_action_penalty: -0.1   # Slightly stronger signal for masked-but-still-penalized actions
-  drawdown_penalty_lambda: 0.5
+  drawdown_penalty_lambda: 0.3   # Midpoint: 0.5 caused death spirals, 0.15 caused action collapse to 100% exposure
   slippage_bps: 5.0
-  opportunity_cost_lambda: 0.1  # Penalizes holding cash when asset moves; scales with abs(price_return) * cash_fraction
+  opportunity_cost_lambda: 0.0   # Disabled; subsumed by benchmark-relative reward
+  benchmark_allocation_frac: 0.5  # Reward = excess return over this fixed allocation; prevents action collapse
   min_rebalance_pct: 0.02      # Minimum allocation delta to trigger a trade (2% of portfolio)
   min_trade_value: 1.0         # Minimum trade notional in USD (Alpaca crypto minimum)
 
@@ -79,14 +88,15 @@ trainer:
   seed: 42
   warmup_steps: 20000       # With action masking, warmup produces cleaner transitions
   update_freq: 20           # Learn every 20 env steps (~20 min of bars); more diverse recent experience
-  gradient_updates_per_step: 3  # 3 gradient updates per trigger; 216 updates per 1440-bar episode
+  gradient_updates_per_step: 1  # Reduced from 3; lower effective step size to prevent policy churn
   log_freq: 60
   per_stats_log_freq: 0
-  validation_freq: 50       # Increased from 20; less validation overhead, each validates 246 files
+  validation_freq: 200      # Less frequent validation; avoids judging a still-learning policy too often
   checkpoint_save_freq: 50
   reward_window: 20
-  reward_clip: 5.0          # Tighter clip to match reward_scale=1 and C51 support
-  early_stopping_patience: 6  # Increased from 4; more patience with cosine LR
+  reward_clip: 0.5          # Clip to match C51 support [-1, 1]; per-step rewards are O(1e-4) to O(1e-3)
+  min_episodes_before_early_stopping: 5000  # Defer best-tracking and early stopping until meaningful training
+  early_stopping_patience: 12  # Increased from 6; more runway for slow convergence
   final_phase_lr_start_frac: 0.85  # Later start since cosine already decays smoothly
   final_phase_lr_multiplier: 0.3
   min_validation_threshold: 0.001

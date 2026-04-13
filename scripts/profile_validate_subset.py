@@ -285,7 +285,7 @@ def run(args: argparse.Namespace) -> dict[str, dict]:
         }
         with profile(**profiler_kwargs) as torch_prof:
             try:
-                _, validation_score, avg_metrics = trainer.validate(validation_subset)
+                _, validation_score, avg_metrics = trainer.validate(validation_subset, episode=10**9)
             finally:
                 trainer.close_cached_environments()
         timings["validation"] = time.perf_counter() - validation_start
@@ -301,7 +301,7 @@ def run(args: argparse.Namespace) -> dict[str, dict]:
         torch_profiler_summary = torch_prof.key_averages().table(sort_by=sort_key, row_limit=row_limit)
     else:
         try:
-            _, validation_score, avg_metrics = trainer.validate(validation_subset)
+            _, validation_score, avg_metrics = trainer.validate(validation_subset, episode=10**9)
         finally:
             timings["validation"] = time.perf_counter() - validation_start
             trainer.close_cached_environments()

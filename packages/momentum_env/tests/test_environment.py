@@ -52,6 +52,7 @@ def profitable_trading_env(tmp_path):
         drawdown_penalty_lambda=0.0,
         slippage_bps=0.0,
         opportunity_cost_lambda=0.0,
+        benchmark_allocation_frac=0.5,
         min_rebalance_pct=0.02,
         min_trade_value=1.0,
     )
@@ -74,6 +75,7 @@ def trading_env(sample_data, tmp_path):
         drawdown_penalty_lambda=0.0,
         slippage_bps=0.0,
         opportunity_cost_lambda=0.0,
+        benchmark_allocation_frac=0.5,
         min_rebalance_pct=0.02,
         min_trade_value=1.0,
     )
@@ -161,7 +163,7 @@ def test_all_actions_valid(trading_env):
     for action in range(NUM_ACTIONS):
         trading_env.reset()
         obs, reward, term, trunc, info = trading_env.step(action)
-        assert not info.get("invalid_action", False), f"Action {action} ({TARGET_ALLOCATIONS[action]*100}%) was invalid"
+        assert not info.get("invalid_action", False), f"Action {action} ({TARGET_ALLOCATIONS[action] * 100}%) was invalid"
 
 
 def test_hold_target_no_trade(trading_env):

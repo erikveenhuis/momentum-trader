@@ -29,8 +29,8 @@ def default_config():
         "batch_size": 4,  # Small batch size for tests
         "target_update_freq": 5,  # Frequent updates for testing
         "num_atoms": 51,
-        "v_min": -10,
-        "v_max": 10,
+        "v_min": -1,
+        "v_max": 1,
         "alpha": 0.6,
         "beta_start": 0.4,
         "beta_frames": 100,  # Short annealing for tests
@@ -41,6 +41,10 @@ def default_config():
         "num_actions": 3,  # e.g., Hold, Buy, Sell
         "debug": True,  # Enable debug checks
         "grad_clip_norm": 10.0,
+        "epsilon_start": 0.3,
+        "epsilon_end": 0.01,
+        "epsilon_decay_steps": 1000,
+        "entropy_coeff": 0.03,
         # Add missing network params required by RainbowNetwork
         "transformer_nhead": 2,  # Value from test_model config
         "transformer_layers": 1,  # Value from test_model config
@@ -123,6 +127,21 @@ def test_select_action(agent, default_config):
     assert isinstance(action_eval, int)
     assert 0 <= action_eval < default_config["num_actions"]
     assert agent.network.training is False  # Should be in eval mode
+
+
+@pytest.mark.unit
+def test_inference_only_cpu_forward(default_config):
+    """Live path: CPU + inference_only skips compile and runs ``select_action``."""
+    cfg = dict(default_config)
+    agent = RainbowDQNAgent(cfg, device="cpu", inference_only=True)
+    agent.set_training_mode(False)
+    obs = generate_dummy_observation(cfg)
+    action = agent.select_action(obs)
+    assert isinstance(action, int)
+    assert 0 <= action < cfg["num_actions"]
+    assert agent.device.type == "cpu"
+    net = getattr(agent.network, "_orig_mod", agent.network)
+    assert isinstance(net, RainbowNetwork)
 
 
 @pytest.mark.unit
@@ -489,6 +508,8 @@ def test_load_state_dict_path(agent, default_config, tmp_path):
     success = new_agent.load_state(checkpoint)
     assert success
     assert new_agent.total_steps == 99
+
+
 # or edge cases in PER interaction.
 
 # Note: Testing the numerical correctness of _project_target_distribution

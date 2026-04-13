@@ -18,6 +18,7 @@ def _create_minimal_trainer(tmp_path) -> RainbowTrainerModule:
     trainer.best_trainer_checkpoint_base_path = str(tmp_path / "best_checkpoint")
     trainer.writer = None
     trainer.reward_window = 10
+    trainer.min_episodes_before_early_stopping = 0
     trainer.agent = SimpleNamespace(lr_scheduler_enabled=False)
     return trainer
 
@@ -71,14 +72,14 @@ def test_validate_aggregates_metrics_and_writes_results(tmp_path, monkeypatch):
 
     trainer._save_validation_results = capture_save.__get__(trainer, RainbowTrainerModule)
 
-    def record_early_stopping(score):
+    def record_early_stopping(score, episode=0):
         trainer.best_validation_metric = score
         trainer.early_stopping_counter = 0
         return False
 
     trainer._check_early_stopping = record_early_stopping
 
-    should_stop, validation_score, avg_metrics = trainer.validate([Path("file1.csv"), Path("file2.csv")])
+    should_stop, validation_score, avg_metrics = trainer.validate([Path("file1.csv"), Path("file2.csv")], episode=0)
 
     assert not should_stop
     assert validation_score == pytest.approx(np.mean(episode_scores))
@@ -113,12 +114,12 @@ def test_handle_validation_and_checkpointing_triggers_best_checkpoint(tmp_path):
 
     trainer._save_checkpoint = capture_save.__get__(trainer, RainbowTrainerModule)
 
-    def fake_validate(self, val_files):
+    def fake_validate(self, val_files, episode=0):
         # Update best_validation_metric to simulate the real validate() behavior
         trainer.best_validation_metric = 0.5
         return False, 0.5, {"avg_reward": 1.0}
 
-    def record_early_stopping(score):
+    def record_early_stopping(score, episode=0):
         trainer.best_validation_metric = score
         trainer.early_stopping_counter = 0
         return False

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61.0,<82"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -24,6 +24,8 @@ dependencies = [
     "momentum_env==0.2.0",
     "momentum-core==0.1.0",
     "tensorboard==2.20.0",
+    # TensorBoard 2.20 imports pkg_resources, which was removed in setuptools>=82.
+    "setuptools<82",
 ]
 
 [project.optional-dependencies]

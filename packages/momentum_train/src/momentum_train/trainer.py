@@ -63,6 +63,20 @@ class RainbowTrainerModule:
         logger.info(f"Training progress log: {self._progress_path}")
         self.early_stopping_patience = self.trainer_config.get("early_stopping_patience", 10)
         self.early_stopping_counter = 0
+        raw_min_eps_before_stop = self.trainer_config.get("min_episodes_before_early_stopping", 0)
+        try:
+            self.min_episodes_before_early_stopping = max(0, int(raw_min_eps_before_stop))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid min_episodes_before_early_stopping value %s; using 0 (early stopping may begin immediately).",
+                raw_min_eps_before_stop,
+            )
+            self.min_episodes_before_early_stopping = 0
+        if self.min_episodes_before_early_stopping > 0:
+            logger.info(
+                "Early stopping and best-validation tracking deferred until at least %d training episodes complete.",
+                self.min_episodes_before_early_stopping,
+            )
         self.min_validation_threshold = self.trainer_config.get("min_validation_threshold", -np.inf)
         self.validation_freq = self.trainer_config.get("validation_freq", 10)
         self.checkpoint_save_freq = self.trainer_config.get("checkpoint_save_freq", 10)
@@ -249,6 +263,7 @@ class RainbowTrainerModule:
             # --- ADDED Agent State ---
             "agent_config": self.agent.config,
             "agent_total_steps": self.agent.total_steps,
+            "agent_env_steps": self.agent.env_steps,
             "total_steps": self.agent.total_steps,
             "network_state_dict": self.agent.network.state_dict() if self.agent.network is not None else None,
             "target_network_state_dict": (self.agent.target_network.state_dict() if self.agent.target_network is not None else None),
@@ -392,6 +407,7 @@ class RainbowTrainerModule:
         if total_train_steps < self.warmup_steps:
             action = env.action_space.sample()
         else:
+            self.agent.env_steps = total_train_steps - self.warmup_steps
             action = self.agent.select_action(obs)
 
         # Step environment
@@ -453,7 +469,7 @@ class RainbowTrainerModule:
                     exc_info=True,
                 )
                 done = True
-                reward = -10.0
+                reward = -1.0
                 next_obs = obs
                 info = self._get_fallback_info(obs, info if "info" in locals() else {})
 
@@ -489,6 +505,9 @@ class RainbowTrainerModule:
                         if td_stats:
                             self.writer.add_scalar("Train/TD_Error_Mean", td_stats.get("mean", float("nan")), total_train_steps)
                             self.writer.add_scalar("Train/TD_Error_Std", td_stats.get("std", float("nan")), total_train_steps)
+                        last_entropy = getattr(self.agent, "last_entropy", None)
+                        if last_entropy is not None:
+                            self.writer.add_scalar("Train/Action_Entropy", last_entropy, total_train_steps)
                     # ---------------------------- #
 
             except FloatingPointError as exc:
@@ -757,6 +776,7 @@ class RainbowTrainerModule:
             self.writer.add_scalar("Train/Final Position", final_info.get("position", np.nan), episode)
             self.writer.add_scalar("Train/Invalid Action Rate", invalid_action_rate, episode)
             self.writer.add_scalar("Train/Rolling Invalid Action Rate", rolling_invalid_rate, episode)
+            self.writer.add_scalar("Train/Epsilon", self.agent.current_epsilon, episode)
         # ------------------------------------------ #
 
         # Always log PER stats at episode boundaries (unless explicitly disabled)
@@ -784,7 +804,7 @@ class RainbowTrainerModule:
             try:
                 logger.info(f"--- Running validation after episode {episode + 1} ---")
                 # MODIFIED: Capture avg_val_metrics
-                should_stop_training, validation_score, avg_val_metrics = self.validate(val_files)
+                should_stop_training, validation_score, avg_val_metrics = self.validate(val_files, episode)
             except Exception as e:
                 logger.error(f"Exception during validation after episode {episode}: {e}", exc_info=True)
                 should_stop_training = False  # Don't stop on validation error
@@ -800,7 +820,12 @@ class RainbowTrainerModule:
             # MODIFIED: Corrected is_best determination
             # An improvement is "best" if it's better than the old best by at least the threshold.
             # self.best_validation_metric has already been updated by validate() if validation_score was strictly > old_best_validation_metric.
-            if validation_score > old_best_validation_metric + self.min_validation_threshold:
+            # During min_episodes_before_early_stopping, validate() does not update best; force is_best False so we do not save misleading "best" checkpoints.
+            completed_episodes = episode + 1
+            eligible_for_best = (
+                self.min_episodes_before_early_stopping <= 0 or completed_episodes >= self.min_episodes_before_early_stopping
+            )
+            if eligible_for_best and validation_score > old_best_validation_metric + self.min_validation_threshold:
                 is_best = True
                 # self.best_validation_metric is already updated by validate() to validation_score
                 logger.info(
@@ -808,9 +833,16 @@ class RainbowTrainerModule:
                 )
             else:
                 is_best = False
-                logger.info(
-                    f"  No improvement for best checkpoint (Current: {validation_score:.4f}, Best tracked: {self.best_validation_metric:.4f}, Old best for this run: {old_best_validation_metric:.4f}, Threshold: {self.min_validation_threshold})"
-                )
+                if not eligible_for_best:
+                    logger.info(
+                        "  Skipping best checkpoint (completed %d/%d episodes before min_episodes_before_early_stopping).",
+                        completed_episodes,
+                        self.min_episodes_before_early_stopping,
+                    )
+                else:
+                    logger.info(
+                        f"  No improvement for best checkpoint (Current: {validation_score:.4f}, Best tracked: {self.best_validation_metric:.4f}, Old best for this run: {old_best_validation_metric:.4f}, Threshold: {self.min_validation_threshold})"
+                    )
 
             # --- Log Validation Score and Metrics to TensorBoard --- #
             if self.writer:
@@ -1341,8 +1373,16 @@ class RainbowTrainerModule:
         except Exception as e:
             logger.error(f"Error saving validation results: {e}")
 
-    def _check_early_stopping(self, validation_score: float) -> bool:
+    def _check_early_stopping(self, validation_score: float, episode: int) -> bool:
         """Checks the early stopping condition based on validation score."""
+        completed_episodes = episode + 1
+        if self.min_episodes_before_early_stopping > 0 and completed_episodes < self.min_episodes_before_early_stopping:
+            logger.info(
+                "Completed %d/%d episodes: logging validation score but deferring best-validation tracking and early stopping.",
+                completed_episodes,
+                self.min_episodes_before_early_stopping,
+            )
+            return False
         should_stop = False
         if validation_score > self.best_validation_metric:
             logger.info(f"Validation score improved from {self.best_validation_metric:.4f} to {validation_score:.4f}")
@@ -1365,7 +1405,7 @@ class RainbowTrainerModule:
 
     # --- End Validation Helper Methods ---
 
-    def validate(self, val_files: list[Path]) -> tuple[bool, float, dict]:
+    def validate(self, val_files: list[Path], episode: int = 0) -> tuple[bool, float, dict]:
         """Run validation on validation files using helper methods, log, and check for early stopping."""
 
         # Handle empty validation file list
@@ -1442,7 +1482,7 @@ class RainbowTrainerModule:
             self._save_validation_results(validation_score, avg_metrics, detailed_results)
 
             # 6. Check for early stopping
-            should_stop = self._check_early_stopping(validation_score)
+            should_stop = self._check_early_stopping(validation_score, episode)
 
             return should_stop, validation_score, avg_metrics  # MODIFIED: Return avg_metrics
 

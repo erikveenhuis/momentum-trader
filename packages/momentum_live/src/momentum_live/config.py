@@ -52,6 +52,7 @@ class LiveTradingConfig:
     drawdown_penalty_lambda: float
     slippage_bps: float
     opportunity_cost_lambda: float
+    benchmark_allocation_frac: float
     min_rebalance_pct: float
     min_trade_value: float
     models_dir: str

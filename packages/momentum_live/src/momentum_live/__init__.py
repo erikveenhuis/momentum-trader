@@ -1,6 +1,6 @@
 """Momentum Live - Live trading implementation."""
 
-from .agent_loader import find_best_checkpoint, load_agent_from_checkpoint
+from .agent_loader import find_best_checkpoint, load_agent_from_checkpoint, resolve_live_device
 from .alpaca_stream import AlpacaStreamRunner
 from .config import AlpacaCredentials, LiveTradingConfig, parse_symbols
 from .trader import BarData, MomentumLiveTrader
@@ -15,5 +15,6 @@ __all__ = [
     "BarData",
     "find_best_checkpoint",
     "load_agent_from_checkpoint",
+    "resolve_live_device",
     "parse_symbols",
 ]

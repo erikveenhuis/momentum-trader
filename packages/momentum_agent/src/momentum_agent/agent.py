@@ -17,6 +17,30 @@ from .model import RainbowNetwork
 logger = get_logger("Agent")
 
 
+def _maybe_unwrap_orig_mod_state_dict(state_dict: dict) -> dict:
+    """If ``state_dict`` was saved from ``torch.compile`` (``OptimizedModule``), keys are ``_orig_mod.*``; map to plain module keys."""
+
+    if not state_dict:
+        return state_dict
+    keys = list(state_dict.keys())
+    if not keys:
+        return state_dict
+    if all(isinstance(k, str) and k.startswith("_orig_mod.") for k in keys):
+        return {k[len("_orig_mod.") :]: v for k, v in state_dict.items()}
+    return state_dict
+
+
+def _load_state_dict_with_orig_mod_fallback(module: torch.nn.Module, state_dict: dict) -> None:
+    try:
+        module.load_state_dict(state_dict)
+    except Exception:
+        unwrapped = _maybe_unwrap_orig_mod_state_dict(state_dict)
+        if unwrapped is state_dict:
+            raise
+        module.load_state_dict(unwrapped)
+        logger.info("Loaded weights from torch.compile checkpoint (_orig_mod keys) into eager module.")
+
+
 # --- Start: Rainbow DQN Agent ---
 class RainbowDQNAgent:
     """
@@ -29,7 +53,7 @@ class RainbowDQNAgent:
     - Noisy Nets for exploration
     """
 
-    def __init__(self, config: dict, device: str = "cuda", scaler=None):
+    def __init__(self, config: dict, device: str = "cuda", scaler=None, inference_only: bool = False):
         """
         Initializes the Rainbow DQN Agent.
 
@@ -37,22 +61,35 @@ class RainbowDQNAgent:
             config (dict): A dictionary containing all hyperparameters and network settings.
             device (str): The device to run the agent on ('cuda' or 'cpu').
             scaler: Deprecated, kept for checkpoint compatibility. Ignored.
+            inference_only: If True, build for forward-only use (live trading, CPU allowed, no
+                ``torch.compile`` requirement, small replay buffer). Training must use
+                ``inference_only=False`` with CUDA.
         """
-        self.config = config
+        self.inference_only = inference_only
+        cfg = dict(config)
+        if self.inference_only:
+            cfg["batch_size"] = 1
+            orig_rb = int(cfg.get("replay_buffer_size", 1_000_000))
+            cfg["replay_buffer_size"] = min(orig_rb, 4096)
+
+        self.config = cfg
         self.device = self._resolve_device(device)
+        config = self.config
 
-        # REQUIRE CUDA for optimal performance
-        if not torch.cuda.is_available():
-            raise RuntimeError(
-                "CUDA is not available. This training requires CUDA for optimal performance with torch.compile. "
-                "Please ensure you have a CUDA-compatible GPU and PyTorch with CUDA support installed."
-            )
+        if not self.inference_only:
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "CUDA is not available. This training requires CUDA for optimal performance with torch.compile. "
+                    "Please ensure you have a CUDA-compatible GPU and PyTorch with CUDA support installed."
+                )
 
-        if self.device.type != "cuda":
-            raise RuntimeError(
-                f"CUDA device required for training, but got device: {self.device}. "
-                "Please specify device='cuda' or ensure CUDA is available."
-            )
+            if self.device.type != "cuda":
+                raise RuntimeError(
+                    f"CUDA device required for training, but got device: {self.device}. "
+                    "Please specify device='cuda' or ensure CUDA is available."
+                )
+        elif self.device.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(f"CUDA device requested for inference_only agent but CUDA is not available (got device={self.device}).")
 
         # Use direct access for mandatory parameters
         self.seed = config["seed"]
@@ -74,12 +111,14 @@ class RainbowDQNAgent:
         self.beta_start = config["beta_start"]
         self.beta_frames = config["beta_frames"]
         self.grad_clip_norm = config["grad_clip_norm"]
+        self.epsilon_start = float(config["epsilon_start"])
+        self.epsilon_end = float(config["epsilon_end"])
+        self.epsilon_decay_steps = int(config["epsilon_decay_steps"])
+        self.entropy_coeff = float(config["entropy_coeff"])
         self.store_partial_n_step = self.config.get("store_partial_n_step", False)
         self.categorical_logging_interval = int(config.get("categorical_logging_interval", 2000))
         if self.categorical_logging_interval <= 0:
-            logger.warning(
-                "categorical_logging_interval must be a positive integer; falling back to default of 2000 learner steps."
-            )
+            logger.warning("categorical_logging_interval must be a positive integer; falling back to default of 2000 learner steps.")
             self.categorical_logging_interval = 2000
         raw_percentiles = config.get("categorical_logging_percentiles", [5, 25, 50, 75, 95])
         filtered_percentiles: list[float] = []
@@ -110,11 +149,11 @@ class RainbowDQNAgent:
             elif hasattr(torch.backends.cuda, "matmul") and hasattr(torch.backends.cuda.matmul, "fp32_precision"):
                 torch.backends.cuda.matmul.fp32_precision = "tf32"
             else:
-                logger.warning(
-                    "torch.set_float32_matmul_precision is unavailable; TF32 settings fall back to torch defaults."
-                )
-            if hasattr(torch.backends, "cudnn") and hasattr(torch.backends.cudnn, "conv") and hasattr(
-                torch.backends.cudnn.conv, "fp32_precision"
+                logger.warning("torch.set_float32_matmul_precision is unavailable; TF32 settings fall back to torch defaults.")
+            if (
+                hasattr(torch.backends, "cudnn")
+                and hasattr(torch.backends.cudnn, "conv")
+                and hasattr(torch.backends.cudnn.conv, "fp32_precision")
             ):
                 torch.backends.cudnn.conv.fp32_precision = "tf32"
             torch.cuda.manual_seed(self.seed)
@@ -165,59 +204,61 @@ class RainbowDQNAgent:
         self.target_network.load_state_dict(self.network.state_dict())
         self.target_network.eval()  # Target network is not trained directly
 
-        # REQUIRE torch.compile for optimal performance
-        if not hasattr(torch, 'compile'):
-            raise RuntimeError(
-                "torch.compile is not available in this PyTorch version. "
-                "Please upgrade to PyTorch 2.0+ for optimal performance."
-            )
+        if not self.inference_only:
+            # REQUIRE torch.compile for optimal performance (training path)
+            if not hasattr(torch, "compile"):
+                raise RuntimeError(
+                    "torch.compile is not available in this PyTorch version. Please upgrade to PyTorch 2.0+ for optimal performance."
+                )
 
-        logger.info("Applying torch.compile to network and target_network (REQUIRED for training).")
-        compile_success = False
+            logger.info("Applying torch.compile to network and target_network (REQUIRED for training).")
+            compile_success = False
 
-        # Try different compilation modes in order of preference
-        compile_modes = ["default", "reduce-overhead", "max-autotune"]
+            # Try different compilation modes in order of preference
+            compile_modes = ["default", "reduce-overhead", "max-autotune"]
 
-        for mode in compile_modes:
-            try:
-                logger.info(f"Trying torch.compile with mode='{mode}'...")
-                compiled_network = torch.compile(self.network, mode=mode)
-                compiled_target_network = torch.compile(self.target_network, mode=mode)
+            for mode in compile_modes:
+                try:
+                    logger.info(f"Trying torch.compile with mode='{mode}'...")
+                    compiled_network = torch.compile(self.network, mode=mode)
+                    compiled_target_network = torch.compile(self.target_network, mode=mode)
 
-                # Test compilation by running a small forward pass
-                with torch.no_grad():
-                    test_market = torch.zeros((1, self.window_size, self.n_features), device=self.device)
-                    test_account = torch.zeros((1, ACCOUNT_STATE_DIM), device=self.device)
-                    _ = compiled_network(test_market, test_account)
+                    # Test compilation by running a small forward pass
+                    with torch.no_grad():
+                        test_market = torch.zeros((1, self.window_size, self.n_features), device=self.device)
+                        test_account = torch.zeros((1, ACCOUNT_STATE_DIM), device=self.device)
+                        _ = compiled_network(test_market, test_account)
 
-                # Only assign if compilation and test succeeded
-                self.network = compiled_network
-                self.target_network = compiled_target_network
-                logger.info(f"torch.compile applied successfully with mode='{mode}'.")
-                compile_success = True
-                break
+                    # Only assign if compilation and test succeeded
+                    self.network = compiled_network
+                    self.target_network = compiled_target_network
+                    logger.info(f"torch.compile applied successfully with mode='{mode}'.")
+                    compile_success = True
+                    break
 
-            except ImportError as imp_err:
-                logger.error(f"torch.compile mode '{mode}' failed due to import issue: {imp_err}.")
-            except RuntimeError as runtime_err:
-                # Handle cases where compilation fails due to backend issues
-                if "Triton" in str(runtime_err) or "triton" in str(runtime_err).lower():
-                    logger.error(f"torch.compile mode '{mode}' failed due to Triton backend issues: {runtime_err}.")
-                else:
-                    logger.error(f"torch.compile mode '{mode}' failed with runtime error: {runtime_err}.")
-            except Exception as e:
-                logger.error(f"torch.compile mode '{mode}' failed with unexpected error: {e}.")
+                except ImportError as imp_err:
+                    logger.error(f"torch.compile mode '{mode}' failed due to import issue: {imp_err}.")
+                except RuntimeError as runtime_err:
+                    # Handle cases where compilation fails due to backend issues
+                    if "Triton" in str(runtime_err) or "triton" in str(runtime_err).lower():
+                        logger.error(f"torch.compile mode '{mode}' failed due to Triton backend issues: {runtime_err}.")
+                    else:
+                        logger.error(f"torch.compile mode '{mode}' failed with runtime error: {runtime_err}.")
+                except Exception as e:
+                    logger.error(f"torch.compile mode '{mode}' failed with unexpected error: {e}.")
 
-        if not compile_success:
-            raise RuntimeError(
-                "All torch.compile modes failed. torch.compile is REQUIRED for training. "
-                "Please ensure you have:\n"
-                "1. CUDA-compatible GPU\n"
-                "2. GCC compiler installed (sudo apt install build-essential)\n"
-                "3. Python development headers (sudo apt install python3-dev)\n"
-                "4. Working Triton installation\n"
-                "Training cannot proceed without compilation optimization."
-            )
+            if not compile_success:
+                raise RuntimeError(
+                    "All torch.compile modes failed. torch.compile is REQUIRED for training. "
+                    "Please ensure you have:\n"
+                    "1. CUDA-compatible GPU\n"
+                    "2. GCC compiler installed (sudo apt install build-essential)\n"
+                    "3. Python development headers (sudo apt install python3-dev)\n"
+                    "4. Working Triton installation\n"
+                    "Training cannot proceed without compilation optimization."
+                )
+        else:
+            logger.info("inference_only=True: skipping torch.compile (eager inference for live / CPU).")
 
         # Optimizer
         self.optimizer = optim.Adam(self.network.parameters(), lr=self.lr)
@@ -310,7 +351,9 @@ class RainbowDQNAgent:
         self._account_tensor = torch.zeros((1, ACCOUNT_STATE_DIM), device=self.device, dtype=torch.float32)
         self._initialize_batch_tensors()
         self.total_steps = 0  # Track total steps for target network updates and beta annealing
+        self.env_steps = 0  # Track env steps for epsilon annealing (set by trainer)
         self.last_td_error_stats: dict[str, float] | None = None
+        self.last_entropy: float | None = None
 
     def get_per_stats(self) -> dict[str, float | int]:
         """
@@ -353,6 +396,14 @@ class RainbowDQNAgent:
             "total_steps": self.total_steps,
         }
 
+    @property
+    def current_epsilon(self) -> float:
+        """Current epsilon for epsilon-greedy exploration, linearly annealed by env_steps."""
+        if self.epsilon_decay_steps <= 0:
+            return self.epsilon_end
+        frac = min(1.0, self.env_steps / self.epsilon_decay_steps)
+        return self.epsilon_start + frac * (self.epsilon_end - self.epsilon_start)
+
     def select_action(self, obs, action_mask=None):
         """Selects action based on Q-values, with optional action masking."""
         if self.debug_mode:
@@ -365,9 +416,9 @@ class RainbowDQNAgent:
                 self.window_size,
                 self.n_features,
             ), f"Input market_data shape mismatch. Expected {(self.window_size, self.n_features)}, got {obs['market_data'].shape}"
-            assert obs["account_state"].shape == (
-                ACCOUNT_STATE_DIM,
-            ), f"Input account_state shape mismatch. Expected ({ACCOUNT_STATE_DIM},), got {obs['account_state'].shape}"
+            assert obs["account_state"].shape == (ACCOUNT_STATE_DIM,), (
+                f"Input account_state shape mismatch. Expected ({ACCOUNT_STATE_DIM},), got {obs['account_state'].shape}"
+            )
 
         # Convert observation to tensors using preallocated buffers
         market_source = torch.from_numpy(obs["market_data"]).to(dtype=self._market_tensor.dtype)
@@ -411,6 +462,14 @@ class RainbowDQNAgent:
             if self.debug_mode:
                 assert isinstance(action, int), f"Selected action is not an integer: {action}"
                 assert 0 <= action < self.num_actions, f"Selected action ({action}) is out of bounds [0, {self.num_actions})"
+
+        if self.training_mode and random.random() < self.current_epsilon:
+            if action_mask is not None:
+                valid_actions = [i for i, m in enumerate(action_mask) if m]
+                action = random.choice(valid_actions) if valid_actions else action
+            else:
+                action = random.randrange(self.num_actions)
+
         return action
 
     def _resolve_device(self, requested_device) -> torch.device:
@@ -572,9 +631,9 @@ class RainbowDQNAgent:
                 self.window_size,
                 self.n_features,
             ), "state_t[0] (market_data) has wrong type/shape"
-            assert isinstance(state_t[1], np.ndarray) and state_t[1].shape == (
-                ACCOUNT_STATE_DIM,
-            ), "state_t[1] (account_state) has wrong type/shape"
+            assert isinstance(state_t[1], np.ndarray) and state_t[1].shape == (ACCOUNT_STATE_DIM,), (
+                "state_t[1] (account_state) has wrong type/shape"
+            )
             assert isinstance(action_t, (int, np.integer)), "action_t is not an integer"
             assert isinstance(n_step_reward, (float, np.float32, np.float64)), "n_step_reward is not a float"
             assert isinstance(next_state_tn, tuple) and len(next_state_tn) == 2, "next_state_tn is not a 2-tuple"
@@ -582,9 +641,9 @@ class RainbowDQNAgent:
                 self.window_size,
                 self.n_features,
             ), "next_state_tn[0] (market_data) has wrong type/shape"
-            assert isinstance(next_state_tn[1], np.ndarray) and next_state_tn[1].shape == (
-                ACCOUNT_STATE_DIM,
-            ), "next_state_tn[1] (account_state) has wrong type/shape"
+            assert isinstance(next_state_tn[1], np.ndarray) and next_state_tn[1].shape == (ACCOUNT_STATE_DIM,), (
+                "next_state_tn[1] (account_state) has wrong type/shape"
+            )
             assert isinstance(done_tn, (bool, np.bool_)), "done_tn is not a boolean"
             # --- End: Assert return types and shapes ---
 
@@ -625,23 +684,23 @@ class RainbowDQNAgent:
         if self.debug_mode:
             # --- Start: Assert input types and shapes for store_transition ---
             assert isinstance(obs, dict) and "market_data" in obs and "account_state" in obs, "Invalid current observation format"
-            assert (
-                isinstance(next_obs, dict) and "market_data" in next_obs and "account_state" in next_obs
-            ), "Invalid next observation format"
+            assert isinstance(next_obs, dict) and "market_data" in next_obs and "account_state" in next_obs, (
+                "Invalid next observation format"
+            )
             assert isinstance(obs["market_data"], np.ndarray) and obs["market_data"].shape == (
                 self.window_size,
                 self.n_features,
             ), f"Invalid obs market data shape {obs['market_data'].shape}"
-            assert isinstance(obs["account_state"], np.ndarray) and obs["account_state"].shape == (
-                ACCOUNT_STATE_DIM,
-            ), f"Invalid obs account state shape {obs['account_state'].shape}"
+            assert isinstance(obs["account_state"], np.ndarray) and obs["account_state"].shape == (ACCOUNT_STATE_DIM,), (
+                f"Invalid obs account state shape {obs['account_state'].shape}"
+            )
             assert isinstance(next_obs["market_data"], np.ndarray) and next_obs["market_data"].shape == (
                 self.window_size,
                 self.n_features,
             ), f"Invalid next_obs market data shape {next_obs['market_data'].shape}"
-            assert isinstance(next_obs["account_state"], np.ndarray) and next_obs["account_state"].shape == (
-                ACCOUNT_STATE_DIM,
-            ), f"Invalid next_obs account state shape {next_obs['account_state'].shape}"
+            assert isinstance(next_obs["account_state"], np.ndarray) and next_obs["account_state"].shape == (ACCOUNT_STATE_DIM,), (
+                f"Invalid next_obs account state shape {next_obs['account_state'].shape}"
+            )
             assert isinstance(action, (int, np.integer)), "Action must be an integer"
             assert isinstance(reward, (float, np.float32, np.float64)), "Reward must be a float"
             assert isinstance(done, (bool, np.bool_)), "Done flag must be boolean"
@@ -801,9 +860,7 @@ class RainbowDQNAgent:
             return
 
         try:
-            batch_mass = (
-                target_distribution.detach().sum(dim=0).to(device="cpu", dtype=torch.float64).numpy()
-            )
+            batch_mass = target_distribution.detach().sum(dim=0).to(device="cpu", dtype=torch.float64).numpy()
         except (RuntimeError, ValueError) as error:
             logger.warning(f"Failed to accumulate categorical target stats: {error}")
             return
@@ -1012,6 +1069,17 @@ class RainbowDQNAgent:
                 target_return = market_data_batch[:, -1, log_ret_col].detach()
                 aux_loss = torch.nn.functional.mse_loss(aux_pred, target_return)
                 loss = loss + 0.1 * aux_loss
+
+            # --- Action entropy regularization --- #
+            if self.entropy_coeff > 0:
+                all_q = (torch.exp(log_ps) * self.support.unsqueeze(0).unsqueeze(0)).sum(dim=2)  # [B, num_actions]
+                q_range = (all_q.max(dim=1, keepdim=True).values - all_q.min(dim=1, keepdim=True).values).clamp(min=1e-6)
+                q_normalized = (all_q - all_q.mean(dim=1, keepdim=True)) / q_range
+                policy = torch.softmax(q_normalized, dim=1)
+                log_policy = torch.log(policy + 1e-8)
+                entropy = -(policy * log_policy).sum(dim=1).mean()
+                loss = loss - self.entropy_coeff * entropy
+                self.last_entropy = float(entropy.detach())
             # ----------------------------------------- #
 
             # --- Calculate TD errors for PER update --- #
@@ -1059,9 +1127,9 @@ class RainbowDQNAgent:
         loss, td_errors_tensor = self._compute_loss(batch_tuple, weights)
         if self.debug_mode:
             assert isinstance(loss, torch.Tensor) and loss.ndim == 0, "Loss from _compute_loss is not a scalar tensor"
-            assert isinstance(td_errors_tensor, torch.Tensor) and td_errors_tensor.shape == (
-                self.batch_size,
-            ), "TD errors tensor from _compute_loss has wrong shape/type"
+            assert isinstance(td_errors_tensor, torch.Tensor) and td_errors_tensor.shape == (self.batch_size,), (
+                "TD errors tensor from _compute_loss has wrong shape/type"
+            )
 
         # Log GPU memory usage if using CUDA (less frequently to reduce log spam)
         if self.device.type == "cuda" and torch.cuda.is_available() and self.total_steps % 100 == 0:
@@ -1104,10 +1172,7 @@ class RainbowDQNAgent:
 
         # Increment step counter and update target network periodically
         self.total_steps += 1
-        if (
-            self.categorical_logging_interval > 0
-            and self.total_steps % self.categorical_logging_interval == 0
-        ):
+        if self.categorical_logging_interval > 0 and self.total_steps % self.categorical_logging_interval == 0:
             self._log_categorical_target_stats()
         if self.last_td_error_stats is not None and self.total_steps % 100 == 0:
             logger.info(
@@ -1349,7 +1414,7 @@ class RainbowDQNAgent:
         # Load network state
         if "network_state_dict" in agent_state_dict and self.network is not None:
             try:
-                self.network.load_state_dict(agent_state_dict["network_state_dict"])
+                _load_state_dict_with_orig_mod_fallback(self.network, agent_state_dict["network_state_dict"])
                 self.network.to(self.device)  # Ensure model is on the correct device
                 logger.info("Network state loaded from dictionary.")
             except Exception as e:
@@ -1362,7 +1427,10 @@ class RainbowDQNAgent:
         # Load target network state
         if "target_network_state_dict" in agent_state_dict and self.target_network is not None:
             try:
-                self.target_network.load_state_dict(agent_state_dict["target_network_state_dict"])
+                _load_state_dict_with_orig_mod_fallback(
+                    self.target_network,
+                    agent_state_dict["target_network_state_dict"],
+                )
                 self.target_network.to(self.device)  # Ensure model is on the correct device
                 logger.info("Target network state loaded from dictionary.")
             except Exception as e:
@@ -1390,6 +1458,10 @@ class RainbowDQNAgent:
         if "total_steps" in agent_state_dict:
             self.total_steps = agent_state_dict["total_steps"]
             logger.info(f"Total steps loaded from dictionary: {self.total_steps}")
+
+        if "agent_env_steps" in agent_state_dict:
+            self.env_steps = agent_state_dict["agent_env_steps"]
+            logger.info(f"Env steps loaded from dictionary: {self.env_steps} (epsilon={self.current_epsilon:.4f})")
         else:
             logger.warning("Total steps not found in provided dictionary. Agent's total_steps not updated.")
             # Consider if this should be an error or if agent's current total_steps is acceptable.

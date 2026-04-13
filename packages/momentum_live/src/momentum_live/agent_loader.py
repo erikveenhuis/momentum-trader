@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -41,20 +42,34 @@ def find_best_checkpoint(
     return best
 
 
-def _resolve_device(device: str | torch.device | None) -> str:
-    if device is None:
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    if isinstance(device, torch.device):
-        return device.type
-    return str(device)
+def resolve_live_device(device: str | torch.device | None) -> str:
+    """Pick device for live inference. Defaults to CPU; set ``MOMENTUM_LIVE_DEVICE=cuda`` for GPU."""
+
+    if device is not None:
+        if isinstance(device, torch.device):
+            return device.type
+        return str(device)
+
+    env = os.getenv("MOMENTUM_LIVE_DEVICE", "").strip().lower()
+    if env in ("cuda", "gpu"):
+        if not torch.cuda.is_available():
+            LOGGER.warning("MOMENTUM_LIVE_DEVICE requests CUDA but torch.cuda.is_available() is false; using CPU")
+            return "cpu"
+        return "cuda"
+    return "cpu"
 
 
 def load_agent_from_checkpoint(
     checkpoint_path: str | Path,
     *,
     device: str | torch.device | None = None,
+    inference_only: bool = True,
 ) -> RainbowDQNAgent:
-    """Instantiate and load a trained ``RainbowDQNAgent`` from a checkpoint."""
+    """Instantiate and load a trained ``RainbowDQNAgent`` from a checkpoint.
+
+    Live inference uses ``inference_only=True`` (eager forward, CPU allowed). Training code must
+    instantiate the agent with ``inference_only=False`` on CUDA.
+    """
 
     checkpoint_path = Path(checkpoint_path)
     if not checkpoint_path.exists():
@@ -76,9 +91,14 @@ def load_agent_from_checkpoint(
     agent_config = agent_config.copy()
     agent_config.setdefault("seed", 42)
 
-    resolved_device = _resolve_device(device)
-    LOGGER.info("Instantiating agent on %s", resolved_device)
-    agent = RainbowDQNAgent(config=agent_config, device=resolved_device, scaler=None)
+    resolved_device = resolve_live_device(device)
+    LOGGER.info("Instantiating agent on %s (inference_only=%s)", resolved_device, inference_only)
+    agent = RainbowDQNAgent(
+        config=agent_config,
+        device=resolved_device,
+        scaler=None,
+        inference_only=inference_only,
+    )
 
     loaded = agent.load_state(checkpoint)
     if not loaded:
@@ -88,4 +108,4 @@ def load_agent_from_checkpoint(
     return agent
 
 
-__all__ = ["find_best_checkpoint", "load_agent_from_checkpoint"]
+__all__ = ["find_best_checkpoint", "load_agent_from_checkpoint", "resolve_live_device"]

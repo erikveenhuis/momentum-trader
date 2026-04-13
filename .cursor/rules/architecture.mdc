@@ -9,7 +9,7 @@ alwaysApply: true
 - Transformer: 3 encoder layers, 4 heads, hidden_dim=256, FFN=512, pre-norm + GELU
 - CLS token pooling -> concat with account MLP -> LayerNorm -> NoisyLinear dueling heads (C51)
 - Auxiliary return-prediction head on CLS output (0.1 weight MSE loss on log_return_1 feature)
-- Polyak soft target updates (tau=0.005, every learner step)
+- Polyak soft target updates (tau=0.001, every learner step)
 
 ## Features (12 channels)
 - Columns 0-5 (raw): open, high, low, close, volume, transactions -> window-level z-score at observation time
@@ -25,7 +25,7 @@ alwaysApply: true
 
 ## Training
 - bfloat16 autocast (no GradScaler), torch.compile required
-- C51 support [-10, 10] with 101 atoms; reward_scale=1.0 keeps n-step returns in range
+- C51 support [-1, 1] with 101 atoms (atom spacing 0.02); reward_scale=1.0 keeps per-step rewards O(1e-4 to 1e-3) and n-step returns well within range
 - No action masking needed (target allocation actions are always valid)
 - Curriculum learning: training file pool ramps from 30% to 100% over episodes
 - Progress tracked in models/progress.jsonl (one JSONL line per episode/validation)
@@ -35,7 +35,7 @@ alwaysApply: true
 - 6 target-allocation actions: 0%, 20%, 40%, 60%, 80%, 100% exposure
 - Agent picks desired position size; environment computes the buy/sell delta
 - Every action is always valid (no action masking needed)
-- Risk-adjusted reward: reward_scale * (market_return + trade_return) - lambda * drawdown - opportunity_cost_lambda * abs(price_return) * cash_fraction
+- Benchmark-relative reward: reward_scale * ((market_return + trade_return) - benchmark_frac * price_return) - lambda * drawdown
 - min_trade_notional: $10 minimum (matches Alpaca live requirement)
 - Slippage: configurable basis points on all trades
 - Termination: portfolio < 1% of initial balance
@@ -44,3 +44,4 @@ alwaysApply: true
 - torch.compile wraps networks in OptimizedModule; always use `is not None` checks, never truthiness
 - Old checkpoints incompatible after architecture changes (different dims)
 - Live trader (momentum_live) must match training normalization exactly (window-level z-score + derived features)
+- Live inference loads checkpoints with `inference_only=True` (eager forward, no compile); default device is CPU. Set `MOMENTUM_LIVE_DEVICE=cuda` for GPU inference. Training still requires CUDA + compile (`inference_only=False`).

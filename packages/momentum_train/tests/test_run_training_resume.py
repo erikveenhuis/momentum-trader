@@ -148,6 +148,10 @@ def test_run_training_resume_uses_trainer_steps(monkeypatch, tmp_path):
             "beta_start": 0.4,
             "beta_frames": 1000,
             "grad_clip_norm": 1.0,
+            "epsilon_start": 0.3,
+            "epsilon_end": 0.01,
+            "epsilon_decay_steps": 1000,
+            "entropy_coeff": 0.03,
         },
         "environment": {
             "window_size": 1,
@@ -260,6 +264,10 @@ def test_resume_tensorboard_log_dir_reuses_existing_directory(monkeypatch, tmp_p
             "beta_start": 0.4,
             "beta_frames": 1000,
             "grad_clip_norm": 1.0,
+            "epsilon_start": 0.3,
+            "epsilon_end": 0.01,
+            "epsilon_decay_steps": 1000,
+            "entropy_coeff": 0.03,
         },
         "environment": {
             "window_size": 1,

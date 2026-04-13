@@ -20,8 +20,8 @@ def test_gpu_memory():
             "hidden_dim": 256,
             "num_actions": 6,
             "num_atoms": 101,
-            "v_min": -10.0,
-            "v_max": 10.0,
+            "v_min": -1.0,
+            "v_max": 1.0,
             "nhead": 4,
             "num_encoder_layers": 3,
             "dim_feedforward": 512,
@@ -37,6 +37,10 @@ def test_gpu_memory():
             "n_steps": 3,
             "grad_clip_norm": 1.0,
             "seed": 42,
+            "epsilon_start": 0.3,
+            "epsilon_end": 0.01,
+            "epsilon_decay_steps": 200000,
+            "entropy_coeff": 0.03,
         }
 
         device = torch.device("cuda")

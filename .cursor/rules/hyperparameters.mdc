@@ -14,13 +14,31 @@ alwaysApply: false
 
 ## RL Params
 - gamma=0.99: minute-scale trades still benefit from looking ahead. 0.95 discounts too aggressively.
+- lr=1e-4: reduced from 3e-4 after Apr 2026 run showed policy churn (best val at ep 50, then steady degradation). Combined with gradient_updates_per_step=1, this gives a much more conservative effective step size.
 - batch_size=8192: balances GPU utilization (~41% VRAM on RTX 5090) with PER effectiveness. 16384 approximates uniform sampling.
 - buffer=1M: 24k files x 1440 bars = 34M total bars. Larger buffer = more diverse replay.
 - n_steps=3: tight credit assignment for in-and-out-in-minutes momentum. 5 was too long-horizon.
-- reward_scale=1.0: with n_steps=3 and gamma=0.99, n-step returns stay in [-10, 10] C51 support. Old scale=10 caused edge-piling.
+- reward_scale=1.0: with n_steps=3 and gamma=0.99, per-step rewards are O(1e-4 to 1e-3) and n-step returns stay well within [-1, 1] C51 support. Old support [-10, 10] wasted 99% of atoms on unreachable regions, collapsing all probability mass onto atoms near zero and destroying distributional resolution. Old scale=10 caused edge-piling on the even wider support.
+- polyak_tau=0.001: reduced from 0.005. Old value made target network track online network too aggressively, undermining Double DQN stability.
+
+## Reward Shaping
+- benchmark_allocation_frac=0.5: Reward is benchmark-relative: excess_return = (agent_return) - (benchmark_frac * price_return). No constant-allocation policy can earn systematically positive excess return; only state-dependent timing can. This is the standard alpha-generation framing from quant finance. 0.5 is the mean of the action space (0%, 20%, 40%, 60%, 80%, 100%). Previous absolute-return reward caused action collapse to a single optimal constant allocation across every run attempted (action=5 at lambda=0.15, action=3 at lambda=0.3, action=1 with epsilon-greedy). Entropy regularization (0.03 and 0.5) and epsilon-greedy could not overcome this because the C51 gradient always pointed toward the optimal constant action.
+- drawdown_penalty_lambda=0.3: applied to agent's actual drawdown (not relative to benchmark). 0.5 caused death spirals, 0.15 was too weak. 0.3 balances risk awareness without dominating.
+- opportunity_cost_lambda=0.0: disabled. Subsumed by benchmark-relative reward -- holding cash when price rises already produces negative excess return vs the 50% benchmark.
+- entropy_coeff=0.0: disabled. Benchmark-relative reward structurally prevents action collapse, making entropy regularization unnecessary. Code path retained for future experiments.
+
+## Exploration
+- epsilon_start=0.3, epsilon_end=0.05, epsilon_decay_steps=2000000: Epsilon-greedy on top of NoisyNets ensures diverse experience in the replay buffer during early training. A higher floor (0.05 vs 0.01) and a much longer decay (2M env steps) keep exploration meaningful on multi-thousand-episode runs; the prior 200k-step schedule collapsed epsilon before the policy had stabilized.
+
+## Training Loop
+- gradient_updates_per_step=1: reduced from 3. Combined with lr=3e-4, the old setting tripled effective step size per learning trigger. Caused the agent to overshoot the good early policy learned during eps 14-50.
+- validation_freq=200: less frequent validation than 50; reduces overhead and avoids noisy “best” comparisons while the policy is still learning.
+- min_episodes_before_early_stopping=5000: until at least 5000 training episodes have completed, validation scores are logged but `best_validation_metric` is not updated and the early-stopping counter does not advance. This prevents the first validation (often dominated by a passive / low-turnover policy) from anchoring “best” and triggering patience-based stop before meaningful learning (~5000+ episodes).
+- early_stopping_patience=12: increased from 6. With validation_freq=200, patience×freq is the rough episode window without improvement before stop (after the minimum-episode phase).
 
 ## Hardware Context (RTX 5090 + Ryzen 9 9950X3D)
 - batch=8192 uses 13.3 GB / 31 GB VRAM (41.4%)
 - Forward: 128ms, Backward: 1178ms at batch=8192
 - Preprocessing 27k files: ~10 seconds with 12 CPU workers
 - GPU is not the bottleneck; environment stepping is
+- **Future work:** vectorized environments (e.g. 4–8 parallel `gymnasium.vector.AsyncVectorEnv` workers) are the next throughput target; requires refactoring the trainer loop, n-step return handling, and replay buffer interactions so multiple env steps feed training coherently.

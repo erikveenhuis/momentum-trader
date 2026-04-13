@@ -32,10 +32,10 @@ The agent is a full **Rainbow DQN** (C51 distributional + PER + dueling + noisy 
 **Key design decisions:**
 - **12 features**: 6 raw (OHLCV + transactions) with window-level z-score normalization, plus 6 precomputed derived features (log returns at lag 1/5/10, realized volatility, volume ratio, high-low range ratio)
 - **5-D account state**: position fraction, cash fraction, unrealized PnL, bars-in-position, cumulative fee fraction
-- **Risk-adjusted reward**: PnL return minus drawdown penalty (`lambda * max_drawdown_increment`)
+- **Benchmark-relative reward**: excess return vs a fixed allocation benchmark, minus drawdown penalty (`lambda * max_drawdown_increment`)
 - **Slippage model**: configurable basis-point slippage on all trades
 - **bfloat16 AMP**: native Blackwell tensor core support, no GradScaler needed
-- **Polyak soft target updates** (tau=0.005) instead of hard copy
+- **Polyak soft target updates** (tau=0.001) instead of hard copy
 - **Auxiliary return-prediction head** on the Transformer CLS output
 - **Target allocation actions**: 6 discrete exposure levels (0%--100% in 20% steps) where every action is always valid
 - **Curriculum learning**: progressively expands training data pool over the training run
