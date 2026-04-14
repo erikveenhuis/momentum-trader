@@ -35,7 +35,7 @@ alwaysApply: true
 - 6 target-allocation actions: 0%, 20%, 40%, 60%, 80%, 100% exposure
 - Agent picks desired position size; environment computes the buy/sell delta
 - Every action is always valid (no action masking needed)
-- Benchmark-relative reward: reward_scale * ((market_return + trade_return) - benchmark_frac * price_return) - lambda * drawdown
+- Benchmark-relative reward: reward_scale * ((market_return + trade_return) - benchmark_frac * price_return) - lambda * incremental_drawdown
 - min_trade_notional: $10 minimum (matches Alpaca live requirement)
 - Slippage: configurable basis points on all trades
 - Termination: portfolio < 1% of initial balance

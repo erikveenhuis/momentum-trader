@@ -20,7 +20,7 @@ agent:
   # Core RL params
   gamma: 0.99           # Increased from 0.95; minute-scale trades still care about future bars
   lr: 0.0001            # Reduced from 3e-4; previous run showed policy churn from overshooting
-  batch_size: 8192      # Reduced from 16384; better PER prioritization, still GPU-saturating
+  batch_size: 8192      # 8192 at 41% VRAM; try 16384 (84% VRAM) with num_vector_envs >= 4 for faster buffer fill
   replay_buffer_size: 1000000  # Doubled from 500k; more diverse replay with 24k training files
   target_update_freq: 1000     # Logging frequency only (Polyak updates every step regardless)
 
@@ -86,11 +86,12 @@ feature_rolling_window: 20   # Lookback bars for derived features (realized vol,
 
 trainer:
   seed: 42
+  num_vector_envs: 4        # Parallel TradingEnv workers (1 = legacy single-env loop; 4-8 recommended for GPU saturation)
   warmup_steps: 20000       # With action masking, warmup produces cleaner transitions
-  update_freq: 20           # Learn every 20 env steps (~20 min of bars); more diverse recent experience
-  gradient_updates_per_step: 1  # Reduced from 3; lower effective step size to prevent policy churn
+  update_freq: 20           # Learn every 20 env steps; vectorized loop uses threshold counter to avoid modulo drift
+  gradient_updates_per_step: 2  # Reduced from 3; try 2 with num_vector_envs >= 4 at lr=1e-4 (monitor val score)
   log_freq: 60
-  per_stats_log_freq: 0
+  per_stats_log_freq: 300
   validation_freq: 200      # Less frequent validation; avoids judging a still-learning policy too often
   checkpoint_save_freq: 50
   reward_window: 20

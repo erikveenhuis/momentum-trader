@@ -99,6 +99,31 @@ Each `.npz` file contains:
 - `close_prices`: float32 array for trade execution
 - `features`: float32 array with 12 columns (6 raw OHLCV+transactions + 6 derived features)
 
+## GPU Stability (RTX 5090)
+
+The RTX 5090 requires the **open** NVIDIA kernel module (`nvidia-driver-590-open`) for display output. The `nvidia-powerd` daemon does not yet support this GPU (PCI ID `0x2b85`) and exits on startup; this is harmless on desktop since hardware power management is handled by the driver directly.
+
+To prevent system freezes during sustained training, set a power cap and enable persistence mode:
+
+```bash
+sudo nvidia-smi -pm 1
+sudo nvidia-smi -pl 500
+```
+
+To persist across reboots, enable the provided systemd service:
+
+```bash
+sudo cp config/nvidia-powerlimit.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now nvidia-powerlimit.service
+```
+
+Monitor GPU thermals during training in a separate terminal:
+
+```bash
+nvidia-smi dmon -s pucvmet -d 5 | tee gpu_monitor.log
+```
+
 ## Training
 
 1. Review `config/training_config.yaml` for hyperparameters.
@@ -106,8 +131,18 @@ Each `.npz` file contains:
    ```bash
    python -m momentum_train.run_training --config_path config/training_config.yaml
    ```
-   - `--resume` reuses the latest checkpoint in `models/`.
-   - `--mode eval` runs evaluation against test splits.
+3. Resume from the latest checkpoint after a crash or interruption:
+   ```bash
+   python -m momentum_train.run_training --config_path config/training_config.yaml --resume
+   ```
+4. Resume and reset the learning rate to the config value (discards optimizer/scheduler state):
+   ```bash
+   python -m momentum_train.run_training --config_path config/training_config.yaml --resume --reset-lr-on-resume
+   ```
+5. Run evaluation against test splits:
+   ```bash
+   python -m momentum_train.run_training --config_path config/training_config.yaml --mode eval
+   ```
 
 ## Live Trading
 

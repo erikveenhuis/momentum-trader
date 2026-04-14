@@ -216,3 +216,147 @@ def test_profitable_roundtrip(profitable_trading_env):
 
     obs, reward, term, trunc, info_sell = env.step(0)
     assert info_sell["balance"] > env.config.initial_balance
+
+
+class TestResetWithDataPath:
+    """Tests for TradingEnv.reset(options={"data_path": ...})."""
+
+    def _make_csv(self, path, n_rows=50, seed=0):
+        rng = np.random.RandomState(seed)
+        data = pd.DataFrame(
+            {
+                "open": rng.uniform(90, 110, n_rows),
+                "high": rng.uniform(100, 120, n_rows),
+                "low": rng.uniform(80, 100, n_rows),
+                "close": rng.uniform(90, 110, n_rows),
+                "volume": rng.uniform(1000, 2000, n_rows),
+            }
+        )
+        data.to_csv(path, index=False)
+        return path
+
+    def test_reset_loads_new_data(self, tmp_path):
+        path_a = self._make_csv(tmp_path / "a.csv", n_rows=60, seed=1)
+        path_b = self._make_csv(tmp_path / "b.csv", n_rows=80, seed=2)
+
+        config = TradingEnvConfig(
+            data_path=str(path_a),
+            window_size=5,
+            initial_balance=10000.0,
+            transaction_fee=0.001,
+            reward_scale=1.0,
+            invalid_action_penalty=0.0,
+            drawdown_penalty_lambda=0.0,
+            slippage_bps=0.0,
+            opportunity_cost_lambda=0.0,
+            benchmark_allocation_frac=0.5,
+            min_rebalance_pct=0.02,
+            min_trade_value=1.0,
+        )
+        env = TradingEnv(config=config)
+        assert env.market_data.data_length == 60
+
+        obs, info = env.reset(options={"data_path": str(path_b)})
+        assert env.market_data.data_length == 80
+        assert isinstance(obs["market_data"], np.ndarray)
+        assert obs["market_data"].shape == (5, env.market_data.num_features)
+
+    def test_reset_without_options_keeps_data(self, tmp_path):
+        path_a = self._make_csv(tmp_path / "a.csv", n_rows=60, seed=1)
+        config = TradingEnvConfig(
+            data_path=str(path_a),
+            window_size=5,
+            initial_balance=10000.0,
+            transaction_fee=0.001,
+            reward_scale=1.0,
+            invalid_action_penalty=0.0,
+            drawdown_penalty_lambda=0.0,
+            slippage_bps=0.0,
+            opportunity_cost_lambda=0.0,
+            benchmark_allocation_frac=0.5,
+            min_rebalance_pct=0.02,
+            min_trade_value=1.0,
+        )
+        env = TradingEnv(config=config)
+        original_length = env.market_data.data_length
+
+        env.reset()
+        assert env.market_data.data_length == original_length
+
+    def test_observation_space_unchanged_after_reload(self, tmp_path):
+        path_a = self._make_csv(tmp_path / "a.csv", n_rows=60, seed=1)
+        path_b = self._make_csv(tmp_path / "b.csv", n_rows=80, seed=2)
+
+        config = TradingEnvConfig(
+            data_path=str(path_a),
+            window_size=5,
+            initial_balance=10000.0,
+            transaction_fee=0.001,
+            reward_scale=1.0,
+            invalid_action_penalty=0.0,
+            drawdown_penalty_lambda=0.0,
+            slippage_bps=0.0,
+            opportunity_cost_lambda=0.0,
+            benchmark_allocation_frac=0.5,
+            min_rebalance_pct=0.02,
+            min_trade_value=1.0,
+        )
+        env = TradingEnv(config=config)
+        original_obs_space = env.observation_space
+
+        env.reset(options={"data_path": str(path_b)})
+        assert env.observation_space["market_data"].shape == original_obs_space["market_data"].shape
+        assert env.observation_space["account_state"].shape == original_obs_space["account_state"].shape
+
+    def test_portfolio_state_resets_on_data_reload(self, tmp_path):
+        path_a = self._make_csv(tmp_path / "a.csv", n_rows=60, seed=1)
+        path_b = self._make_csv(tmp_path / "b.csv", n_rows=80, seed=2)
+
+        config = TradingEnvConfig(
+            data_path=str(path_a),
+            window_size=5,
+            initial_balance=10000.0,
+            transaction_fee=0.001,
+            reward_scale=1.0,
+            invalid_action_penalty=0.0,
+            drawdown_penalty_lambda=0.0,
+            slippage_bps=0.0,
+            opportunity_cost_lambda=0.0,
+            benchmark_allocation_frac=0.5,
+            min_rebalance_pct=0.02,
+            min_trade_value=1.0,
+        )
+        env = TradingEnv(config=config)
+        env.step(5)  # buy
+
+        obs, info = env.reset(options={"data_path": str(path_b)})
+        assert info["balance"] == 10000.0
+        assert info["position"] == 0.0
+        assert env.bars_in_position == 0
+
+    def test_stepping_works_after_data_reload(self, tmp_path):
+        path_a = self._make_csv(tmp_path / "a.csv", n_rows=60, seed=1)
+        path_b = self._make_csv(tmp_path / "b.csv", n_rows=80, seed=2)
+
+        config = TradingEnvConfig(
+            data_path=str(path_a),
+            window_size=5,
+            initial_balance=10000.0,
+            transaction_fee=0.001,
+            reward_scale=1.0,
+            invalid_action_penalty=0.0,
+            drawdown_penalty_lambda=0.0,
+            slippage_bps=0.0,
+            opportunity_cost_lambda=0.0,
+            benchmark_allocation_frac=0.5,
+            min_rebalance_pct=0.02,
+            min_trade_value=1.0,
+        )
+        env = TradingEnv(config=config)
+        env.reset(options={"data_path": str(path_b)})
+
+        for _ in range(10):
+            obs, reward, term, trunc, info = env.step(3)
+            if term or trunc:
+                break
+            assert obs["market_data"].shape == (5, env.market_data.num_features)

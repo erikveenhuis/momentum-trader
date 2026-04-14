@@ -1,0 +1,12 @@
+[Unit]
+Description=NVIDIA GPU Power Limit
+After=nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/nvidia-smi -pm 1
+ExecStart=/usr/bin/nvidia-smi -pl 500
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

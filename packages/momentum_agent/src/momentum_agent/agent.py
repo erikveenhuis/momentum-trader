@@ -136,8 +136,6 @@ class RainbowDQNAgent:
         # Optional flags can still use .get()
         self.debug_mode = config.get("debug", False)
         self.scaler = None  # GradScaler removed; bfloat16 autocast doesn't need it
-        self._n_step_needs_reset = False
-
         # Setup seeds
         np.random.seed(self.seed)
         random.seed(self.seed)
@@ -334,14 +332,14 @@ class RainbowDQNAgent:
             self.beta_frames,
             debug=self.debug_mode,
         )
-        # For N-step returns
-        self.n_step_buffer = deque(maxlen=self.n_steps)
-        # --- ADDED: Deque for n-step reward logging window ---
+        # Per-env N-step return buffers (vectorized training support)
+        self._num_envs = 1
+        self._n_step_buffers: list[deque] = [deque(maxlen=self.n_steps)]
+        self._n_step_needs_reset_flags: list[bool] = [False]
+        # Legacy aliases for single-env access and checkpoint compat
+        self.n_step_buffer = self._n_step_buffers[0]
         self.n_step_reward_window = deque(maxlen=60)
-        # --- END ADDED ---
-        # --- ADDED: List for comprehensive N-step reward history ---
         self.observed_n_step_rewards_history = [] if self.debug_mode else None
-        # --- END ADDED ---
 
         self.training_mode = True  # Start in training mode by default
         self._network_mode_training: bool | None = None
@@ -472,6 +470,63 @@ class RainbowDQNAgent:
 
         return action
 
+    # ------------------------------------------------------------------
+    # Vectorized environment support
+    # ------------------------------------------------------------------
+
+    def set_num_envs(self, num_envs: int) -> None:
+        """Configure the agent for *num_envs* parallel environments.
+
+        Replaces per-env n-step buffers.  Safe to call on a resumed agent
+        (all deques start empty, matching the lazy-reset behaviour on resume).
+        """
+        if num_envs < 1:
+            raise ValueError(f"num_envs must be >= 1, got {num_envs}")
+        self._num_envs = num_envs
+        self._n_step_buffers = [deque(maxlen=self.n_steps) for _ in range(num_envs)]
+        self._n_step_needs_reset_flags = [False] * num_envs
+        self.n_step_buffer = self._n_step_buffers[0]
+
+    def select_actions_batch(self, obs_batch: dict[str, np.ndarray]) -> np.ndarray:
+        """Select actions for a batch of N observations (one per env).
+
+        Args:
+            obs_batch: dict with ``market_data`` shape ``[N, W, F]`` and
+                ``account_state`` shape ``[N, ACCOUNT_STATE_DIM]``.
+
+        Returns:
+            ``np.ndarray`` of ints with shape ``(N,)``.
+        """
+        n = obs_batch["market_data"].shape[0]
+
+        if self.training_mode and hasattr(self.network, "reset_noise"):
+            self.network.reset_noise()
+
+        market_t = torch.from_numpy(obs_batch["market_data"]).to(
+            device=self.device, dtype=torch.float32, non_blocking=self._non_blocking_copy
+        )
+        account_t = torch.from_numpy(obs_batch["account_state"]).to(
+            device=self.device, dtype=torch.float32, non_blocking=self._non_blocking_copy
+        )
+
+        autocast_enabled = self.device.type == "cuda" and torch.cuda.is_available()
+
+        with torch.inference_mode():
+            with autocast("cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
+                q_values = self.network.get_q_values(market_t, account_t)  # [N, num_actions]
+
+        actions = q_values.argmax(dim=1).cpu().numpy()  # [N]
+
+        if self.training_mode:
+            eps = self.current_epsilon
+            rand_mask = np.random.random(n) < eps
+            if rand_mask.any():
+                actions[rand_mask] = np.random.randint(0, self.num_actions, size=int(rand_mask.sum()))
+
+        return actions
+
+    # ------------------------------------------------------------------
+
     def _resolve_device(self, requested_device) -> torch.device:
         """Normalizes the requested device into a torch.device, falling back to CPU if needed."""
         if isinstance(requested_device, torch.device):
@@ -586,36 +641,32 @@ class RainbowDQNAgent:
             self._batch_weights_tensor,
         )
 
-    def _get_n_step_info(self, steps: int | None = None):
-        """
-        Calculates the (truncated) n-step return using the oldest `steps` transitions
-        currently stored in the n-step buffer.
+    def _get_n_step_info(self, buf: deque, steps: int | None = None):
+        """Compute (truncated) n-step return from *buf*.
 
         Args:
-            steps (int | None): Number of transitions to consider. Defaults to self.n_steps.
+            buf: The per-env n-step deque to read from.
+            steps: Number of transitions to consider. Defaults to self.n_steps.
 
         Returns:
-            tuple: Contains state_t, action_t, discounted reward, next_state_tn, done_tn.
+            tuple: (state_t, action_t, n_step_reward, next_state_tn, done_tn)
         """
         if steps is None:
             steps = self.n_steps
 
         if steps < 1:
             raise ValueError("Steps for n-step calculation must be >= 1")
-        if len(self.n_step_buffer) < steps:
+        if len(buf) < steps:
             raise ValueError("Insufficient transitions in n-step buffer")
 
-        transitions = list(self.n_step_buffer)[:steps]
+        transitions = list(buf)[:steps]
 
-        # State and action from the *first* transition in the slice (t)
         market_data_t, account_state_t, action_t, _, _, _, _ = transitions[0]
         state_t = (market_data_t, account_state_t)
 
-        # Next state and done flag from the *last* transition in the slice (t + steps - 1)
         _, _, _, _, next_market_tn, next_account_tn, done_tn = transitions[-1]
         next_state_tn = (next_market_tn, next_account_tn)
 
-        # Calculate cumulative discounted reward G_t^(steps)
         n_step_reward = 0.0
         discount = 1.0
         for _, _, _, reward_i, _, _, done_i in transitions:
@@ -625,7 +676,6 @@ class RainbowDQNAgent:
             discount *= self.gamma
 
         if self.debug_mode:
-            # --- Start: Assert return types and shapes ---
             assert isinstance(state_t, tuple) and len(state_t) == 2, "state_t is not a 2-tuple"
             assert isinstance(state_t[0], np.ndarray) and state_t[0].shape == (
                 self.window_size,
@@ -645,22 +695,19 @@ class RainbowDQNAgent:
                 "next_state_tn[1] (account_state) has wrong type/shape"
             )
             assert isinstance(done_tn, (bool, np.bool_)), "done_tn is not a boolean"
-            # --- End: Assert return types and shapes ---
 
         return state_t, action_t, n_step_reward, next_state_tn, done_tn
 
-    def _store_n_step_transition(self, steps: int, *, pop_after: bool) -> None:
-        """Helper to compute and store an n-step (or truncated) transition."""
-        state_t, action_t, n_step_reward, next_state_tn, done_tn = self._get_n_step_info(steps)
+    def _store_n_step_transition(self, buf: deque, steps: int, *, pop_after: bool) -> None:
+        """Compute and store an n-step (or truncated) transition from *buf*."""
+        state_t, action_t, n_step_reward, next_state_tn, done_tn = self._get_n_step_info(buf, steps)
         market_data_t, account_state_t = state_t
         next_market_tn, next_account_tn = next_state_tn
 
-        # Track reward statistics
         self.n_step_reward_window.append(n_step_reward)
         if self.observed_n_step_rewards_history is not None:
             self.observed_n_step_rewards_history.append(n_step_reward)
 
-        # Store transition in PER
         self.buffer.store(
             market_data_t,
             account_state_t,
@@ -671,18 +718,23 @@ class RainbowDQNAgent:
             done_tn,
         )
 
-        # Advance buffer window when requested (e.g., during terminal flush)
-        if pop_after and len(self.n_step_buffer) > 0:
-            self.n_step_buffer.popleft()
+        if pop_after and len(buf) > 0:
+            buf.popleft()
 
-    def store_transition(self, obs, action, reward, next_obs, done):
-        """Stores experience in N-step buffer and potentially transfers to PER."""
-        if self._n_step_needs_reset:
-            self.n_step_buffer.clear()
-            self._n_step_needs_reset = False
+    def store_transition(self, obs, action, reward, next_obs, done, *, env_id: int = 0):
+        """Store experience in the per-env N-step buffer and potentially transfer to PER.
+
+        Args:
+            obs, action, reward, next_obs, done: standard transition tuple.
+            env_id: index of the parallel environment (default 0 for single-env compat).
+        """
+        buf = self._n_step_buffers[env_id]
+
+        if self._n_step_needs_reset_flags[env_id]:
+            buf.clear()
+            self._n_step_needs_reset_flags[env_id] = False
 
         if self.debug_mode:
-            # --- Start: Assert input types and shapes for store_transition ---
             assert isinstance(obs, dict) and "market_data" in obs and "account_state" in obs, "Invalid current observation format"
             assert isinstance(next_obs, dict) and "market_data" in next_obs and "account_state" in next_obs, (
                 "Invalid next observation format"
@@ -704,10 +756,7 @@ class RainbowDQNAgent:
             assert isinstance(action, (int, np.integer)), "Action must be an integer"
             assert isinstance(reward, (float, np.float32, np.float64)), "Reward must be a float"
             assert isinstance(done, (bool, np.bool_)), "Done flag must be boolean"
-            # --- End: Assert input types and shapes ---
 
-        # Store raw single-step transition data needed for n-step calculation
-        # (s_k, a_k, r_{k+1}, s_{k+1}_market, s_{k+1}_account, d_{k+1})
         transition = (
             obs["market_data"],
             obs["account_state"],
@@ -717,30 +766,27 @@ class RainbowDQNAgent:
             next_obs["account_state"],
             done,
         )
-        self.n_step_buffer.append(transition)
+        buf.append(transition)
 
-        buffer_full = len(self.n_step_buffer) == self.n_steps
+        buffer_full = len(buf) == self.n_steps
 
-        # When buffer is full during ongoing episodes, store the rolling n-step transition
         if buffer_full and not done:
-            self._store_n_step_transition(self.n_steps, pop_after=False)
+            self._store_n_step_transition(buf, self.n_steps, pop_after=False)
 
         if done:
-            # Ensure the final n-step transition is captured once
             if buffer_full:
                 self._store_n_step_transition(
+                    buf,
                     self.n_steps,
                     pop_after=self.store_partial_n_step,
                 )
 
             if self.store_partial_n_step:
-                # Optionally store truncated returns at episode end
-                while len(self.n_step_buffer) > 0:
-                    steps = len(self.n_step_buffer)
-                    self._store_n_step_transition(steps, pop_after=True)
+                while len(buf) > 0:
+                    steps = len(buf)
+                    self._store_n_step_transition(buf, steps, pop_after=True)
 
-            # Defer clearing until the next transition to keep tests' expectations
-            self._n_step_needs_reset = True
+            self._n_step_needs_reset_flags[env_id] = True
 
     def _project_target_distribution(self, next_market_data_batch, next_account_state_batch, rewards, dones):
         """

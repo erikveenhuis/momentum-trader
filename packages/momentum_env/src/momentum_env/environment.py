@@ -72,6 +72,15 @@ class TradingEnv(gym.Env):
     def reset(self, seed: int | None = None, options: dict | None = None) -> tuple[dict[str, np.ndarray], dict]:
         super().reset(seed=seed)
 
+        if options and "data_path" in options:
+            new_path = str(options["data_path"])
+            new_market_data = self.data_processor.load_and_process_data(new_path)
+            if new_market_data.num_features != self.market_data.num_features:
+                raise ValueError(
+                    f"Feature count mismatch: expected {self.market_data.num_features}, got {new_market_data.num_features} from {new_path}"
+                )
+            self.market_data = new_market_data
+
         self.state = {"current_step": 0}
         self.portfolio_state = PortfolioState(
             balance=self.config.initial_balance,

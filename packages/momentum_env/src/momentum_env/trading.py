@@ -40,6 +40,7 @@ class TradingLogic:
         self.min_trade_value: float = min_trade_value
         self.benchmark_allocation_frac = benchmark_allocation_frac
         self.peak_portfolio_value: float = 0.0
+        self._prev_drawdown: float = 0.0
 
     def handle_buy(
         self,
@@ -188,8 +189,9 @@ class TradingLogic:
         return new_state, is_valid  # Return the state and validity
 
     def reset_peak(self, initial_value: float) -> None:
-        """Reset peak portfolio value for drawdown tracking (call on env reset)."""
+        """Reset peak portfolio value and drawdown tracking (call on env reset)."""
         self.peak_portfolio_value = initial_value
+        self._prev_drawdown = 0.0
 
     def calculate_reward(
         self,
@@ -228,8 +230,11 @@ class TradingLogic:
         if self.peak_portfolio_value > 1e-9:
             drawdown = (self.peak_portfolio_value - post_trade_portfolio_value) / self.peak_portfolio_value
 
+        incremental_drawdown = max(0.0, drawdown - self._prev_drawdown)
+        self._prev_drawdown = drawdown
+
         cash_fraction = max(0.0, 1.0 - position_fraction)
         opportunity_cost = self.opportunity_cost_lambda * abs(price_return) * cash_fraction
 
-        reward = pnl_reward - self.drawdown_penalty_lambda * drawdown - opportunity_cost
+        reward = pnl_reward - self.drawdown_penalty_lambda * incremental_drawdown - opportunity_cost
         return reward

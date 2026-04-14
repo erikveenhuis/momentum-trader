@@ -165,7 +165,7 @@ def test_apply_trade(trading_logic, portfolio_state):
 
 
 def test_calculate_reward_pnl(trading_logic):
-    """Test PnL component of reward."""
+    """Test PnL component of reward (benchmark-relative)."""
     trading_logic.reset_peak(10000.0)
 
     reward = trading_logic.calculate_reward(
@@ -176,9 +176,11 @@ def test_calculate_reward_pnl(trading_logic):
         price_return=0.05,
         position_fraction=1.0,
     )
-    pnl = trading_logic.reward_scale * 0.05
+    market_return = (10500.0 - 10000.0) / 10000.0
+    benchmark_return = trading_logic.benchmark_allocation_frac * 0.05
+    expected = trading_logic.reward_scale * (market_return - benchmark_return)
     assert reward > 0
-    assert reward == pytest.approx(pnl, abs=0.01)
+    assert reward == pytest.approx(expected, abs=0.001)
 
 
 def test_calculate_reward_invalid(trading_logic):
@@ -218,6 +220,99 @@ def test_calculate_reward_drawdown_penalty(trading_logic):
         position_fraction=0.5,
     )
     assert reward < 0
+
+
+def test_incremental_drawdown_no_repeat_penalty(trading_logic):
+    """Staying at the same drawdown level should not incur further penalty."""
+    trading_logic.reset_peak(10000.0)
+
+    reward_drop = trading_logic.calculate_reward(
+        prev_portfolio_value=10000.0,
+        pre_trade_portfolio_value=9500.0,
+        post_trade_portfolio_value=9500.0,
+        is_valid=True,
+        price_return=-0.05,
+        position_fraction=0.5,
+    )
+
+    reward_flat = trading_logic.calculate_reward(
+        prev_portfolio_value=9500.0,
+        pre_trade_portfolio_value=9500.0,
+        post_trade_portfolio_value=9500.0,
+        is_valid=True,
+        price_return=0.0,
+        position_fraction=0.5,
+    )
+
+    assert reward_drop < reward_flat
+
+    market_return = (9500.0 - 10000.0) / 10000.0
+    benchmark_return = trading_logic.benchmark_allocation_frac * (-0.05)
+    pnl_reward = trading_logic.reward_scale * (market_return - benchmark_return)
+    dd_penalty = trading_logic.drawdown_penalty_lambda * 0.05
+    opp_cost = trading_logic.opportunity_cost_lambda * abs(-0.05) * 0.5
+    assert reward_drop == pytest.approx(pnl_reward - dd_penalty - opp_cost, abs=0.001)
+
+
+def test_incremental_drawdown_deepening(trading_logic):
+    """Deepening drawdown penalizes only the new increment."""
+    trading_logic.reset_peak(10000.0)
+
+    trading_logic.calculate_reward(
+        prev_portfolio_value=10000.0,
+        pre_trade_portfolio_value=9500.0,
+        post_trade_portfolio_value=9500.0,
+        is_valid=True,
+        price_return=-0.05,
+        position_fraction=0.5,
+    )
+
+    reward_deeper = trading_logic.calculate_reward(
+        prev_portfolio_value=9500.0,
+        pre_trade_portfolio_value=9000.0,
+        post_trade_portfolio_value=9000.0,
+        is_valid=True,
+        price_return=-0.0526,
+        position_fraction=0.5,
+    )
+
+    new_dd = (10000.0 - 9000.0) / 10000.0  # 10%
+    old_dd = (10000.0 - 9500.0) / 10000.0  # 5%
+    increment = new_dd - old_dd  # 5%
+    expected_penalty = trading_logic.drawdown_penalty_lambda * increment
+    assert expected_penalty > 0
+    assert reward_deeper < 0
+
+
+def test_incremental_drawdown_recovery_no_penalty(trading_logic):
+    """Recovering from drawdown should not incur any drawdown penalty."""
+    trading_logic.reset_peak(10000.0)
+
+    trading_logic.calculate_reward(
+        prev_portfolio_value=10000.0,
+        pre_trade_portfolio_value=9000.0,
+        post_trade_portfolio_value=9000.0,
+        is_valid=True,
+        price_return=-0.10,
+        position_fraction=0.5,
+    )
+
+    reward_recovery = trading_logic.calculate_reward(
+        prev_portfolio_value=9000.0,
+        pre_trade_portfolio_value=9500.0,
+        post_trade_portfolio_value=9500.0,
+        is_valid=True,
+        price_return=0.0556,
+        position_fraction=0.5,
+    )
+
+    market_return = (9500.0 - 9000.0) / 9000.0
+    benchmark_return = trading_logic.benchmark_allocation_frac * 0.0556
+    excess = market_return - benchmark_return
+    pnl_reward = trading_logic.reward_scale * excess
+    opp_cost = trading_logic.opportunity_cost_lambda * abs(0.0556) * 0.5
+    expected = pnl_reward - opp_cost
+    assert reward_recovery == pytest.approx(expected, abs=0.001)
 
 
 def test_calculate_reward_opportunity_cost(trading_logic):

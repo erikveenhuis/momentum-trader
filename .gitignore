@@ -10,6 +10,7 @@ venv/
 env/
 ENV/
 .venv
+.tb-venv/
 
 # Package files
 *.egg-info/

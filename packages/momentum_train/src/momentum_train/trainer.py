@@ -165,6 +165,7 @@ class RainbowTrainerModule:
             )
         self._final_phase_lr_applied = False
         self.warmup_steps = self.trainer_config.get("warmup_steps", 50000)
+        self.num_vector_envs = max(1, int(self.trainer_config.get("num_vector_envs", 1)))
         self.invalid_action_window = self.trainer_config.get("invalid_action_window", 20)
         self.invalid_action_rate_window: deque[float] = deque(maxlen=self.invalid_action_window)
         # Extract run parameters
@@ -1657,9 +1658,241 @@ class RainbowTrainerModule:
             invalid_action_count,
         )
 
+    # ------------------------------------------------------------------
+    # Vectorized training loop
+    # ------------------------------------------------------------------
+
+    def _train_vectorized(
+        self,
+        num_episodes: int,
+        start_episode: int,
+        total_train_steps: int,
+        val_files: list,
+    ) -> int:
+        """Step-based training loop with *num_vector_envs* parallel environments.
+
+        Returns the final ``total_train_steps``.
+        """
+        from .vector_env import create_vector_env, reset_done_envs
+
+        num_envs = self.num_vector_envs
+        self.agent.set_num_envs(num_envs)
+        logger.info(f"Vectorized training with {num_envs} parallel envs (SyncVectorEnv, DISABLED autoreset)")
+
+        vec_env = create_vector_env(num_envs, self.env_config, self.data_manager)
+
+        # Initial reset with curriculum files
+        curriculum_frac = min(1.0, 0.3 + 0.7 * (start_episode / max(num_episodes, 1)))
+        for i in range(num_envs):
+            path = str(self.data_manager.get_random_training_file(curriculum_frac=curriculum_frac))
+            vec_env.envs[i].reset(options={"data_path": path})
+        obs, _info = vec_env.reset()
+
+        # Per-env tracking
+        per_env_episode_reward = np.zeros(num_envs)
+        per_env_steps = np.zeros(num_envs, dtype=int)
+        per_env_trackers = [PerformanceTracker() for _ in range(num_envs)]
+        for i in range(num_envs):
+            initial_info = vec_env.envs[i]._get_info()
+            per_env_trackers[i].add_initial_value(initial_info["portfolio_value"])
+
+        completed_episodes = start_episode
+        total_rewards: list[float] = []
+        steps_since_last_learn = 0
+
+        # Aggregate action distribution across all envs (rolling window)
+        vec_action_counts = np.zeros(self.agent.num_actions, dtype=int)
+        vec_action_window = deque(maxlen=10_000)
+
+        while completed_episodes < num_episodes:
+            if self._abort_training:
+                break
+
+            # Select actions
+            if total_train_steps < self.warmup_steps:
+                actions = np.array([vec_env.envs[i].action_space.sample() for i in range(num_envs)])
+            else:
+                self.agent.env_steps = total_train_steps - self.warmup_steps
+                actions = self.agent.select_actions_batch(obs)
+
+            # Step all envs
+            next_obs, rewards, terminateds, truncateds, infos = vec_env.step(actions)
+            dones = np.logical_or(terminateds, truncateds)
+
+            # Process each env's transition
+            for i in range(num_envs):
+                reward_i = float(rewards[i])
+                if self.reward_clip_value is not None:
+                    reward_i = float(np.clip(reward_i, -self.reward_clip_value, self.reward_clip_value))
+
+                obs_i = {"market_data": obs["market_data"][i], "account_state": obs["account_state"][i]}
+                next_obs_i = {"market_data": next_obs["market_data"][i], "account_state": next_obs["account_state"][i]}
+
+                self.agent.store_transition(obs_i, int(actions[i]), reward_i, next_obs_i, bool(dones[i]), env_id=i)
+
+                per_env_episode_reward[i] += reward_i
+                per_env_steps[i] += 1
+
+                info_i = {k: (v[i] if hasattr(v, "__getitem__") else v) for k, v in infos.items()} if isinstance(infos, dict) else {}
+                per_env_trackers[i].update(
+                    portfolio_value=info_i.get("portfolio_value", 0.0),
+                    action=int(actions[i]),
+                    reward=reward_i,
+                    transaction_cost=info_i.get("step_transaction_cost", 0.0),
+                    position=info_i.get("position"),
+                    balance=info_i.get("balance"),
+                    price=info_i.get("price"),
+                )
+
+            for a in actions:
+                vec_action_counts[int(a)] += 1
+                vec_action_window.append(int(a))
+
+            total_train_steps += num_envs
+            self.total_train_steps = total_train_steps
+            steps_since_last_learn += num_envs
+
+            # Threshold-based learning schedule
+            if len(self.agent.buffer) >= self.agent.batch_size and total_train_steps > self.warmup_steps:
+                while steps_since_last_learn >= self.update_freq:
+                    try:
+                        for _ in range(self.gradient_updates_per_step):
+                            loss = self.agent.learn()
+                            if loss is None:
+                                break
+                            if self.writer:
+                                self.writer.add_scalar("Train/Loss", float(loss), total_train_steps)
+                    except Exception:
+                        logger.error("Exception during learning update", exc_info=True)
+                        self._abort_training = True
+                        self._abort_reason = "Learning error in vectorized loop"
+                        self._abort_step = total_train_steps
+                        break
+                    steps_since_last_learn -= self.update_freq
+
+            # Handle done envs
+            if dones.any():
+                done_indices = np.where(dones)[0]
+                for i in done_indices:
+                    completed_episodes += 1
+                    total_rewards.append(per_env_episode_reward[i])
+
+                    ep_metrics = per_env_trackers[i].get_metrics()
+                    ep_action_counts = ep_metrics.get("action_counts", {})
+                    ep_steps = int(per_env_steps[i])
+                    ep_reward = per_env_episode_reward[i]
+
+                    should_log_full = completed_episodes <= 5 or completed_episodes % max(1, self.log_freq) == 0
+
+                    if should_log_full:
+                        avg_rw = np.mean(total_rewards[-self.reward_window :])
+                        curriculum_frac_now = min(1.0, 0.3 + 0.7 * (completed_episodes / max(num_episodes, 1)))
+
+                        act_str = " ".join(f"{k}:{v}" for k, v in sorted(ep_action_counts.items()))
+                        # Rolling action distribution from recent window
+                        if vec_action_window:
+                            window_counts = np.bincount(
+                                list(vec_action_window),
+                                minlength=self.agent.num_actions,
+                            )
+                            window_total = window_counts.sum()
+                            act_pct = " ".join(
+                                f"{ai}:{window_counts[ai] * 100 / window_total:.0f}%" for ai in range(self.agent.num_actions)
+                            )
+                        else:
+                            act_pct = "n/a"
+
+                        logger.info(
+                            f"[Vec] Ep {completed_episodes}/{num_episodes} (env {i}) | "
+                            f"steps={ep_steps} reward={ep_reward:.4f} "
+                            f"avg_{self.reward_window}={avg_rw:.4f} | "
+                            f"PV=${ep_metrics.get('portfolio_value', 0):.2f} "
+                            f"ret={ep_metrics.get('total_return', 0):.2f}% "
+                            f"sharpe={ep_metrics.get('sharpe_ratio', 0):.4f} "
+                            f"dd={ep_metrics.get('max_drawdown', 0) * 100:.2f}% | "
+                            f"actions=[{act_str}] dist=[{act_pct}] | "
+                            f"curriculum={curriculum_frac_now:.2f} "
+                            f"eps={self.agent.current_epsilon:.4f} "
+                            f"lr={self.agent.optimizer.param_groups[0]['lr']:.2e} "
+                            f"total_steps={total_train_steps}"
+                        )
+
+                    self._log_progress(
+                        "episode",
+                        episode=completed_episodes,
+                        steps=ep_steps,
+                        total_steps=total_train_steps,
+                        reward=round(ep_reward, 4),
+                        avg_reward=round(np.mean(total_rewards[-self.reward_window :]), 4),
+                        total_return=round(ep_metrics.get("total_return", 0.0), 2) if ep_metrics else 0.0,
+                        sharpe=round(ep_metrics.get("sharpe_ratio", 0.0), 4) if ep_metrics else 0.0,
+                        max_dd=round(ep_metrics.get("max_drawdown", 0.0) * 100, 2) if ep_metrics else 0.0,
+                        action_counts=ep_action_counts,
+                        lr=self.agent.optimizer.param_groups[0]["lr"],
+                        pv=round(ep_metrics.get("portfolio_value", 0.0), 2) if ep_metrics else 0.0,
+                        env_id=int(i),
+                    )
+
+                    if self.writer:
+                        self.writer.add_scalar("Train/Episode Reward", ep_reward, completed_episodes)
+                        self.writer.add_scalar(
+                            f"Train/Average Reward ({self.reward_window} ep)",
+                            np.mean(total_rewards[-self.reward_window :]),
+                            completed_episodes,
+                        )
+                        self.writer.add_scalar("Train/Steps Per Episode", ep_steps, completed_episodes)
+                        if ep_metrics:
+                            self.writer.add_scalar("Train/Total Return Pct", ep_metrics.get("total_return", 0), completed_episodes)
+                            self.writer.add_scalar("Train/Sharpe Ratio", ep_metrics.get("sharpe_ratio", 0), completed_episodes)
+                            self.writer.add_scalar("Train/Max Drawdown Pct", ep_metrics.get("max_drawdown", 0) * 100, completed_episodes)
+                            self.writer.add_scalar("Train/Transaction Costs", ep_metrics.get("transaction_costs", 0), completed_episodes)
+                            for action_idx, count in ep_action_counts.items():
+                                rate = count / max(ep_steps, 1)
+                                self.writer.add_scalar(f"Train/Action Rate/{action_idx}", rate, completed_episodes)
+                        self.writer.add_scalar("Train/Epsilon", self.agent.current_epsilon, completed_episodes)
+                        self.writer.add_scalar("Train/Final Portfolio Value", ep_metrics.get("portfolio_value", 0), completed_episodes)
+
+                    per_env_episode_reward[i] = 0.0
+                    per_env_steps[i] = 0
+                    per_env_trackers[i] = PerformanceTracker()
+
+                # Validation and checkpointing at episode boundaries
+                if completed_episodes % self.validation_freq == 0:
+                    last_tracker = per_env_trackers[done_indices[-1]]
+                    should_stop = self._handle_validation_and_checkpointing(
+                        completed_episodes - 1, total_train_steps, val_files, last_tracker
+                    )
+                    if should_stop:
+                        logger.info("Early stopping condition met. Exiting vectorized training loop.")
+                        break
+                elif completed_episodes % self.checkpoint_save_freq == 0:
+                    self._save_checkpoint(
+                        completed_episodes - 1,
+                        total_train_steps,
+                        is_best=False,
+                        validation_score=None,
+                    )
+
+                # Reset done envs with new data
+                curriculum_frac = min(1.0, 0.3 + 0.7 * (completed_episodes / max(num_episodes, 1)))
+                next_obs = reset_done_envs(vec_env, dones, self.data_manager, curriculum_frac)
+
+                for i in done_indices:
+                    init_info = vec_env.envs[i]._get_info()
+                    per_env_trackers[i].add_initial_value(init_info["portfolio_value"])
+
+            obs = next_obs
+
+            # Periodic PER stats logging
+            self._maybe_log_per_stats(total_train_steps)
+
+        vec_env.close()
+        return total_train_steps
+
+    # ------------------------------------------------------------------
+
     def train(
         self,
-        # env: TradingEnv, # No longer needed as direct input
         num_episodes: int,
         start_episode: int,
         start_total_steps: int,
@@ -1668,29 +1901,24 @@ class RainbowTrainerModule:
         specific_file: str | None = None,
     ):
         """Train the Rainbow DQN agent by orchestrating helper methods."""
-        # Basic input validation
         assert isinstance(num_episodes, int) and num_episodes > 0
         assert isinstance(start_episode, int) and start_episode >= 0
         assert isinstance(start_total_steps, int) and start_total_steps >= 0
         assert isinstance(specific_file, (str, type(None)))
 
-        # Initialize state from parameters
         self.best_validation_metric = initial_best_score
         self.early_stopping_counter = initial_early_stopping_counter
         total_train_steps = start_total_steps
-        self.total_train_steps = start_total_steps  # Also store on self for internal checks
+        self.total_train_steps = start_total_steps
 
         self.agent.set_training_mode(True)
         self._abort_training = False
         self._abort_reason = None
         self._abort_step = None
 
-        total_rewards = []  # Track rewards across episodes for logging
-
         logger.info("====== STARTING/RESUMING RAINBOW DQN TRAINING ======")
         logger.info(f"Starting from Episode: {start_episode + 1}/{num_episodes}")
         logger.info(f"Starting from Total Steps: {total_train_steps}")
-        # Log other config details (agent, env, trainer params)
         logger.info(f"Agent Config: {self.agent_config}")
         logger.info(f"Env Config: {self.env_config}")
         logger.info(f"Trainer Config: {self.trainer_config}")
@@ -1699,7 +1927,26 @@ class RainbowTrainerModule:
         if not val_files:
             logger.warning("No validation files found. Training will proceed without validation.")
 
-        # Main training loop
+        # Dispatch to vectorized loop when num_vector_envs > 1
+        if self.num_vector_envs > 1 and specific_file is None:
+            logger.info(f"Using vectorized training with {self.num_vector_envs} parallel envs.")
+            try:
+                total_train_steps = self._train_vectorized(
+                    num_episodes,
+                    start_episode,
+                    total_train_steps,
+                    val_files,
+                )
+            except Exception:
+                logger.error("!!! UNEXPECTED EXCEPTION in vectorized training loop !!!", exc_info=True)
+            finally:
+                self._finalize_training(total_train_steps, num_episodes, val_files)
+                self.agent.set_training_mode(False)
+            return
+
+        # Legacy single-env episodic loop
+        total_rewards = []
+
         try:
             for episode in range(start_episode, num_episodes):
                 if self._maybe_apply_final_phase_lr_decay(
@@ -1715,10 +1962,9 @@ class RainbowTrainerModule:
                 episode_env, initial_obs, initial_info, tracker = self._initialize_episode(specific_file, episode, num_episodes)
                 if episode_env is None or tracker is None:
                     logger.error(f"Failed to initialize episode {episode + 1}. Skipping.")
-                    continue  # Skip to next episode
+                    continue
 
                 # 2. Run steps within the episode
-                # Pass the initial_obs obtained from initialization
                 (
                     episode_reward,
                     episode_loss,
@@ -1727,7 +1973,7 @@ class RainbowTrainerModule:
                     info,
                     invalid_action_count,
                 ) = self._run_episode_steps(episode_env, initial_obs, tracker, episode, total_train_steps)
-                self.total_train_steps = total_train_steps  # Update internal tracker
+                self.total_train_steps = total_train_steps
 
                 # 3. Log episode summary
                 total_rewards.append(episode_reward)
@@ -1760,13 +2006,11 @@ class RainbowTrainerModule:
 
                 if should_stop:
                     logger.info("Early stopping condition met. Exiting training loop.")
-                    break  # Exit training loop if early stopping triggered
+                    break
 
         except Exception:
             logger.error("!!! UNEXPECTED EXCEPTION in main training loop !!!", exc_info=True)
-            # Consider saving a final checkpoint here? Or just rely on last successful save.
 
         finally:
-            # 5. Finalize training (save final model, log summary)
             self._finalize_training(total_train_steps, num_episodes, val_files)
-            self.agent.set_training_mode(False)  # Ensure agent is left in eval mode
+            self.agent.set_training_mode(False)
