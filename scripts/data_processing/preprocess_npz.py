@@ -61,9 +61,70 @@ FEATURE_NAMES = RAW_COLUMNS + [
     "hl_range_ratio",
 ]
 
+# --- Price-contamination filter ---
+# Some minute-bar sources (historically Polygon/Massive for ETC-USD, XTZ-USD, DOGE-USD
+# and others in 2017-2021) interleave two venue streams, producing close-price series
+# that alternate between two price levels every other bar. A naive RL agent can "learn"
+# to round-trip against these artifacts and produce astronomical returns that do not
+# generalize to live trading. These constants identify such files.
+#
+#   - MIN_ALTERNATING_BIG_PAIRS: consecutive bars where both |log return| > 5% AND the
+#     two returns have opposite signs. Real markets almost never do this >~80 times in
+#     a single day; contaminated files typically hit 100-600.
+#   - MAX_ORACLE_LOG_GROWTH: the perfect-trader log-growth a file affords
+#     (sum over bars of max(0, log(p[t+1]/p[t]))). Healthy crypto days rarely exceed
+#     ~20; we reject >= 25 when the daily range is narrow.
+#   - CONTAMINATION_MAX_RANGE_RATIO: price_max / price_min. Real extreme events (LUNA
+#     collapse, May 2021 crash, Covid crash) pair huge oracle growth with huge range;
+#     contamination pairs huge oracle growth with a narrow range.
+MIN_ALTERNATING_BIG_PAIRS = 100
+MAX_ORACLE_LOG_GROWTH = 25.0
+CONTAMINATION_MAX_RANGE_RATIO = 5.0
+BIG_MOVE_LOG_THRESHOLD = float(np.log(1.05))
+
+
+def check_price_contamination(close_prices: np.ndarray) -> str | None:
+    """Return a reason string if close_prices look dual-feed contaminated, else None.
+
+    Two independent checks, either of which triggers rejection:
+      1. Many alternating big (>5%) bar-to-bar moves (classic two-venue interleave).
+      2. Oracle-like perfect-trader growth that is absurd relative to the daily range.
+    """
+    if close_prices.size < 2:
+        return None
+
+    cp = close_prices.astype(np.float64, copy=False)
+    if not np.all(np.isfinite(cp)) or np.any(cp <= 0):
+        return "non-finite or non-positive close prices"
+
+    log_returns = np.log(cp[1:] / cp[:-1])
+    abs_big = np.abs(log_returns) > BIG_MOVE_LOG_THRESHOLD
+
+    if abs_big.size >= 2:
+        # Alternating big-move pairs: adjacent bars both >5% magnitude with opposite signs.
+        both_big = abs_big[:-1] & abs_big[1:]
+        opposite_sign = log_returns[:-1] * log_returns[1:] < 0.0
+        alternating_pairs = int(np.sum(both_big & opposite_sign))
+        if alternating_pairs >= MIN_ALTERNATING_BIG_PAIRS:
+            return f"alternating >5% bar pairs = {alternating_pairs} (>= {MIN_ALTERNATING_BIG_PAIRS})"
+
+    oracle_log_growth = float(np.sum(np.log(np.maximum(cp[1:] / cp[:-1], 1.0))))
+    range_ratio = float(cp.max() / cp.min())
+    if oracle_log_growth >= MAX_ORACLE_LOG_GROWTH and range_ratio < CONTAMINATION_MAX_RANGE_RATIO:
+        return (
+            f"oracle log-growth {oracle_log_growth:.1f} >= {MAX_ORACLE_LOG_GROWTH:.0f} "
+            f"with narrow daily range {range_ratio:.2f}x < {CONTAMINATION_MAX_RANGE_RATIO:.0f}x"
+        )
+
+    return None
+
 
 def process_single_csv(csv_path: Path) -> str | None:
-    """Convert one CSV to .npz. Returns error message on failure, None on success."""
+    """Convert one CSV to .npz. Returns error message on failure/rejection, None on success.
+
+    Files that fail the price-contamination check are skipped and any pre-existing .npz
+    at the same path is removed.
+    """
     npz_path = csv_path.with_suffix(".npz")
     try:
         df = pd.read_csv(csv_path)
@@ -82,6 +143,13 @@ def process_single_csv(csv_path: Path) -> str | None:
 
         raw = df[RAW_COLUMNS].values.astype(np.float32)
         close_prices = df["close"].values.astype(np.float32)
+
+        contamination = check_price_contamination(close_prices)
+        if contamination is not None:
+            if npz_path.exists():
+                npz_path.unlink()
+            return f"REJECTED {csv_path.name}: {contamination}"
+
         derived = compute_derived_features(df)
 
         features = np.concatenate([raw, derived], axis=1)
@@ -134,6 +202,7 @@ def run_preprocessing(
 
     success = 0
     errors = 0
+    rejected = 0
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(process_single_csv, p): p for p in all_csvs}
@@ -141,13 +210,18 @@ def run_preprocessing(
             result = future.result()
             if result is None:
                 success += 1
+            elif result.startswith("REJECTED "):
+                rejected += 1
+                logger.warning(result)
             else:
                 errors += 1
                 logger.error(f"Error: {result}")
             if i % 5000 == 0:
-                logger.info(f"Progress: {i}/{len(all_csvs)} (success={success}, errors={errors})")
+                logger.info(f"Progress: {i}/{len(all_csvs)} (success={success}, rejected={rejected}, errors={errors})")
 
-    logger.info(f"Preprocessing complete. Success: {success}, Errors: {errors}, Total: {len(all_csvs)}")
+    logger.info(
+        f"Preprocessing complete. Success: {success}, Rejected (contamination): {rejected}, Errors: {errors}, Total: {len(all_csvs)}"
+    )
 
 
 if __name__ == "__main__":
