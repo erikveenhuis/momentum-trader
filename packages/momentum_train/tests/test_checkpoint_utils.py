@@ -8,7 +8,6 @@ REQUIRED_KEYS = [
     "episode",
     "total_train_steps",
     "network_state_dict",
-    "optimizer_state_dict",
     "best_validation_metric",
     "target_network_state_dict",
     "agent_total_steps",
@@ -16,9 +15,19 @@ REQUIRED_KEYS = [
     "agent_config",
 ]
 
+OPTIONAL_KEYS = [
+    "optimizer_state_dict",
+    "scheduler_state_dict",
+    "scaler_state_dict",
+]
 
-def _make_valid_checkpoint() -> dict:
-    return {key: 0 for key in REQUIRED_KEYS}
+
+def _make_valid_checkpoint(*, with_optimizer: bool = True) -> dict:
+    ckpt = {key: 0 for key in REQUIRED_KEYS}
+    if with_optimizer:
+        for key in OPTIONAL_KEYS:
+            ckpt[key] = 0
+    return ckpt
 
 
 # --- find_latest_checkpoint ---
@@ -82,6 +91,25 @@ def test_load_checkpoint_missing_keys(tmp_path):
 
     result = load_checkpoint(str(path))
     assert result is None
+
+
+@pytest.mark.unit
+def test_load_checkpoint_succeeds_without_optimizer_state(tmp_path):
+    """A checkpoint stripped by --reset-lr-on-resume / --strip-optimizer must still load.
+
+    The optimizer / scheduler / scaler keys are intentionally optional
+    because both `--reset-lr-on-resume` and
+    `scripts/recover_from_collapse.py --strip-optimizer` produce
+    checkpoints without them.
+    """
+    ckpt = _make_valid_checkpoint(with_optimizer=False)
+    path = tmp_path / "stripped.pt"
+    torch.save(ckpt, path)
+
+    loaded = load_checkpoint(str(path))
+    assert loaded is not None
+    for key in OPTIONAL_KEYS:
+        assert key not in loaded
 
 
 @pytest.mark.unit

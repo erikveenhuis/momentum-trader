@@ -130,6 +130,126 @@ def test_select_action(agent, default_config):
 
 
 @pytest.mark.unit
+def test_select_action_with_provenance_eval_mode_is_always_greedy(agent, default_config):
+    """Tier 2c: in eval mode the agent never explores → was_greedy is always True."""
+    obs = generate_dummy_observation(default_config)
+    agent.set_training_mode(False)
+    for _ in range(5):
+        action, was_greedy = agent.select_action_with_provenance(obs)
+        assert isinstance(action, int)
+        assert 0 <= action < default_config["num_actions"]
+        assert was_greedy is True
+
+
+@pytest.mark.unit
+def test_select_action_with_provenance_training_eps_zero_is_greedy(agent, default_config):
+    """Tier 2c: with epsilon forced to 0 in train mode, every action is greedy."""
+    obs = generate_dummy_observation(default_config)
+    agent.set_training_mode(True)
+    # Force epsilon = 0 by saturating the linear decay.
+    agent.epsilon_decay_steps = 1
+    agent.epsilon_start = 0.0
+    agent.epsilon_end = 0.0
+    agent.env_steps = 1
+    for _ in range(5):
+        action, was_greedy = agent.select_action_with_provenance(obs)
+        assert isinstance(action, int)
+        assert 0 <= action < default_config["num_actions"]
+        assert was_greedy is True
+
+
+@pytest.mark.unit
+def test_select_action_with_provenance_training_eps_one_is_eps(agent, default_config):
+    """Tier 2c: with epsilon forced to 1 in train mode, every action is eps-forced."""
+    obs = generate_dummy_observation(default_config)
+    agent.set_training_mode(True)
+    agent.epsilon_decay_steps = 1
+    agent.epsilon_start = 1.0
+    agent.epsilon_end = 1.0
+    agent.env_steps = 1
+    for _ in range(5):
+        _action, was_greedy = agent.select_action_with_provenance(obs)
+        assert was_greedy is False
+
+
+@pytest.mark.unit
+def test_select_actions_batch_with_provenance_eval_mode_is_greedy(agent, default_config):
+    """Tier 2c: vectorized eval batch never explores → all flags True."""
+    n = 4
+    market_batch = np.stack([generate_dummy_observation(default_config)["market_data"] for _ in range(n)])
+    account_batch = np.stack([generate_dummy_observation(default_config)["account_state"] for _ in range(n)])
+    obs_batch = {"market_data": market_batch, "account_state": account_batch}
+    agent.set_training_mode(False)
+    actions, was_greedy = agent.select_actions_batch_with_provenance(obs_batch)
+    assert actions.shape == (n,)
+    assert was_greedy.shape == (n,)
+    assert was_greedy.dtype == bool
+    assert was_greedy.all()
+
+
+@pytest.mark.unit
+def test_select_actions_batch_with_provenance_training_eps_one_is_eps(agent, default_config):
+    """Tier 2c: vectorized train batch with epsilon=1 marks every env as eps-forced."""
+    n = 4
+    market_batch = np.stack([generate_dummy_observation(default_config)["market_data"] for _ in range(n)])
+    account_batch = np.stack([generate_dummy_observation(default_config)["account_state"] for _ in range(n)])
+    obs_batch = {"market_data": market_batch, "account_state": account_batch}
+    agent.set_training_mode(True)
+    agent.epsilon_decay_steps = 1
+    agent.epsilon_start = 1.0
+    agent.epsilon_end = 1.0
+    agent.env_steps = 1
+    _actions, was_greedy = agent.select_actions_batch_with_provenance(obs_batch)
+    assert was_greedy.shape == (n,)
+    assert not was_greedy.any()
+
+
+@pytest.mark.unit
+def test_greedy_context_manager_disables_exploration(agent, default_config):
+    """Tier 2d: agent.greedy() puts the agent in deterministic mode and restores."""
+    agent.set_training_mode(True)
+    # Force epsilon=1 so any non-greedy slot would be eps-overridden.
+    agent.epsilon_decay_steps = 1
+    agent.epsilon_start = 1.0
+    agent.epsilon_end = 1.0
+    agent.env_steps = 1
+    obs = generate_dummy_observation(default_config)
+
+    with agent.greedy():
+        assert agent.training_mode is False
+        for _ in range(5):
+            _action, was_greedy = agent.select_action_with_provenance(obs)
+            assert was_greedy is True
+
+    # Restored back to training mode.
+    assert agent.training_mode is True
+    _action, was_greedy = agent.select_action_with_provenance(obs)
+    assert was_greedy is False
+
+
+@pytest.mark.unit
+def test_greedy_context_restores_on_exception(agent, default_config):
+    """Tier 2d: training mode is restored even if the body raises."""
+    agent.set_training_mode(True)
+    try:
+        with agent.greedy():
+            assert agent.training_mode is False
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+    assert agent.training_mode is True
+
+
+@pytest.mark.unit
+def test_greedy_context_when_already_eval_is_idempotent(agent, default_config):
+    """Tier 2d: entering greedy() while already in eval mode keeps eval mode on exit."""
+    agent.set_training_mode(False)
+    with agent.greedy():
+        assert agent.training_mode is False
+    assert agent.training_mode is False
+
+
+@pytest.mark.unit
 def test_inference_only_cpu_forward(default_config):
     """Live path: CPU + inference_only skips compile and runs ``select_action``."""
     cfg = dict(default_config)
@@ -515,3 +635,522 @@ def test_load_state_dict_path(agent, default_config, tmp_path):
 # Note: Testing the numerical correctness of _project_target_distribution
 # would require known inputs and analytically derived or pre-computed expected outputs,
 # which can be complex to set up. The current tests focus on integration and API usage.
+
+
+# ---------------------------------------------------------------------------
+# Tier 1c: categorical-target stats mirrored to TensorBoard
+# ---------------------------------------------------------------------------
+
+
+class _CapturingWriter:
+    """Minimal SummaryWriter mock for verifying TB calls in unit tests."""
+
+    def __init__(self):
+        self.scalars: list[tuple[str, float, int]] = []
+        self.histograms: list[tuple[str, np.ndarray, int]] = []
+
+    def add_scalar(self, tag, value, step):
+        self.scalars.append((str(tag), float(value), int(step)))
+
+    def add_histogram(self, tag, values, step):
+        self.histograms.append((str(tag), np.asarray(values), int(step)))
+
+    def tags(self) -> list[str]:
+        return [t for t, _v, _s in self.scalars]
+
+    def value_for(self, tag: str) -> float:
+        matches = [v for t, v, _s in self.scalars if t == tag]
+        if not matches:
+            raise KeyError(f"No scalar emitted with tag {tag!r}")
+        return matches[-1]
+
+
+def _make_categorical_stub_agent(num_atoms: int = 11):
+    """Construct a partial agent suitable for exercising _log_categorical_target_stats only."""
+    stub = RainbowDQNAgent.__new__(RainbowDQNAgent)
+    stub.num_atoms = num_atoms
+    stub.support_cpu = np.linspace(-1.0, 1.0, num_atoms, dtype=np.float64)
+    stub.categorical_logging_interval = 1
+    stub.categorical_logging_percentiles = (5.0, 25.0, 50.0, 75.0, 95.0)
+    stub._categorical_target_accumulator = {
+        "mass": np.zeros(num_atoms, dtype=np.float64),
+        "samples": 0,
+    }
+    stub.total_steps = 1234
+    stub.tb_writer = None
+    return stub
+
+
+@pytest.mark.unit
+def test_log_categorical_target_stats_mirrors_to_tensorboard():
+    stub = _make_categorical_stub_agent(num_atoms=11)
+    stub.tb_writer = _CapturingWriter()
+
+    # Concentrate the accumulated mass on the centre atom so the resulting probs
+    # peak at index 5 (support value 0.0); edge atoms hold a tiny share.
+    stub._categorical_target_accumulator["mass"][5] = 80.0
+    stub._categorical_target_accumulator["mass"][0] = 1.0
+    stub._categorical_target_accumulator["mass"][-1] = 1.0
+    stub._categorical_target_accumulator["mass"][3] = 9.0
+    stub._categorical_target_accumulator["mass"][7] = 9.0
+    stub._categorical_target_accumulator["samples"] = 100
+
+    RainbowDQNAgent._log_categorical_target_stats(stub)
+
+    writer = stub.tb_writer
+    tags = set(writer.tags())
+    assert "Train/CategoricalTarget/Mean" in tags
+    assert "Train/CategoricalTarget/Edge_Mass_Min" in tags
+    assert "Train/CategoricalTarget/Edge_Mass_Max" in tags
+    assert "Train/CategoricalTarget/Samples" in tags
+    for percentile in (5, 25, 50, 75, 95):
+        assert f"Train/CategoricalTarget/P{percentile}" in tags
+
+    expected_total = 80.0 + 1.0 + 1.0 + 9.0 + 9.0
+    expected_edge = 1.0 / expected_total
+    assert writer.value_for("Train/CategoricalTarget/Edge_Mass_Min") == pytest.approx(expected_edge)
+    assert writer.value_for("Train/CategoricalTarget/Edge_Mass_Max") == pytest.approx(expected_edge)
+    assert writer.value_for("Train/CategoricalTarget/Samples") == pytest.approx(100.0)
+    # Mass is symmetric around the centre atom (support value 0.0) so mean ≈ 0.
+    assert writer.value_for("Train/CategoricalTarget/Mean") == pytest.approx(0.0, abs=1e-9)
+    # The 50th percentile should land on the centre atom (support value 0.0).
+    assert writer.value_for("Train/CategoricalTarget/P50") == pytest.approx(0.0, abs=1e-9)
+
+    assert any(tag == "Train/CategoricalTarget/Distribution" for tag, _v, _s in writer.histograms)
+    hist_tag, hist_values, hist_step = writer.histograms[0]
+    assert hist_tag == "Train/CategoricalTarget/Distribution"
+    assert hist_step == 1234
+    assert hist_values.shape == (11,)
+    assert hist_values.sum() == pytest.approx(1.0, rel=1e-6)
+
+    # Accumulator is reset after logging.
+    assert stub._categorical_target_accumulator["samples"] == 0
+    assert stub._categorical_target_accumulator["mass"].sum() == pytest.approx(0.0)
+
+
+@pytest.mark.unit
+def test_log_categorical_target_stats_no_writer_is_noop():
+    stub = _make_categorical_stub_agent(num_atoms=11)
+    stub._categorical_target_accumulator["mass"][5] = 100.0
+    stub._categorical_target_accumulator["samples"] = 100
+    # Should not raise even though tb_writer is None.
+    RainbowDQNAgent._log_categorical_target_stats(stub)
+    assert stub._categorical_target_accumulator["samples"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Tier 1e: n-step reward window stats mirrored to TensorBoard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_log_n_step_reward_window_stats_mirrors_to_tensorboard():
+    from collections import deque as _deque
+
+    stub = RainbowDQNAgent.__new__(RainbowDQNAgent)
+    stub.total_steps = 60
+    stub.n_step_reward_window = _deque([0.1, -0.2, 0.3, -0.4, 0.5], maxlen=60)
+    stub.tb_writer = _CapturingWriter()
+
+    RainbowDQNAgent._log_n_step_reward_window_stats(stub)
+
+    writer = stub.tb_writer
+    tags = set(writer.tags())
+    for expected in (
+        "Train/NStepReward/Mean",
+        "Train/NStepReward/Std",
+        "Train/NStepReward/Min",
+        "Train/NStepReward/Max",
+        "Train/NStepReward/WindowSize",
+    ):
+        assert expected in tags, f"Missing n-step reward scalar: {expected}"
+
+    expected_mean = float(np.mean([0.1, -0.2, 0.3, -0.4, 0.5]))
+    expected_std = float(np.std([0.1, -0.2, 0.3, -0.4, 0.5], ddof=0))
+    assert writer.value_for("Train/NStepReward/Mean") == pytest.approx(expected_mean)
+    assert writer.value_for("Train/NStepReward/Std") == pytest.approx(expected_std)
+    assert writer.value_for("Train/NStepReward/Min") == pytest.approx(-0.4)
+    assert writer.value_for("Train/NStepReward/Max") == pytest.approx(0.5)
+    assert writer.value_for("Train/NStepReward/WindowSize") == pytest.approx(5.0)
+
+
+@pytest.mark.unit
+def test_log_noisy_sigma_stats_emits_per_module_scalars(agent):
+    """Tier 3a: per-NoisyLinear sigma stats are mirrored to TensorBoard."""
+    agent.tb_writer = _CapturingWriter()
+    agent.noisy_sigma_logging_interval = 1
+    agent.total_steps = 4242
+    agent._log_noisy_sigma_stats()
+
+    writer = agent.tb_writer
+    tags = writer.tags()
+    # We don't hard-code module names (depends on the network architecture),
+    # but at least one NoisyLinear must be present and produce all 3 stats.
+    assert any(t.startswith("Train/Noisy/") and t.endswith("/SigmaMean") for t in tags), (
+        f"No NoisyLinear sigma scalars emitted; tags={tags!r}"
+    )
+    assert any(t.endswith("/SigmaMax") for t in tags)
+    assert any(t.endswith("/SigmaMin") for t in tags)
+    assert "Train/Noisy/AggregateSigmaMean" in tags
+    assert "Train/Noisy/ModuleCount" in tags
+
+    module_count = writer.value_for("Train/Noisy/ModuleCount")
+    assert module_count >= 1.0
+    # All scalars should share the same step.
+    steps = {s for _t, _v, s in writer.scalars}
+    assert steps == {4242}
+
+
+@pytest.mark.unit
+def test_log_noisy_sigma_stats_no_writer_is_noop(agent):
+    """Tier 3a: missing tb_writer is a no-op (no exception)."""
+    agent.tb_writer = None
+    agent._log_noisy_sigma_stats()
+
+
+# ---------------------------------------------------------------------------
+# Tier 3b: Q-value stats mirrored to TensorBoard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_log_q_value_stats_emits_per_action_means_and_margin():
+    """Tier 3b: per-action means + ActionMargin land in TB at the current step."""
+    stub = RainbowDQNAgent.__new__(RainbowDQNAgent)
+    stub.total_steps = 4321
+    stub.tb_writer = _CapturingWriter()
+    # Batch of 4 examples, 6 actions. Action 5 is uniformly the best by 0.5.
+    q = torch.tensor(
+        [
+            [0.1, 0.2, 0.3, 0.4, 0.5, 1.0],
+            [0.0, 0.1, 0.2, 0.3, 0.4, 0.9],
+            [0.5, 0.4, 0.3, 0.2, 0.1, 1.0],
+            [0.2, 0.2, 0.2, 0.2, 0.2, 0.7],
+        ],
+        dtype=torch.float32,
+    )
+    stub._last_batch_q = q
+    RainbowDQNAgent._log_q_value_stats(stub, emit_histogram=False)
+
+    writer = stub.tb_writer
+    tags = set(writer.tags())
+    for required in (
+        "Train/Q/Mean",
+        "Train/Q/Std",
+        "Train/Q/MaxAcrossActions",
+        "Train/Q/MinAcrossActions",
+        "Train/Q/ActionMargin",
+    ):
+        assert required in tags, f"Missing Q-value scalar: {required}"
+    for action_idx in range(6):
+        assert f"Train/Q/PerAction/Mean/{action_idx}" in tags
+
+    assert writer.value_for("Train/Q/Mean") == pytest.approx(float(q.mean()))
+    assert writer.value_for("Train/Q/Std") == pytest.approx(float(q.std(unbiased=False)))
+    assert writer.value_for("Train/Q/PerAction/Mean/5") == pytest.approx(float(q[:, 5].mean()))
+    # Margin is mean(top1 - top2). For each row top1=1.0/0.9/1.0/0.7 and top2=0.5/0.4/0.5/0.2.
+    expected_margin = float(((1.0 - 0.5) + (0.9 - 0.4) + (1.0 - 0.5) + (0.7 - 0.2)) / 4)
+    assert writer.value_for("Train/Q/ActionMargin") == pytest.approx(expected_margin)
+    # No histogram unless explicitly asked.
+    assert all(t != "Train/Q/Distribution" for t, _v, _s in writer.histograms)
+
+
+@pytest.mark.unit
+def test_log_q_value_stats_emits_histogram_when_requested():
+    """Tier 3b: emit_histogram=True writes a Train/Q/Distribution histogram."""
+    stub = RainbowDQNAgent.__new__(RainbowDQNAgent)
+    stub.total_steps = 100
+    stub.tb_writer = _CapturingWriter()
+    stub._last_batch_q = torch.zeros(2, 6, dtype=torch.float32)
+    RainbowDQNAgent._log_q_value_stats(stub, emit_histogram=True)
+    assert any(t == "Train/Q/Distribution" for t, _v, _s in stub.tb_writer.histograms)
+
+
+@pytest.mark.unit
+def test_log_grad_stats_emits_global_per_group_and_update_ratio(agent):
+    """Tier 3c: gradient norms + ParamUpdateRatio land in TB after a backward pass."""
+    agent.tb_writer = _CapturingWriter()
+    agent.grad_logging_interval = 1
+    agent.total_steps = 999
+
+    # Run a tiny forward+backward to populate .grad on every parameter.
+    obs = generate_dummy_observation(agent.config if hasattr(agent, "config") else {})
+    market = torch.from_numpy(obs["market_data"]).unsqueeze(0).to(agent.device, dtype=torch.float32)
+    account = torch.from_numpy(obs["account_state"]).unsqueeze(0).to(agent.device, dtype=torch.float32)
+    out = agent.network.get_q_values(market, account)
+    out.sum().backward()
+
+    pre_clip_norm = torch.nn.utils.clip_grad_norm_(agent.network.parameters(), max_norm=1e9)
+    agent._log_grad_stats(pre_clip_norm)
+
+    writer = agent.tb_writer
+    tags = set(writer.tags())
+    assert "Train/Grad/Norm" in tags
+    assert "Train/ParamUpdateRatio" in tags
+    # At least one per-group norm exists.
+    assert any(t.startswith("Train/Grad/PerGroup/") and t.endswith("/Norm") for t in tags), (
+        f"No per-group grad norms emitted; tags={tags!r}"
+    )
+
+    # Step value must be (total_steps + 1) per Tier 3c contract — see comment
+    # in _log_grad_stats. Confirms the lr * grad / param ratio is associated
+    # with the *next* learn step, not the one whose grad was just consumed.
+    grad_steps = {s for t, _v, s in writer.scalars if t == "Train/Grad/Norm"}
+    assert grad_steps == {1000}
+
+
+@pytest.mark.unit
+def test_target_net_soft_update_emits_counter_and_deviation(agent):
+    """Tier 3d: SoftUpdates counter increments every call; ParamDeviation > 0
+    when networks have diverged; both throttled by target_net_logging_interval."""
+    agent.tb_writer = _CapturingWriter()
+    agent.target_net_logging_interval = 1
+    agent.total_steps = 42
+
+    # Force divergence between online + target so deviation is non-zero.
+    with torch.no_grad():
+        for p in agent.network.parameters():
+            p.add_(0.1)
+
+    starting_count = agent._soft_update_count
+    agent._update_target_network()
+    assert agent._soft_update_count == starting_count + 1
+
+    writer = agent.tb_writer
+    tags = {t for t, _v, _s in writer.scalars}
+    assert "Train/TargetNet/SoftUpdates" in tags
+    assert "Train/TargetNet/ParamDeviation" in tags
+    deviation = next(v for t, v, _s in writer.scalars if t == "Train/TargetNet/ParamDeviation")
+    assert deviation > 0.0, "deviation should be positive after we offset online weights"
+    counter = next(v for t, v, _s in writer.scalars if t == "Train/TargetNet/SoftUpdates")
+    assert counter == float(agent._soft_update_count)
+
+
+@pytest.mark.unit
+def test_target_net_logging_throttle_skips_intermediate_updates(agent):
+    """Tier 3d: with interval=3, only every 3rd Polyak update emits scalars."""
+    agent.tb_writer = _CapturingWriter()
+    agent.target_net_logging_interval = 3
+    starting = agent._soft_update_count
+    for _ in range(5):
+        agent._update_target_network()
+    expected_emits = sum(1 for n in range(starting + 1, starting + 6) if n % 3 == 0)
+    counter_emits = [v for t, v, _s in agent.tb_writer.scalars if t == "Train/TargetNet/SoftUpdates"]
+    assert len(counter_emits) == expected_emits
+
+
+@pytest.mark.unit
+def test_target_net_no_writer_is_noop(agent):
+    """Tier 3d: counter still ticks but no scalars are written when writer is None."""
+    agent.tb_writer = None
+    starting = agent._soft_update_count
+    agent._update_target_network()
+    assert agent._soft_update_count == starting + 1
+
+
+@pytest.mark.unit
+def test_log_grad_stats_no_writer_is_noop():
+    """Tier 3c: missing writer / network are silent no-ops."""
+    stub = RainbowDQNAgent.__new__(RainbowDQNAgent)
+    stub.tb_writer = None
+    stub.network = None
+    stub.total_steps = 0
+    stub.optimizer = None
+    RainbowDQNAgent._log_grad_stats(stub, 1.0)  # should not raise
+
+
+@pytest.mark.unit
+def test_log_q_value_stats_no_writer_is_noop():
+    """Tier 3b: a missing writer (or missing cache) returns silently."""
+    stub = RainbowDQNAgent.__new__(RainbowDQNAgent)
+    stub.total_steps = 0
+    stub.tb_writer = None
+    stub._last_batch_q = torch.zeros(2, 6, dtype=torch.float32)
+    RainbowDQNAgent._log_q_value_stats(stub, emit_histogram=True)
+    # And missing cache:
+    stub.tb_writer = _CapturingWriter()
+    stub._last_batch_q = None
+    RainbowDQNAgent._log_q_value_stats(stub, emit_histogram=True)
+    assert stub.tb_writer.scalars == []
+    assert stub.tb_writer.histograms == []
+
+
+@pytest.mark.unit
+def test_log_n_step_reward_window_stats_empty_window_is_noop():
+    from collections import deque as _deque
+
+    stub = RainbowDQNAgent.__new__(RainbowDQNAgent)
+    stub.total_steps = 60
+    stub.n_step_reward_window = _deque([], maxlen=60)
+    stub.tb_writer = _CapturingWriter()
+    RainbowDQNAgent._log_n_step_reward_window_stats(stub)
+    assert stub.tb_writer.scalars == []
+
+
+# ---------------------------------------------------------------------------
+# reset_noisy_sigma helper (recovery: re-energise NoisyNet exploration)
+# ---------------------------------------------------------------------------
+
+
+def _collect_noisy_layers(network):
+    from momentum_agent.model import NoisyLinear
+
+    inner = getattr(network, "_orig_mod", network)
+    return [m for m in inner.modules() if isinstance(m, NoisyLinear)]
+
+
+@pytest.mark.unit
+def test_reset_noisy_sigma_refills_to_constructor_formula(agent):
+    """Sigma values match ``std_init / sqrt(in_features)`` and bias_sigma
+    matches ``std_init / sqrt(out_features)`` after reset, regardless of the
+    pre-reset state."""
+    import math as _math
+
+    online_layers = _collect_noisy_layers(agent.network)
+    assert online_layers, "agent network must contain at least one NoisyLinear"
+
+    with torch.no_grad():
+        for layer in online_layers:
+            layer.weight_sigma.data.fill_(0.0)
+            layer.bias_sigma.data.fill_(0.0)
+
+    count = agent.reset_noisy_sigma()
+    assert count == len(online_layers)
+    for layer in online_layers:
+        expected_w = layer.std_init / _math.sqrt(layer.in_features)
+        expected_b = layer.std_init / _math.sqrt(layer.out_features)
+        assert torch.allclose(
+            layer.weight_sigma.data,
+            torch.full_like(layer.weight_sigma.data, expected_w),
+        )
+        assert torch.allclose(
+            layer.bias_sigma.data,
+            torch.full_like(layer.bias_sigma.data, expected_b),
+        )
+
+
+@pytest.mark.unit
+def test_reset_noisy_sigma_leaves_mu_untouched(agent):
+    """Mu (the deterministic part the policy actually uses for argmax) must
+    survive the reset bit-for-bit."""
+    online_layers = _collect_noisy_layers(agent.network)
+    snapshot_w = [layer.weight_mu.data.detach().clone() for layer in online_layers]
+    snapshot_b = [layer.bias_mu.data.detach().clone() for layer in online_layers]
+
+    agent.reset_noisy_sigma(std_init=0.7)
+
+    for layer, w, b in zip(online_layers, snapshot_w, snapshot_b, strict=True):
+        assert torch.equal(layer.weight_mu.data, w)
+        assert torch.equal(layer.bias_mu.data, b)
+
+
+@pytest.mark.unit
+def test_reset_noisy_sigma_overrides_std_init_when_provided(agent):
+    """Passing ``std_init=X`` updates ``layer.std_init`` and the new sigma
+    values use ``X`` rather than the original constructor scalar."""
+    import math as _math
+
+    online_layers = _collect_noisy_layers(agent.network)
+    custom = 0.123
+    agent.reset_noisy_sigma(std_init=custom)
+    for layer in online_layers:
+        assert layer.std_init == pytest.approx(custom)
+        expected_w = custom / _math.sqrt(layer.in_features)
+        assert layer.weight_sigma.data.flatten()[0].item() == pytest.approx(expected_w)
+
+
+@pytest.mark.unit
+def test_reset_noisy_sigma_also_resets_target_network(agent):
+    """Both online and target networks get refilled (their sigma scales must
+    stay structurally identical even though they sample independent epsilon)."""
+    target_layers = _collect_noisy_layers(agent.target_network)
+    with torch.no_grad():
+        for layer in target_layers:
+            layer.weight_sigma.data.fill_(99.0)
+
+    agent.reset_noisy_sigma()
+    for layer in target_layers:
+        assert layer.weight_sigma.data.max().item() < 99.0, "target network sigma should have been refilled away from the sentinel"
+
+
+@pytest.mark.unit
+def test_reset_noisy_sigma_emits_tb_scalar_when_writer_attached(agent):
+    """When ``tb_writer`` is set, ``Agent/NoisySigmaReset`` is logged with the
+    layer count at the current ``total_steps``."""
+    agent.tb_writer = _CapturingWriter()
+    agent.total_steps = 1234
+    count = agent.reset_noisy_sigma()
+    tags = {t for t, _v, _s in agent.tb_writer.scalars}
+    assert "Agent/NoisySigmaReset" in tags
+    value = next(v for t, v, _s in agent.tb_writer.scalars if t == "Agent/NoisySigmaReset")
+    assert value == float(count)
+    step = next(s for t, _v, s in agent.tb_writer.scalars if t == "Agent/NoisySigmaReset")
+    assert step == 1234
+
+
+@pytest.mark.unit
+def test_reset_noisy_sigma_no_writer_is_noop_for_logging(agent):
+    """Without a writer, the reset itself still works and no exception is raised."""
+    agent.tb_writer = None
+    count = agent.reset_noisy_sigma()
+    assert count > 0
+
+
+# ---------------------------------------------------------------------------
+# torch.compile state_dict prefix fallback (bidirectional)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_load_state_dict_fallback_strips_orig_mod_prefix():
+    """`_orig_mod.*` keys load into a plain (eager) module via the fallback."""
+    from momentum_agent.agent import _load_state_dict_with_orig_mod_fallback
+
+    plain = torch.nn.Linear(4, 3)
+    src = torch.nn.Linear(4, 3)
+    prefixed = {f"_orig_mod.{k}": v.clone() for k, v in src.state_dict().items()}
+
+    _load_state_dict_with_orig_mod_fallback(plain, prefixed)
+
+    for k, v in src.state_dict().items():
+        assert torch.equal(plain.state_dict()[k], v)
+
+
+@pytest.mark.unit
+def test_load_state_dict_fallback_adds_orig_mod_prefix():
+    """Plain keys load into an `OptimizedModule`-style wrapper via the fallback.
+
+    We simulate `torch.compile`'s OptimizedModule with a wrapper that stores
+    the inner module under `_orig_mod`, which is exactly the attribute name
+    PyTorch's compile machinery uses. The fallback must add the `_orig_mod.`
+    prefix to the plain state dict so it lines up with the wrapper's own
+    parameter naming.
+    """
+    from momentum_agent.agent import _load_state_dict_with_orig_mod_fallback
+
+    class FakeOptimizedModule(torch.nn.Module):
+        def __init__(self, inner: torch.nn.Module) -> None:
+            super().__init__()
+            self._orig_mod = inner
+
+    inner_target = torch.nn.Linear(4, 3)
+    wrapped = FakeOptimizedModule(inner_target)
+    src = torch.nn.Linear(4, 3)
+    plain = {k: v.clone() for k, v in src.state_dict().items()}
+
+    _load_state_dict_with_orig_mod_fallback(wrapped, plain)
+
+    for k, v in src.state_dict().items():
+        assert torch.equal(wrapped.state_dict()[f"_orig_mod.{k}"], v)
+
+
+@pytest.mark.unit
+def test_load_state_dict_fallback_passthrough_when_no_prefix_change_helps():
+    """If neither prefix transform helps, the original error must propagate."""
+    from momentum_agent.agent import _load_state_dict_with_orig_mod_fallback
+
+    target = torch.nn.Linear(4, 3)
+    bad_state = {"completely_unrelated_key": torch.zeros(2, 2)}
+
+    with pytest.raises(Exception):
+        _load_state_dict_with_orig_mod_fallback(target, bad_state)

@@ -44,6 +44,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-rebalance-pct", type=float, required=True, help="Min allocation delta to trigger trade")
     parser.add_argument("--min-trade-value", type=float, required=True, help="Min trade notional in USD")
     parser.add_argument("--location", default=None, help="Alpaca crypto data feed location")
+    parser.add_argument(
+        "--tb-log-dir",
+        default=None,
+        help="If set, mirror Live/Trade/*, Live/Action Rate/*, Live/Q/* scalars to TensorBoard (Tier 6 parity).",
+    )
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     return parser
 
@@ -71,6 +76,7 @@ def main(argv: list[str] | None = None) -> int:
             min_trade_value=args.min_trade_value,
             models_dir=args.models_dir,
             checkpoint_pattern=args.checkpoint_pattern,
+            tb_log_dir=args.tb_log_dir,
         )
 
         credentials = AlpacaCredentials.from_environment()

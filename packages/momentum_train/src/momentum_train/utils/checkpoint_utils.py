@@ -82,20 +82,26 @@ def load_checkpoint(checkpoint_path: str) -> dict[str, Any] | None:
         # weights_only=False: PyTorch>=2.6 defaults True; trainer checkpoints pickle buffer objects (e.g. Experience).
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
-        # Basic validation of checkpoint structure
+        # Basic validation of checkpoint structure.
+        # optimizer_state_dict / scheduler_state_dict / scaler_state_dict are
+        # intentionally NOT required: --reset-lr-on-resume pops them after load,
+        # and scripts/recover_from_collapse.py --strip-optimizer bakes that same
+        # removal into the file. Both flows expect the trainer downstream to
+        # handle the absence (it does — the optimizer is freshly constructed
+        # from config when no state is present).
         required_keys = [
             "episode",
             "total_train_steps",
             "network_state_dict",
-            "optimizer_state_dict",
             "best_validation_metric",
             "target_network_state_dict",
             "agent_total_steps",
             "early_stopping_counter",
             "agent_config",
         ]
-        if not all(key in checkpoint for key in required_keys):
-            logger.error(f"Checkpoint {checkpoint_path} is missing required keys. Cannot resume.")
+        missing = [key for key in required_keys if key not in checkpoint]
+        if missing:
+            logger.error(f"Checkpoint {checkpoint_path} is missing required keys: {missing}. Cannot resume.")
             return None
 
         logger.info(f"Successfully loaded checkpoint from {checkpoint_path}")

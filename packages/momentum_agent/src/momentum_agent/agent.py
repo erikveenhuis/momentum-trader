@@ -1,6 +1,9 @@
+import math
 import os  # Added for save/load path handling
 import random
 from collections import deque
+from contextlib import contextmanager
+from typing import Any
 
 import numpy as np
 import torch
@@ -30,15 +33,43 @@ def _maybe_unwrap_orig_mod_state_dict(state_dict: dict) -> dict:
     return state_dict
 
 
+def _maybe_wrap_orig_mod_state_dict(state_dict: dict) -> dict:
+    """Reverse of :func:`_maybe_unwrap_orig_mod_state_dict`.
+
+    If ``state_dict`` has plain keys but we're loading into an
+    ``OptimizedModule``, add the ``_orig_mod.`` prefix back. Returns the
+    original dict unchanged if any key already has the prefix (so we don't
+    double-prefix).
+    """
+
+    if not state_dict:
+        return state_dict
+    keys = list(state_dict.keys())
+    if not keys:
+        return state_dict
+    if any(isinstance(k, str) and k.startswith("_orig_mod.") for k in keys):
+        return state_dict
+    return {f"_orig_mod.{k}": v for k, v in state_dict.items()}
+
+
 def _load_state_dict_with_orig_mod_fallback(module: torch.nn.Module, state_dict: dict) -> None:
     try:
         module.load_state_dict(state_dict)
     except Exception:
         unwrapped = _maybe_unwrap_orig_mod_state_dict(state_dict)
-        if unwrapped is state_dict:
-            raise
-        module.load_state_dict(unwrapped)
-        logger.info("Loaded weights from torch.compile checkpoint (_orig_mod keys) into eager module.")
+        if unwrapped is not state_dict:
+            try:
+                module.load_state_dict(unwrapped)
+                logger.info("Loaded weights from torch.compile checkpoint (_orig_mod keys) into eager module.")
+                return
+            except Exception:
+                pass
+        wrapped = _maybe_wrap_orig_mod_state_dict(state_dict)
+        if wrapped is not state_dict:
+            module.load_state_dict(wrapped)
+            logger.info("Loaded weights from eager checkpoint (plain keys) into torch.compile module.")
+            return
+        raise
 
 
 # --- Start: Rainbow DQN Agent ---
@@ -120,6 +151,41 @@ class RainbowDQNAgent:
         if self.categorical_logging_interval <= 0:
             logger.warning("categorical_logging_interval must be a positive integer; falling back to default of 2000 learner steps.")
             self.categorical_logging_interval = 2000
+        # Tier 3a: NoisyNet sigma stats. Default cadence matches categorical
+        # logging so the diagnostics line up on the same time axis. Set to 0 to
+        # disable.
+        self.noisy_sigma_logging_interval = int(config.get("noisy_sigma_logging_interval", self.categorical_logging_interval))
+        if self.noisy_sigma_logging_interval < 0:
+            logger.warning("noisy_sigma_logging_interval must be >= 0; disabling NoisyNet sigma logging.")
+            self.noisy_sigma_logging_interval = 0
+        # Tier 3b: Q-value scalar stats are cheap; default to log every 250
+        # learn steps. The histogram is far heavier so it gets its own (longer)
+        # cadence (~10x slower).
+        self.q_value_logging_interval = int(config.get("q_value_logging_interval", 250))
+        if self.q_value_logging_interval < 0:
+            logger.warning("q_value_logging_interval must be >= 0; disabling Q-value logging.")
+            self.q_value_logging_interval = 0
+        self.q_value_histogram_interval = int(config.get("q_value_histogram_interval", max(self.q_value_logging_interval * 10, 2500)))
+        if self.q_value_histogram_interval < 0:
+            self.q_value_histogram_interval = 0
+        # Tier 3c: gradient norms + param-update-ratio. Same-cadence as Q-value
+        # scalars by default — both are cheap and benefit from being plotted on
+        # a shared time axis.
+        self.grad_logging_interval = int(config.get("grad_logging_interval", self.q_value_logging_interval or 250))
+        if self.grad_logging_interval < 0:
+            logger.warning("grad_logging_interval must be >= 0; disabling gradient diagnostics.")
+            self.grad_logging_interval = 0
+        # Tier 3d: target-network deviation. Polyak runs every learn step so we
+        # MUST throttle — the L2 sweep over every param tensor is otherwise the
+        # most expensive thing in the train loop. Default = same cadence as
+        # gradient stats, since these are diagnostic siblings.
+        self.target_net_logging_interval = int(config.get("target_net_logging_interval", self.grad_logging_interval or 250))
+        if self.target_net_logging_interval < 0:
+            logger.warning("target_net_logging_interval must be >= 0; disabling target-net diagnostics.")
+            self.target_net_logging_interval = 0
+        # Cumulative counter, surfaced as ``Train/TargetNet/SoftUpdates``. Lets
+        # the caller verify Polyak is actually running at the expected cadence.
+        self._soft_update_count: int = 0
         raw_percentiles = config.get("categorical_logging_percentiles", [5, 25, 50, 75, 95])
         filtered_percentiles: list[float] = []
         for value in raw_percentiles if isinstance(raw_percentiles, (list, tuple)) else [raw_percentiles]:
@@ -172,6 +238,12 @@ class RainbowDQNAgent:
             "mass": np.zeros(self.num_atoms, dtype=np.float64),
             "samples": 0,
         }
+        # Optional TensorBoard writer injected by the trainer (see logging plan Tier 1c/3a-d).
+        # Kept untyped (Any) to avoid forcing a torch.utils.tensorboard import here.
+        self.tb_writer: Any = None
+        # Default provenance state for batch action selection (Tier 2c).
+        self._last_batch_was_greedy: np.ndarray = np.zeros(0, dtype=bool)
+        self._last_select_q_values: np.ndarray | None = None
 
         # Initialize Networks
         # Pass the agent's config dictionary and device directly
@@ -403,7 +475,24 @@ class RainbowDQNAgent:
         return self.epsilon_start + frac * (self.epsilon_end - self.epsilon_start)
 
     def select_action(self, obs, action_mask=None):
-        """Selects action based on Q-values, with optional action masking."""
+        """Selects action based on Q-values, with optional action masking.
+
+        Thin wrapper around :meth:`select_action_with_provenance` that drops the
+        provenance flag for callers that don't need it. Prefer the provenance
+        variant in new code (it is required for Tier 2c TB metrics that split
+        action rates by greedy vs epsilon-greedy origin).
+        """
+        action, _ = self.select_action_with_provenance(obs, action_mask=action_mask)
+        return action
+
+    def select_action_with_provenance(self, obs, action_mask=None) -> tuple[int, bool]:
+        """Like :meth:`select_action` but also returns ``was_greedy``.
+
+        ``was_greedy`` is True when the returned action was the argmax of Q,
+        False when it was overridden by epsilon-greedy random exploration. In
+        eval mode (``training_mode=False``) the agent never explores, so the
+        flag is always True there.
+        """
         if self.debug_mode:
             assert isinstance(obs, dict), "Observation must be a dictionary"
             assert "market_data" in obs and "account_state" in obs, "Observation missing required keys"
@@ -460,15 +549,18 @@ class RainbowDQNAgent:
             if self.debug_mode:
                 assert isinstance(action, int), f"Selected action is not an integer: {action}"
                 assert 0 <= action < self.num_actions, f"Selected action ({action}) is out of bounds [0, {self.num_actions})"
+            self._last_select_q_values = q_values.detach().to(torch.float32).cpu().numpy().reshape(-1)
 
+        was_greedy = True
         if self.training_mode and random.random() < self.current_epsilon:
+            was_greedy = False
             if action_mask is not None:
                 valid_actions = [i for i, m in enumerate(action_mask) if m]
                 action = random.choice(valid_actions) if valid_actions else action
             else:
                 action = random.randrange(self.num_actions)
 
-        return action
+        return action, was_greedy
 
     # ------------------------------------------------------------------
     # Vectorized environment support
@@ -517,13 +609,23 @@ class RainbowDQNAgent:
 
         actions = q_values.argmax(dim=1).cpu().numpy()  # [N]
 
+        was_greedy = np.ones(n, dtype=bool)
         if self.training_mode:
             eps = self.current_epsilon
             rand_mask = np.random.random(n) < eps
             if rand_mask.any():
                 actions[rand_mask] = np.random.randint(0, self.num_actions, size=int(rand_mask.sum()))
+                was_greedy[rand_mask] = False
 
+        # Stash provenance on the agent so callers (vectorized trainer) can
+        # retrieve it without changing the public return type. Tier 2c.
+        self._last_batch_was_greedy = was_greedy
         return actions
+
+    def select_actions_batch_with_provenance(self, obs_batch: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+        """Like :meth:`select_actions_batch` but also returns the per-env greedy mask."""
+        actions = self.select_actions_batch(obs_batch)
+        return actions, np.asarray(self._last_batch_was_greedy, dtype=bool)
 
     # ------------------------------------------------------------------
 
@@ -953,6 +1055,14 @@ class RainbowDQNAgent:
         edge_min = float(probs[0])
         edge_max = float(probs[-1])
 
+        # Build {percentile -> support_value} mapping for both logs and TB scalars.
+        percentile_values: dict[float, float] = {}
+        for percentile in self.categorical_logging_percentiles:
+            target = percentile / 100.0
+            idx = int(np.searchsorted(cdf, target, side="left"))
+            idx = min(max(idx, 0), self.num_atoms - 1)
+            percentile_values[float(percentile)] = float(self.support_cpu[idx])
+
         logger.info(
             "Categorical target stats at learn step %s (accumulated over %s samples): mean=%.4f, edge_mass=(min=%.4f, max=%.4f), percentiles=[%s]",
             self.total_steps,
@@ -967,8 +1077,317 @@ class RainbowDQNAgent:
             np.array2string(probs, precision=4, suppress_small=True),
         )
 
+        # Tier 1c: mirror categorical-target diagnostics to TensorBoard.
+        if self.tb_writer is not None:
+            try:
+                step = int(self.total_steps)
+                self.tb_writer.add_scalar("Train/CategoricalTarget/Mean", mean_value, step)
+                self.tb_writer.add_scalar("Train/CategoricalTarget/Edge_Mass_Min", edge_min, step)
+                self.tb_writer.add_scalar("Train/CategoricalTarget/Edge_Mass_Max", edge_max, step)
+                self.tb_writer.add_scalar("Train/CategoricalTarget/Samples", float(total_samples), step)
+                for percentile, support_value in percentile_values.items():
+                    tag = f"Train/CategoricalTarget/P{percentile:g}"
+                    self.tb_writer.add_scalar(tag, support_value, step)
+                # Histogram: weighted distribution over the 101 atoms.
+                # Use the per-atom probability directly so the TB histogram view shows
+                # the full target distribution shape.
+                self.tb_writer.add_histogram(
+                    "Train/CategoricalTarget/Distribution",
+                    probs.astype(np.float32),
+                    step,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("Failed to mirror categorical target stats to TensorBoard: %s", exc)
+
         accumulator["mass"].fill(0.0)
         accumulator["samples"] = 0
+
+    def _log_n_step_reward_window_stats(self) -> None:
+        """Logs statistics of the rolling n-step reward window to logger and TensorBoard.
+
+        Tier 1e: realized n-step returns are mirrored to TB so they can be compared
+        directly against the categorical target distribution (Tier 1c) and PER stats
+        (Tier 1d) on the same time axis.
+        """
+        if len(self.n_step_reward_window) == 0:
+            return
+        try:
+            rewards_array = np.fromiter(self.n_step_reward_window, dtype=float)
+        except ValueError:  # pragma: no cover - safeguard
+            logger.warning("Could not materialize n-step reward window for stats.")
+            return
+
+        min_r = float(rewards_array.min())
+        max_r = float(rewards_array.max())
+        mean_r = float(rewards_array.mean())
+        std_r = float(rewards_array.std(ddof=0))
+        window_len = len(self.n_step_reward_window)
+
+        logger.info(
+            "N-Step Reward Window (last %s learns): Min=%.4f, Max=%.4f, Mean=%.4f, Std=%.4f",
+            window_len,
+            min_r,
+            max_r,
+            mean_r,
+            std_r,
+        )
+
+        if self.tb_writer is not None:
+            try:
+                step = int(self.total_steps)
+                self.tb_writer.add_scalar("Train/NStepReward/Mean", mean_r, step)
+                self.tb_writer.add_scalar("Train/NStepReward/Std", std_r, step)
+                self.tb_writer.add_scalar("Train/NStepReward/Min", min_r, step)
+                self.tb_writer.add_scalar("Train/NStepReward/Max", max_r, step)
+                self.tb_writer.add_scalar("Train/NStepReward/WindowSize", float(window_len), step)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug(
+                    "Failed to mirror n-step reward window stats to TensorBoard: %s",
+                    exc,
+                )
+
+    def _log_grad_stats(self, pre_clip_norm: torch.Tensor | float | None) -> None:
+        """Mirror gradient norms + param-update-ratio per module group to TB.
+
+        Tier 3c. Called immediately after :func:`torch.nn.utils.clip_grad_norm_`
+        and before :meth:`optimizer.step`, so:
+
+        * ``Train/Grad/Norm`` reports the *pre-clip* global L2 norm — this is
+          what would have been applied without clipping. Watching it spike past
+          ``grad_clip_norm`` quickly explains otherwise-invisible loss plateaus.
+        * ``Train/Grad/PerGroup/{group}/Norm`` mirrors per-top-level-module
+          gradients (encoder, advantage stream, etc.). A single dominating
+          group is the canonical signature of a wonky aux head or transformer
+          collapse.
+        * ``Train/ParamUpdateRatio`` ≈ ``lr * ||grad|| / ||param||`` — the
+          textbook "is the optimizer actually moving the weights?" metric.
+        """
+        if self.tb_writer is None or self.network is None:
+            return
+        step = int(self.total_steps + 1)
+        # Use the underlying compiled module so group names are clean
+        # (no ``_orig_mod`` prefix injected by torch.compile).
+        net = getattr(self.network, "_orig_mod", self.network)
+        try:
+            if pre_clip_norm is not None:
+                norm_val = float(pre_clip_norm) if not torch.is_tensor(pre_clip_norm) else float(pre_clip_norm.item())
+                if math.isfinite(norm_val):
+                    self.tb_writer.add_scalar("Train/Grad/Norm", norm_val, step)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Failed to mirror Train/Grad/Norm: %s", exc)
+
+        # Per-top-level-module group L2 norms.
+        group_grad_sq: dict[str, float] = {}
+        group_param_sq: dict[str, float] = {}
+        try:
+            for name, param in net.named_parameters():
+                if param.grad is None:
+                    continue
+                group = name.split(".", 1)[0] or "root"
+                g_sq = float(param.grad.detach().pow(2).sum().item())
+                p_sq = float(param.detach().pow(2).sum().item())
+                if not (math.isfinite(g_sq) and math.isfinite(p_sq)):
+                    continue
+                group_grad_sq[group] = group_grad_sq.get(group, 0.0) + g_sq
+                group_param_sq[group] = group_param_sq.get(group, 0.0) + p_sq
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Failed to compute per-group grad stats: %s", exc)
+            return
+
+        try:
+            for group in sorted(group_grad_sq):
+                self.tb_writer.add_scalar(
+                    f"Train/Grad/PerGroup/{group}/Norm",
+                    math.sqrt(group_grad_sq[group]),
+                    step,
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Failed to mirror per-group grad norms: %s", exc)
+
+        # Param-update ratio: lr * ||grad|| / ||param||. Computed across the
+        # whole network so we get a single, comparable scalar per step.
+        try:
+            total_grad = math.sqrt(sum(group_grad_sq.values()))
+            total_param = math.sqrt(sum(group_param_sq.values()))
+            lr = float(self.optimizer.param_groups[0].get("lr", 0.0)) if self.optimizer is not None else 0.0
+            if total_param > 0 and math.isfinite(total_grad) and math.isfinite(lr):
+                ratio = (lr * total_grad) / total_param
+                if math.isfinite(ratio):
+                    self.tb_writer.add_scalar("Train/ParamUpdateRatio", ratio, step)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Failed to mirror Train/ParamUpdateRatio: %s", exc)
+
+    def _log_q_value_stats(self, *, emit_histogram: bool = False) -> None:
+        """Mirror Q-value distribution stats from the most recent training batch.
+
+        Tier 3b. Reads the cached online ``[B, num_actions]`` Q tensor stashed
+        by :meth:`_compute_loss` and emits:
+
+        * ``Train/Q/Mean`` / ``Train/Q/Std``
+        * ``Train/Q/MaxAcrossActions`` / ``Train/Q/MinAcrossActions``
+        * ``Train/Q/ActionMargin`` — mean over the batch of ``q_max - q_2nd``,
+          a direct readout of how *decisive* the policy is. A collapsing margin
+          flags the canonical "policy goes flat" failure mode.
+        * ``Train/Q/PerAction/Mean/{0..num_actions-1}``
+        * ``Train/Q/Distribution`` (histogram, sub-sampled cadence)
+
+        All emissions are silent no-ops if the writer or the cached tensor are
+        missing — keeps the call idempotent for tests / CPU smoke runs.
+        """
+        if self.tb_writer is None:
+            return
+        q = getattr(self, "_last_batch_q", None)
+        if q is None:
+            return
+        try:
+            q_np = q.detach().to(torch.float32).cpu().numpy()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Failed to materialize cached Q-values: %s", exc)
+            return
+        if q_np.ndim != 2 or q_np.size == 0:
+            return
+        step = int(self.total_steps)
+        try:
+            self.tb_writer.add_scalar("Train/Q/Mean", float(q_np.mean()), step)
+            self.tb_writer.add_scalar("Train/Q/Std", float(q_np.std(ddof=0)), step)
+            self.tb_writer.add_scalar("Train/Q/MaxAcrossActions", float(q_np.max()), step)
+            self.tb_writer.add_scalar("Train/Q/MinAcrossActions", float(q_np.min()), step)
+            # Per-batch action margin: top-1 minus top-2 across the action axis,
+            # averaged over the batch. Robust to ties / single-action collapse.
+            sorted_q = np.sort(q_np, axis=1)
+            if sorted_q.shape[1] >= 2:
+                margin = float((sorted_q[:, -1] - sorted_q[:, -2]).mean())
+                self.tb_writer.add_scalar("Train/Q/ActionMargin", margin, step)
+            for action_idx in range(q_np.shape[1]):
+                self.tb_writer.add_scalar(
+                    f"Train/Q/PerAction/Mean/{action_idx}",
+                    float(q_np[:, action_idx].mean()),
+                    step,
+                )
+            if emit_histogram:
+                try:
+                    self.tb_writer.add_histogram("Train/Q/Distribution", q_np.astype(np.float32), step)
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug("Failed to emit Train/Q/Distribution histogram: %s", exc)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Failed to mirror Q-value stats to TB: %s", exc)
+
+    def _log_noisy_sigma_stats(self) -> None:
+        """Mirror NoisyLinear sigma stats per module to TensorBoard.
+
+        Tier 3a. Tracks ``Train/Noisy/{module}/SigmaMean/Max/Min`` for every
+        :class:`NoisyLinear` layer in the online network. Sigma collapse is the
+        canonical NoisyNet failure mode (the agent stops exploring); this lets
+        us catch it early without parsing distributions by eye. The target
+        network is intentionally excluded — its noise is independent and has no
+        bearing on the policy that's currently being optimized.
+        """
+        if self.tb_writer is None or self.network is None:
+            return
+        # Walk the *underlying* network so torch.compile wrappers don't pollute
+        # the module path with ``_orig_mod`` segments.
+        net = getattr(self.network, "_orig_mod", self.network)
+        try:
+            from .model import NoisyLinear  # local import to avoid cycles
+        except Exception:  # pragma: no cover - defensive
+            return
+        step = int(self.total_steps)
+        all_means: list[float] = []
+        for name, module in net.named_modules():
+            if not isinstance(module, NoisyLinear):
+                continue
+            tag = name.replace(".", "/") if name else "root"
+            try:
+                w_sigma = module.weight_sigma.detach().abs()
+                b_sigma = module.bias_sigma.detach().abs()
+                sigma_mean = float((w_sigma.sum() + b_sigma.sum()) / (w_sigma.numel() + b_sigma.numel()))
+                sigma_max = float(max(w_sigma.max().item(), b_sigma.max().item()))
+                sigma_min = float(min(w_sigma.min().item(), b_sigma.min().item()))
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("Failed to read NoisyLinear sigma for %s: %s", name, exc)
+                continue
+            try:
+                self.tb_writer.add_scalar(f"Train/Noisy/{tag}/SigmaMean", sigma_mean, step)
+                self.tb_writer.add_scalar(f"Train/Noisy/{tag}/SigmaMax", sigma_max, step)
+                self.tb_writer.add_scalar(f"Train/Noisy/{tag}/SigmaMin", sigma_min, step)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("Failed to mirror NoisyLinear sigma to TB: %s", exc)
+                continue
+            all_means.append(sigma_mean)
+        if all_means:
+            try:
+                self.tb_writer.add_scalar("Train/Noisy/AggregateSigmaMean", float(np.mean(all_means)), step)
+                self.tb_writer.add_scalar("Train/Noisy/ModuleCount", float(len(all_means)), step)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("Failed to mirror aggregate NoisyLinear sigma to TB: %s", exc)
+
+    def reset_noisy_sigma(self, std_init: float | None = None) -> int:
+        """Re-initialise sigma parameters of every NoisyLinear layer in-place.
+
+        Mu (the deterministic part learned by gradient descent) is left
+        untouched, so the policy keeps everything it has learned, but
+        exploration is re-energised. This is the canonical recovery move when
+        :meth:`_log_noisy_sigma_stats` shows that sigma has collapsed and the
+        agent has effectively stopped exploring.
+
+        The same reset is applied to both the online and target networks so
+        their NoisyLinear layers stay structurally identical (the target
+        network samples its own epsilon, but the sigma scale must match).
+        After the sigma refill we call ``reset_noise()`` to immediately
+        refresh epsilon buffers so the next forward pass uses the new noise
+        scale.
+
+        Args:
+            std_init: Sigma scale to use. ``None`` means "use whatever value
+                each layer was constructed with" (so heterogeneous configs
+                are preserved). A float overrides every layer uniformly.
+
+        Returns:
+            The number of NoisyLinear layers that had their sigma reset
+            (counted on the online network only — the target network mirrors
+            the same count).
+        """
+        from .model import NoisyLinear
+
+        def _reset_one(net: torch.nn.Module) -> int:
+            count = 0
+            inner = getattr(net, "_orig_mod", net)
+            for module in inner.modules():
+                if not isinstance(module, NoisyLinear):
+                    continue
+                effective_std = float(std_init) if std_init is not None else float(module.std_init)
+                in_f = int(module.in_features)
+                out_f = int(module.out_features)
+                with torch.no_grad():
+                    module.weight_sigma.data.fill_(effective_std / math.sqrt(in_f))
+                    module.bias_sigma.data.fill_(effective_std / math.sqrt(out_f))
+                if std_init is not None:
+                    module.std_init = effective_std
+                module.reset_noise()
+                count += 1
+            return count
+
+        online_count = _reset_one(self.network) if self.network is not None else 0
+        target_count = _reset_one(self.target_network) if self.target_network is not None else 0
+        if online_count != target_count:
+            logger.warning(
+                "reset_noisy_sigma: online/target NoisyLinear counts differ (online=%d target=%d).",
+                online_count,
+                target_count,
+            )
+        logger.info(
+            "Reset NoisyLinear sigma on %d online + %d target layer(s) (std_init=%s).",
+            online_count,
+            target_count,
+            "per-layer" if std_init is None else f"{float(std_init):.4f}",
+        )
+        if self.tb_writer is not None and online_count > 0:
+            try:
+                step = int(self.total_steps)
+                self.tb_writer.add_scalar("Agent/NoisySigmaReset", float(online_count), step)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("Failed to log Agent/NoisySigmaReset: %s", exc)
+        return online_count
 
     def _compute_loss(self, batch, weights):
         """Computes the C51 loss using PER weights."""
@@ -1086,6 +1505,12 @@ class RainbowDQNAgent:
                     self.num_atoms,
                 ), "Online log_ps shape mismatch"
 
+            # Tier 3b: stash the per-action expected Q-values from the *online* net
+            # so _log_q_value_stats can mirror them to TB without recomputing.
+            # Detached + cpu-bound to avoid keeping the autograd graph alive.
+            with torch.no_grad():
+                self._last_batch_q = (torch.exp(log_ps) * self.support.unsqueeze(0).unsqueeze(0)).sum(dim=2).detach()
+
             # Gather the log-probabilities for the actions actually taken: log Z(s_t, a_t)
             # We need to select the log probabilities corresponding to actions_batch
             actions_indices = actions_batch.view(self.batch_size, 1, 1).expand(self.batch_size, 1, self.num_atoms)
@@ -1191,7 +1616,9 @@ class RainbowDQNAgent:
                 if p.grad is not None and not torch.isfinite(p.grad).all():
                     logger.error(f"NaN or Inf detected in gradients BEFORE clipping for parameter: {p.shape}")
 
-        torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=self.grad_clip_norm)
+        # Capture the *pre-clip* global grad norm; clip_grad_norm_ returns it.
+        # Tier 3c: this is the canonical "is the loss healthy?" telemetry.
+        pre_clip_norm = torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=self.grad_clip_norm)
 
         if self.debug_mode:
             for p in self.network.parameters():
@@ -1199,6 +1626,12 @@ class RainbowDQNAgent:
                     logger.error(
                         f"NaN or Inf detected in gradients AFTER clipping (Max Norm: {self.grad_clip_norm}) for parameter: {p.shape}"
                     )
+
+        # Tier 3c: gradient + param-update-ratio diagnostics, throttled. Must
+        # happen *before* optimizer.step() so the param tensors haven't moved
+        # yet and the grad/param ratio is meaningful.
+        if self.grad_logging_interval > 0 and (self.total_steps + 1) % self.grad_logging_interval == 0:
+            self._log_grad_stats(pre_clip_norm)
 
         self.optimizer.step()
 
@@ -1220,6 +1653,11 @@ class RainbowDQNAgent:
         self.total_steps += 1
         if self.categorical_logging_interval > 0 and self.total_steps % self.categorical_logging_interval == 0:
             self._log_categorical_target_stats()
+        if self.noisy_sigma_logging_interval > 0 and self.total_steps % self.noisy_sigma_logging_interval == 0:
+            self._log_noisy_sigma_stats()
+        if self.q_value_logging_interval > 0 and self.total_steps % self.q_value_logging_interval == 0:
+            emit_hist = self.q_value_histogram_interval > 0 and self.total_steps % self.q_value_histogram_interval == 0
+            self._log_q_value_stats(emit_histogram=emit_hist)
         if self.last_td_error_stats is not None and self.total_steps % 100 == 0:
             logger.info(
                 "TD error stats at learn step %s - mean: %.6f, std: %.6f",
@@ -1238,27 +1676,9 @@ class RainbowDQNAgent:
         # Log loss and PER beta
         logger.debug(f"Step: {self.total_steps}, Loss: {loss_item:.4f}, PER Beta: {beta:.4f}")
 
-        # --- ADDED: Log min/max of n-step reward window periodically ---
-        # Log every 60 agent learning steps if the window has data
-        if self.total_steps % 60 == 0 and len(self.n_step_reward_window) > 0:
-            try:
-                rewards_array = np.fromiter(self.n_step_reward_window, dtype=float)
-                min_r = float(rewards_array.min())
-                max_r = float(rewards_array.max())
-                mean_r = float(rewards_array.mean())
-                std_r = float(rewards_array.std(ddof=0))
-                logger.info(
-                    "N-Step Reward Window (last %s learns): Min=%.4f, Max=%.4f, Mean=%.4f, Std=%.4f",
-                    len(self.n_step_reward_window),
-                    min_r,
-                    max_r,
-                    mean_r,
-                    std_r,
-                )
-            except ValueError:
-                # Should not happen if len > 0, but safeguard
-                logger.warning("Could not calculate statistics for n-step reward window.")
-        # --- END ADDED ---
+        # Periodic n-step reward window diagnostics (logger + TensorBoard, see Tier 1e).
+        if self.total_steps % 60 == 0:
+            self._log_n_step_reward_window_stats()
 
         return loss_item  # Return loss for external logging/monitoring
 
@@ -1289,11 +1709,45 @@ class RainbowDQNAgent:
             )
 
     def _update_target_network(self):
-        """Polyak-averaged (soft) update: target <- tau * online + (1 - tau) * target."""
+        """Polyak-averaged (soft) update: target <- tau * online + (1 - tau) * target.
+
+        Tier 3d: emits ``Train/TargetNet/SoftUpdates`` (cumulative counter) and
+        ``Train/TargetNet/ParamDeviation`` (pre-update L2 norm of
+        ``online - target``). The deviation is captured *before* the Polyak
+        blend so it actually reflects "how far apart were we?" — after the
+        blend it's monotonically smaller by construction.
+        """
         tau = self.polyak_tau
+        self._soft_update_count += 1
+
+        should_log = (
+            self.tb_writer is not None
+            and self.target_net_logging_interval > 0
+            and self._soft_update_count % self.target_net_logging_interval == 0
+        )
+        deviation_sq: float | None = None
+        if should_log:
+            try:
+                acc = 0.0
+                for tp, op in zip(self.target_network.parameters(), self.network.parameters()):
+                    acc += float((op.data - tp.data).pow(2).sum().item())
+                deviation_sq = acc
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("Failed to compute target-net param deviation: %s", exc)
+                deviation_sq = None
+
         for tp, op in zip(self.target_network.parameters(), self.network.parameters()):
             tp.data.mul_(1.0 - tau).add_(op.data, alpha=tau)
         logger.debug(f"Target network soft-updated (tau={tau}).")
+
+        if should_log and self.tb_writer is not None:
+            step = int(self.total_steps)
+            try:
+                self.tb_writer.add_scalar("Train/TargetNet/SoftUpdates", float(self._soft_update_count), step)
+                if deviation_sq is not None and math.isfinite(deviation_sq):
+                    self.tb_writer.add_scalar("Train/TargetNet/ParamDeviation", math.sqrt(deviation_sq), step)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("Failed to mirror target-net diagnostics: %s", exc)
 
     def save_model(self, path_prefix):
         """Saves the agent's model and optimizer state."""
@@ -1552,6 +2006,40 @@ class RainbowDQNAgent:
         self._apply_network_mode(training)
         mode = "TRAINING" if training else "EVALUATION"
         logger.info(f"Set agent to {mode} mode")
+
+    @contextmanager
+    def greedy(self):
+        """Context manager that puts the agent in fully deterministic eval mode.
+
+        Tier 2d: makes the "greedy" rollout an explicit, named operation so
+        validation/test/eval-script paths read identically. Inside the block:
+
+        * ``training_mode`` is False → epsilon-greedy override is bypassed in
+          :meth:`select_action_with_provenance`.
+        * ``self.network`` is in eval mode → :class:`NoisyLinear` uses ``mu``
+          weights only (sigma path is frozen out of the forward pass).
+        * Any pre-existing ``weight_epsilon`` / ``bias_epsilon`` buffers are
+          left in place; they are unused while ``training=False``, but we
+          re-seed them on exit so a subsequent training step still starts from
+          a fresh noise sample (matches the existing per-step ``reset_noise``
+          discipline in :meth:`select_action_with_provenance`).
+
+        Restoration is exception-safe: training mode is restored even on error.
+        """
+        was_training = self.training_mode
+        try:
+            self.set_training_mode(False)
+            yield self
+        finally:
+            self.set_training_mode(was_training)
+            if was_training and self.network is not None and hasattr(self.network, "reset_noise"):
+                # Re-seed NoisyNet samples so the very next training step does
+                # not reuse the snapshot that was active before we entered the
+                # greedy block.
+                try:
+                    self.network.reset_noise()
+                except Exception:  # pragma: no cover - defensive
+                    logger.debug("Failed to reset NoisyNet noise after greedy() exit", exc_info=True)
 
     def _apply_network_mode(self, training: bool) -> None:
         if self.network is None:

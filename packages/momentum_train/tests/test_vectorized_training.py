@@ -192,8 +192,11 @@ def test_vectorized_speedup_benchmark(vec_training_setup, capsys):
         cfg["trainer"] = dict(config["trainer"])
         cfg["trainer"]["num_vector_envs"] = n_envs
         cfg["trainer"]["warmup_steps"] = 500
-        cfg["trainer"]["validation_freq"] = episodes + 1
-        cfg["trainer"]["checkpoint_save_freq"] = episodes + 1
+        # Effectively disable validation for this benchmark by matching freq
+        # to the run length (validates exactly once at the end). Using
+        # ``episodes + 1`` would trip the new validation-cadence guard.
+        cfg["trainer"]["validation_freq"] = episodes
+        cfg["trainer"]["checkpoint_save_freq"] = episodes
         cfg["run"] = dict(config["run"])
         cfg["run"]["episodes"] = episodes
 

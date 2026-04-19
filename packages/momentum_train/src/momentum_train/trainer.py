@@ -1,5 +1,7 @@
 import json
+import math
 import os
+import re
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +18,12 @@ from .data import DataManager  # Use relative import
 from .metrics import (  # Use relative import
     PerformanceTracker,
     calculate_episode_score,
+)
+from .schedules import compute_benchmark_frac
+from .trade_metrics import (
+    StepRecord,
+    aggregate_trade_metrics,
+    segment_trades,
 )
 
 # Get logger instance
@@ -48,6 +56,14 @@ class RainbowTrainerModule:
         self.run_config = config.get("run", {})
         self.best_validation_metric = -np.inf
         self.writer = writer
+        # Inject the trainer's writer into the agent so internal diagnostics
+        # (categorical target stats, NoisyNet sigma, Q-stats, grad norms, target-net
+        # deviation, etc.) can mirror to TensorBoard without crossing package boundaries.
+        # See logging plan Tier 1c/3a-3d.
+        try:
+            self.agent.tb_writer = writer
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("Failed to attach SummaryWriter to agent.tb_writer", exc_info=True)
         # Adjust path prefix for Rainbow models
         self.best_model_base_prefix = str(Path(self.run_config.get("model_dir", "models")) / "rainbow_transformer_best")
         # Add checkpoint paths
@@ -80,6 +96,98 @@ class RainbowTrainerModule:
         self.min_validation_threshold = self.trainer_config.get("min_validation_threshold", -np.inf)
         self.validation_freq = self.trainer_config.get("validation_freq", 10)
         self.checkpoint_save_freq = self.trainer_config.get("checkpoint_save_freq", 10)
+        # Disk hygiene: cap the number of `checkpoint_trainer_latest_*` files
+        # that are kept on disk after each save. Each checkpoint is ~9 GB
+        # because it bundles the full PER buffer state, so an unbounded
+        # 50k-episode run would need ~9 TB. Set to 0 to disable rotation
+        # (every save kept). `best_*.pt` and `recover` checkpoints are
+        # **never** auto-rotated; only the periodic `latest_*` stream is.
+        raw_keep_last_n = self.trainer_config.get("latest_checkpoint_keep_last_n", 0)
+        try:
+            self.latest_checkpoint_keep_last_n = max(0, int(raw_keep_last_n))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid latest_checkpoint_keep_last_n=%r; disabling rotation.",
+                raw_keep_last_n,
+            )
+            self.latest_checkpoint_keep_last_n = 0
+        if self.latest_checkpoint_keep_last_n > 0:
+            logger.info(
+                "Latest-checkpoint rotation enabled: keeping the most recent %d "
+                "`checkpoint_trainer_latest_*_ep*_reward*.pt` file(s) after each save.",
+                self.latest_checkpoint_keep_last_n,
+            )
+
+        # ------------------------------------------------------------------
+        # Benchmark allocation fraction schedule (anneal start -> end over N
+        # episodes, anchored on the absolute episode index so resume continues
+        # the schedule). The CLI flag ``--benchmark-frac-override`` (surfaced
+        # via ``run.benchmark_frac_override``) pins a constant, ignoring the
+        # schedule entirely.
+        #
+        # Default behaviour when schedule keys are absent: use
+        # ``environment.benchmark_allocation_frac`` (required by
+        # :class:`TradingEnvConfig`) as a constant for the whole run. This
+        # also keeps live-trader and random-agent flows — which never had a
+        # schedule — working unchanged.
+        # ------------------------------------------------------------------
+        env_constant_raw = self.env_config.get("benchmark_allocation_frac")
+        env_constant: float = float(env_constant_raw) if env_constant_raw is not None else 0.5
+        raw_start = self.trainer_config.get("benchmark_allocation_frac_start")
+        raw_end = self.trainer_config.get("benchmark_allocation_frac_end")
+        raw_anneal = self.trainer_config.get("benchmark_allocation_frac_anneal_episodes")
+        try:
+            self.benchmark_frac_start: float = float(raw_start) if raw_start is not None else env_constant
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid benchmark_allocation_frac_start=%r; using env-config constant %.4f.",
+                raw_start,
+                env_constant,
+            )
+            self.benchmark_frac_start = env_constant
+        try:
+            self.benchmark_frac_end: float = float(raw_end) if raw_end is not None else env_constant
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid benchmark_allocation_frac_end=%r; using env-config constant %.4f.",
+                raw_end,
+                env_constant,
+            )
+            self.benchmark_frac_end = env_constant
+        try:
+            self.benchmark_frac_anneal_episodes: int = int(raw_anneal) if raw_anneal is not None else 0
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid benchmark_allocation_frac_anneal_episodes=%r; disabling schedule.",
+                raw_anneal,
+            )
+            self.benchmark_frac_anneal_episodes = 0
+        raw_override = self.run_config.get("benchmark_frac_override")
+        try:
+            self.benchmark_frac_override: float | None = float(raw_override) if raw_override is not None else None
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid run.benchmark_frac_override=%r; ignoring override.",
+                raw_override,
+            )
+            self.benchmark_frac_override = None
+        if self.benchmark_frac_override is not None:
+            logger.info(
+                "Benchmark allocation frac PINNED to %.4f via override (schedule ignored).",
+                self.benchmark_frac_override,
+            )
+        elif self.benchmark_frac_anneal_episodes > 0 and self.benchmark_frac_start != self.benchmark_frac_end:
+            logger.info(
+                "Benchmark allocation frac scheduled: %.4f -> %.4f over %d episodes.",
+                self.benchmark_frac_start,
+                self.benchmark_frac_end,
+                self.benchmark_frac_anneal_episodes,
+            )
+        else:
+            logger.info(
+                "Benchmark allocation frac constant: %.4f (no schedule configured).",
+                self.benchmark_frac_start,
+            )
         self.reward_window = self.trainer_config.get("reward_window", 10)
         self.update_freq = self.trainer_config.get("update_freq", 4)
         self.log_freq = self.trainer_config.get("log_freq", 100)
@@ -124,6 +232,31 @@ class RainbowTrainerModule:
             self.per_stats_log_freq = self.log_freq
         elif self.per_stats_log_freq == 0:
             logger.info("PER stats logging disabled because per_stats_log_freq is set to 0.")
+
+        # Tier 4a: full-distribution PER audit — runs less often than the cheap
+        # scalar PER stats since it walks 4096 transitions and computes per-action
+        # priority + reward histograms. Default = 5x per_stats_log_freq so we get
+        # ~5 audits per "interesting" priority drift on TB by default.
+        raw_per_audit = self.trainer_config.get(
+            "per_buffer_audit_interval",
+            (self.per_stats_log_freq or 0) * 5 if self.per_stats_log_freq > 0 else 0,
+        )
+        try:
+            self.per_buffer_audit_interval = int(raw_per_audit)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid per_buffer_audit_interval value %s; disabling Tier 4a audit.",
+                raw_per_audit,
+            )
+            self.per_buffer_audit_interval = 0
+        if self.per_buffer_audit_interval < 0:
+            logger.warning(
+                "per_buffer_audit_interval must be >= 0 (received %s); disabling Tier 4a audit.",
+                self.per_buffer_audit_interval,
+            )
+            self.per_buffer_audit_interval = 0
+        elif self.per_buffer_audit_interval == 0:
+            logger.info("Tier 4a per-buffer distribution audit disabled (interval=0).")
         raw_final_phase_start = self.trainer_config.get("final_phase_lr_start_frac")
         raw_final_phase_multiplier = self.trainer_config.get("final_phase_lr_multiplier")
         self.final_phase_lr_start_frac: float | None = None
@@ -165,6 +298,10 @@ class RainbowTrainerModule:
             )
         self._final_phase_lr_applied = False
         self.warmup_steps = self.trainer_config.get("warmup_steps", 50000)
+        # Tier 2d: validation/test runs greedy by default (epsilon=0 + frozen
+        # NoisyNet sigma). ``--eval-stochastic`` propagates to ``run.eval_stochastic``
+        # to flip back to the legacy stochastic eval path.
+        self.eval_stochastic = bool(self.run_config.get("eval_stochastic", False))
         self.num_vector_envs = max(1, int(self.trainer_config.get("num_vector_envs", 1)))
         self.invalid_action_window = self.trainer_config.get("invalid_action_window", 20)
         self.invalid_action_rate_window: deque[float] = deque(maxlen=self.invalid_action_window)
@@ -188,6 +325,98 @@ class RainbowTrainerModule:
         # Removed complex logic based on improvement_rate and stability
         # Simplified to validate purely based on frequency
         return (episode + 1) % self.validation_freq == 0
+
+    def current_benchmark_frac(self, episode: int) -> float:
+        """Return the benchmark allocation frac for the given absolute episode.
+
+        Honours the CLI override first; otherwise computes the linear anneal
+        from ``benchmark_frac_start`` to ``benchmark_frac_end`` over
+        ``benchmark_frac_anneal_episodes``.
+        """
+        if self.benchmark_frac_override is not None:
+            return float(self.benchmark_frac_override)
+        return compute_benchmark_frac(
+            episode=int(episode),
+            start=self.benchmark_frac_start,
+            end=self.benchmark_frac_end,
+            anneal_episodes=self.benchmark_frac_anneal_episodes,
+        )
+
+    def _apply_benchmark_frac_to_env(self, env, episode: int) -> float:
+        """Push the current scheduled benchmark frac into a single env's
+        :class:`TradingLogic`. Returns the value applied (for logging)."""
+        value = self.current_benchmark_frac(episode)
+        try:
+            env.trading_logic.set_benchmark_allocation_frac(value)
+        except AttributeError:
+            logger.debug(
+                "Env %r exposes no trading_logic.set_benchmark_allocation_frac; skipping.",
+                type(env).__name__,
+            )
+        return value
+
+    def _maybe_emit_benchmark_frac(self, episode: int, value: float) -> None:
+        """Emit ``Train/Hyper/BenchmarkFrac`` for the given episode."""
+        if self.writer is None:
+            return
+        try:
+            self.writer.add_scalar("Train/Hyper/BenchmarkFrac", float(value), int(episode))
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("Failed to emit Train/Hyper/BenchmarkFrac", exc_info=True)
+
+    def _validate_validation_cadence_config(self, num_episodes: int, has_val_files: bool) -> None:
+        """Hard-fail / loudly warn if the validation cadence won't meaningfully fire.
+
+        Catches three foot-guns we've actually hit in production:
+
+        1. ``validation_freq`` larger than the entire run length, with
+           validation files present — guarantees zero ``Validation/*`` scalars
+           and no ``best`` checkpoints. Hard-fail with a clear message.
+        2. ``validation_freq`` so large that fewer than 5 validations would
+           happen across the whole run — the curriculum / best-tracking signal
+           gets too sparse to act on. Loud warning.
+        3. ``min_episodes_before_early_stopping`` larger than ``num_episodes``
+           — guarantees no ``best`` checkpoint ever lands on disk, which
+           silently breaks the recovery flow. Loud warning.
+        """
+        try:
+            num_episodes_int = int(num_episodes)
+            validation_freq_int = int(self.validation_freq)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Skipping validation-cadence guard: non-integer num_episodes=%r or validation_freq=%r.",
+                num_episodes,
+                self.validation_freq,
+            )
+            return
+
+        if has_val_files and validation_freq_int > 0 and validation_freq_int > num_episodes_int:
+            raise RuntimeError(
+                f"validation_freq ({validation_freq_int}) is larger than num_episodes "
+                f"({num_episodes_int}); validation would never fire and no `best` "
+                f"checkpoint would ever be saved. Lower validation_freq or raise "
+                f"run.episodes (or remove all validation files to opt out explicitly)."
+            )
+
+        if has_val_files and validation_freq_int > 0 and num_episodes_int >= 5 and validation_freq_int > max(1, num_episodes_int // 5):
+            expected_runs = num_episodes_int // validation_freq_int
+            logger.warning(
+                "validation_freq=%d will only run validation ~%d time(s) across %d episodes "
+                "(less than 5). Curriculum / best-checkpoint signal will be very sparse; "
+                "consider lowering validation_freq.",
+                validation_freq_int,
+                expected_runs,
+                num_episodes_int,
+            )
+
+        if self.min_episodes_before_early_stopping > 0 and self.min_episodes_before_early_stopping > num_episodes_int:
+            logger.warning(
+                "min_episodes_before_early_stopping=%d > num_episodes=%d: no `best` "
+                "checkpoint will ever be saved during this run. Lower the threshold or "
+                "raise run.episodes if you want best-tracking enabled.",
+                self.min_episodes_before_early_stopping,
+                num_episodes_int,
+            )
 
     @staticmethod
     def _render_on_reset_if_enabled(env, context):
@@ -237,6 +466,83 @@ class RainbowTrainerModule:
                 f.write(json.dumps(record, default=str) + "\n")
         except Exception:
             logger.debug("Failed to append progress record", exc_info=True)
+
+    def _rotate_latest_checkpoints(self) -> list[Path]:
+        """Delete `checkpoint_trainer_latest_*` files older than the keep-N window.
+
+        Episode number (from the canonical
+        ``checkpoint_trainer_latest_<DATE>_ep<N>_reward<...>.pt`` filename) is
+        the sort key, **not** mtime — episode numbers are monotonically
+        non-decreasing with training progress and survive timezone /
+        clock-skew weirdness, while mtime can be reset by file moves.
+
+        ``best_*.pt`` files are never touched: those are the curated "model
+        I want to keep" snapshots and the user / recovery script may rely on
+        them. The recover-script outputs (``rewardrecover`` marker) are
+        intentionally included in the latest-stream rotation because they
+        are themselves `latest_*` files written with bumped episode numbers.
+
+        Returns the list of paths that were deleted (for logging / tests).
+        Silently returns ``[]`` if rotation is disabled (``keep_last_n=0``).
+        """
+        keep_n = self.latest_checkpoint_keep_last_n
+        if keep_n <= 0:
+            return []
+
+        model_dir = Path(self.run_config.get("model_dir", "models"))
+        try:
+            candidates = list(model_dir.glob("checkpoint_trainer_latest_*_ep*_reward*.pt"))
+        except OSError as exc:
+            logger.warning("Checkpoint rotation: failed to list %s: %s", model_dir, exc)
+            return []
+
+        # Pull the episode number out of the filename. Files that don't match
+        # the canonical pattern are skipped (left untouched) rather than
+        # deleted — safer to leave an unrecognised file in place.
+        ep_re = re.compile(r"^checkpoint_trainer_latest_\d{8}_ep(\d+)_reward.+\.pt$")
+        episode_files: list[tuple[int, Path]] = []
+        skipped: list[Path] = []
+        for path in candidates:
+            m = ep_re.match(path.name)
+            if not m:
+                skipped.append(path)
+                continue
+            try:
+                episode_files.append((int(m.group(1)), path))
+            except ValueError:
+                skipped.append(path)
+        if skipped:
+            logger.debug(
+                "Checkpoint rotation: skipping %d non-canonical filename(s): %s",
+                len(skipped),
+                [p.name for p in skipped],
+            )
+
+        if len(episode_files) <= keep_n:
+            return []
+
+        # Highest episode first; everything after the keep-N window gets pruned.
+        episode_files.sort(key=lambda item: item[0], reverse=True)
+        to_delete = [path for _, path in episode_files[keep_n:]]
+        deleted: list[Path] = []
+        for path in to_delete:
+            try:
+                path.unlink()
+                deleted.append(path)
+            except OSError as exc:
+                logger.warning(
+                    "Checkpoint rotation: failed to delete %s: %s",
+                    path,
+                    exc,
+                )
+        if deleted:
+            logger.info(
+                "Checkpoint rotation: pruned %d old `latest_*` checkpoint(s) (kept the most recent %d). Deleted: %s",
+                len(deleted),
+                keep_n,
+                [p.name for p in deleted],
+            )
+        return deleted
 
     def _save_checkpoint(
         self,
@@ -309,6 +615,12 @@ class RainbowTrainerModule:
             logger.info(f"  Total Steps: {total_steps}")
             logger.info(f"  Best Validation Score: {self.best_validation_metric:.4f}")
             logger.info(f"  Early Stopping Counter: {self.early_stopping_counter}")
+            # Disk hygiene: prune older latest_* checkpoints once the new one
+            # is safely on disk. Only runs if `latest_checkpoint_keep_last_n > 0`.
+            try:
+                self._rotate_latest_checkpoints()
+            except Exception:  # noqa: BLE001 — never let rotation break a save
+                logger.warning("Checkpoint rotation raised; continuing.", exc_info=True)
         except Exception as e:
             logger.error(f"Error saving latest checkpoint: {e}", exc_info=True)  # Kept traceback
 
@@ -368,6 +680,8 @@ class RainbowTrainerModule:
             env = TradingEnv(config=env_config_obj)
             obs, info = env.reset()
             self._render_on_reset_if_enabled(env, "train")
+            applied_frac = self._apply_benchmark_frac_to_env(env, episode)
+            self._maybe_emit_benchmark_frac(episode, applied_frac)
             assert isinstance(info["portfolio_value"], (float, np.float32, np.float64)), "Reset info missing valid portfolio_value"
             # Basic observation checks
             assert isinstance(obs, dict), "Observation must be a dict"
@@ -405,11 +719,22 @@ class RainbowTrainerModule:
         assert obs["account_state"].shape == (ACCOUNT_STATE_DIM,)
 
         # Select action
+        # Tier 2c: track action provenance (greedy vs epsilon-forced) so the
+        # per-action greedy/eps split is visible in TB and so trade segmentation
+        # downstream can attribute trades. Warmup actions are sampled uniformly
+        # from the env action space → treat them as non-greedy ("eps") for the
+        # purposes of action-rate split.
         if total_train_steps < self.warmup_steps:
             action = env.action_space.sample()
+            was_greedy = False
         else:
             self.agent.env_steps = total_train_steps - self.warmup_steps
-            action = self.agent.select_action(obs)
+            select_with_provenance = getattr(self.agent, "select_action_with_provenance", None)
+            if callable(select_with_provenance):
+                action, was_greedy = select_with_provenance(obs)
+            else:  # backward-compat with stub agents
+                action = self.agent.select_action(obs)
+                was_greedy = True
 
         # Step environment
         try:
@@ -420,6 +745,7 @@ class RainbowTrainerModule:
             if isinstance(info, dict):
                 info.setdefault("terminated", terminated_flag)
                 info.setdefault("truncated", truncated_flag)
+                info.setdefault("was_greedy", bool(was_greedy))
             # Basic validation of step outputs
             if not isinstance(next_obs, dict):
                 logger.error(f"next_obs is not a dict: {type(next_obs)}")
@@ -601,6 +927,207 @@ class RainbowTrainerModule:
             stats.get("total_priority", 0.0),
         )
 
+        # Tier 1d: mirror PER stats to TensorBoard so beta/alpha/fill/avg/max priority are
+        # visible alongside Train/* curves. Stepped on env-side training step so the time
+        # axis is consistent with reward/action-rate panels.
+        if self.writer is not None:
+            try:
+                step = int(total_train_steps)
+                self.writer.add_scalar("Train/PER/AvgPriority", float(stats.get("avg_priority", 0.0)), step)
+                self.writer.add_scalar("Train/PER/MaxPriority", float(stats.get("max_priority", 0.0)), step)
+                self.writer.add_scalar("Train/PER/TotalPriority", float(stats.get("total_priority", 0.0)), step)
+                self.writer.add_scalar("Train/PER/Beta", float(stats.get("beta", 0.0)), step)
+                self.writer.add_scalar("Train/PER/Alpha", float(stats.get("alpha", 0.0)), step)
+                self.writer.add_scalar("Train/PER/Fill", float(stats.get("fill_ratio", 0.0)), step)
+                self.writer.add_scalar("Train/PER/Size", float(stats.get("size", 0)), step)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("Failed to mirror PER stats to TensorBoard: %s", exc)
+
+        # Tier 1d: light invariant audit on stored n-step rewards.
+        # If clipping is enabled the stored n-step reward magnitude must satisfy
+        #   |R_n| <= reward_clip * sum_{i=0}^{n-1} gamma^i
+        # Any sample exceeding that bound indicates a code bug (clipping bypass) or
+        # a stale checkpointed buffer carrying pre-clip outliers. Counting the events
+        # is a cheap regression guard.
+        self._maybe_audit_per_buffer_clip_bypass(total_train_steps)
+
+        # Tier 4a: full reward + priority distribution audit, runs at a slower
+        # cadence than the cheap PER scalars above.
+        self._maybe_audit_per_buffer_distribution(total_train_steps)
+
+    def _maybe_audit_per_buffer_clip_bypass(self, total_train_steps: int) -> None:
+        """Sample up to 4096 stored transitions and count |reward| > clip bound.
+
+        Invariant: rewards are clipped by ``self.reward_clip_value`` *before* being
+        accumulated into n-step returns by the agent. The maximum legal magnitude
+        of a stored n-step reward is therefore::
+
+            bound = reward_clip * sum_{i=0}^{n-1} gamma^i
+
+        Any sample exceeding ``bound`` after a small floating-point tolerance is a
+        bug (or a stale buffer reload) — surface it as a TB scalar so it is caught
+        immediately rather than silently re-injected into the learner.
+        """
+        if self.writer is None or self.reward_clip_value is None:
+            return
+        buffer = getattr(self.agent, "buffer", None)
+        if buffer is None:
+            return
+        stored_buffer = getattr(buffer, "buffer", None)
+        if stored_buffer is None or len(stored_buffer) == 0:
+            return
+
+        try:
+            gamma = float(self.agent_config.get("gamma", 0.99))
+            n_steps = int(self.agent_config.get("n_steps", 1))
+        except (TypeError, ValueError):
+            gamma, n_steps = 0.99, 1
+        if n_steps <= 0:
+            return
+
+        # Geometric series sum_{i=0}^{n-1} gamma^i
+        if abs(gamma - 1.0) < 1e-9:
+            discount_sum = float(n_steps)
+        else:
+            discount_sum = (1.0 - gamma**n_steps) / (1.0 - gamma)
+        bound = float(self.reward_clip_value) * discount_sum * (1.0 + 1e-6)
+
+        size = len(stored_buffer)
+        sample_size = min(4096, size)
+        try:
+            indices = np.random.randint(0, size, size=sample_size) if sample_size < size else np.arange(size)
+            rewards = np.empty(sample_size, dtype=np.float64)
+            for i, idx in enumerate(indices):
+                experience = stored_buffer[int(idx)]
+                rewards[i] = float(getattr(experience, "reward", 0.0))
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("PER buffer audit failed during sampling: %s", exc)
+            return
+
+        bypass_mask = np.abs(rewards) > bound
+        bypass_count = int(bypass_mask.sum())
+        bypass_fraction = float(bypass_mask.mean()) if sample_size > 0 else 0.0
+
+        try:
+            step = int(total_train_steps)
+            self.writer.add_scalar("Train/PER/ClipBypassEventCount", float(bypass_count), step)
+            self.writer.add_scalar("Train/PER/ClipBypassFraction", bypass_fraction, step)
+            self.writer.add_scalar("Train/PER/AuditSampleSize", float(sample_size), step)
+            self.writer.add_scalar("Train/PER/StoredRewardClipBound", bound, step)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Failed to mirror PER buffer audit to TensorBoard: %s", exc)
+
+        if bypass_count > 0:
+            top = float(np.max(np.abs(rewards)))
+            logger.warning(
+                "PER buffer clip-bypass audit: %d/%d sampled transitions exceed bound=%.6f "
+                "(max |reward|=%.6f). Possible code bug or stale checkpointed buffer.",
+                bypass_count,
+                sample_size,
+                bound,
+                top,
+            )
+
+    def _maybe_audit_per_buffer_distribution(self, total_train_steps: int) -> None:
+        """Sample up to 4096 stored transitions and emit reward + priority distribution audit.
+
+        Tier 4a. Emits:
+
+        * ``Train/PER/Reward/Histogram`` — full reward distribution shape;
+          catches multi-modal collapse the scalar avg/max can't see.
+        * ``Train/PER/Reward/OutlierFrac`` — fraction of |reward| > 5*reward_clip
+          (relative to the stored n-step bound). Looser than the clip-bypass
+          audit on purpose; flags "concerning tail" rather than "is a bug".
+        * ``Train/PER/PriorityByAction/{k}`` — mean SumTree priority per action
+          k. The "always action 5" failure mode shows up here as a single
+          action dominating priority well before it dominates Action Rate.
+        * ``Train/PER/Top1PctActionShare/{k}`` — share of the top-1% highest
+          priority transitions belonging to action k. Even sharper signal than
+          PriorityByAction since it isolates *which* action the learner is
+          chasing the largest TD errors on.
+        """
+        if self.writer is None:
+            return
+        if self.per_buffer_audit_interval <= 0:
+            return
+        if total_train_steps <= 0 or total_train_steps % self.per_buffer_audit_interval != 0:
+            return
+        buffer = getattr(self.agent, "buffer", None)
+        if buffer is None:
+            return
+        stored_buffer = getattr(buffer, "buffer", None)
+        sum_tree = getattr(buffer, "tree", None)
+        if stored_buffer is None or len(stored_buffer) == 0 or sum_tree is None:
+            return
+        tree_arr = getattr(sum_tree, "tree", None)
+        capacity = int(getattr(sum_tree, "capacity", 0))
+        if tree_arr is None or capacity <= 0:
+            return
+
+        size = len(stored_buffer)
+        sample_size = min(4096, size)
+        try:
+            indices = np.random.randint(0, size, size=sample_size) if sample_size < size else np.arange(size)
+            rewards = np.empty(sample_size, dtype=np.float64)
+            actions = np.empty(sample_size, dtype=np.int64)
+            priorities = np.empty(sample_size, dtype=np.float64)
+            for i, idx in enumerate(indices):
+                experience = stored_buffer[int(idx)]
+                rewards[i] = float(getattr(experience, "reward", 0.0))
+                actions[i] = int(getattr(experience, "action", 0))
+                # SumTree leaves live at indices [capacity-1, 2*capacity-2]; the
+                # buffer index equals the SumTree's data pointer (lockstep
+                # writes — see PrioritizedReplayBuffer.store), so this lookup
+                # is direct and identity-safe.
+                priorities[i] = float(tree_arr[int(idx) + capacity - 1])
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("PER distribution audit failed during sampling: %s", exc)
+            return
+
+        step = int(total_train_steps)
+        try:
+            self.writer.add_histogram("Train/PER/Reward/Histogram", rewards, step)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Failed to mirror PER reward histogram: %s", exc)
+
+        # Outlier fraction is *informational* (not a bug guard like
+        # ClipBypass); use a generous 5x reward_clip threshold when clipping
+        # is enabled, otherwise fall back to 5x the empirical std.
+        try:
+            if self.reward_clip_value is not None:
+                threshold = 5.0 * float(self.reward_clip_value)
+            else:
+                std = float(np.std(rewards)) if rewards.size > 1 else 0.0
+                threshold = 5.0 * std if std > 0 else float("inf")
+            outlier_frac = float(np.mean(np.abs(rewards) > threshold)) if math.isfinite(threshold) else 0.0
+            self.writer.add_scalar("Train/PER/Reward/OutlierFrac", outlier_frac, step)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Failed to mirror PER reward outlier fraction: %s", exc)
+
+        num_actions = int(getattr(self.agent, "num_actions", int(actions.max() + 1) if actions.size else 1))
+        try:
+            for k in range(num_actions):
+                mask = actions == k
+                if mask.any():
+                    mean_p = float(priorities[mask].mean())
+                else:
+                    mean_p = 0.0
+                self.writer.add_scalar(f"Train/PER/PriorityByAction/{k}", mean_p, step)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Failed to mirror PER per-action priorities: %s", exc)
+
+        # Top 1% by priority — the slice of the buffer the learner is
+        # actually being shaped by right now.
+        try:
+            top_n = max(1, sample_size // 100)
+            top_idx = np.argpartition(-priorities, kth=min(top_n - 1, sample_size - 1))[:top_n]
+            top_actions = actions[top_idx]
+            for k in range(num_actions):
+                share = float(np.mean(top_actions == k)) if top_actions.size else 0.0
+                self.writer.add_scalar(f"Train/PER/Top1PctActionShare/{k}", share, step)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Failed to mirror PER top-1pct action shares: %s", exc)
+
     def _maybe_apply_final_phase_lr_decay(
         self,
         *,
@@ -668,6 +1195,96 @@ class RainbowTrainerModule:
                 total_train_steps,
             )
         return changed
+
+    # Eval-gap scalar set: keys must exist in *both* Validation and Train to
+    # produce a meaningful diff. Tags are deliberately short so they group
+    # nicely in the TensorBoard left-rail tree under ``Train/EvalGap/``.
+    _EVAL_GAP_METRIC_TAGS: dict[str, str] = {
+        "total_return": "TotalReturnPct",
+        "sharpe_ratio": "SharpeRatio",
+        "max_drawdown": "MaxDrawdown",
+        "transaction_costs": "TransactionCosts",
+        "avg_reward": "AvgReward",
+        "portfolio_value": "PortfolioValue",
+    }
+
+    def _emit_eval_gap_scalars(self, avg_val_metrics: dict, train_recent: dict, episode: int) -> None:
+        """Emit ``Train/EvalGap/*`` = greedy_validation - stochastic_training.
+
+        Tier 2d. Each tag is the *signed* difference; positive values mean the
+        greedy projection outperformed the stochastic training window on that
+        metric. Skips a tag if either side is missing or non-finite, so eval
+        gaps remain readable even on partial validation runs.
+        """
+        if not self.writer:
+            return
+        for key, tag in self._EVAL_GAP_METRIC_TAGS.items():
+            val = avg_val_metrics.get(key)
+            ref = train_recent.get(key)
+            if val is None or ref is None:
+                continue
+            try:
+                fv = float(val)
+                fr = float(ref)
+            except (TypeError, ValueError):
+                continue
+            if math.isnan(fv) or math.isinf(fv) or math.isnan(fr) or math.isinf(fr):
+                continue
+            self.writer.add_scalar(f"Train/EvalGap/{tag}", fv - fr, episode)
+
+    def _trade_metrics_from_tracker(self, tracker: PerformanceTracker) -> dict[str, float]:
+        """Build per-trade aggregate metrics from a training :class:`PerformanceTracker`.
+
+        Tier 2c: reuses Tier 2a's :func:`segment_trades` so train-time and
+        eval-time per-trade KPIs share one definition. Returns an empty dict if
+        the tracker doesn't have enough state (positions/prices) to segment.
+        """
+        positions = list(getattr(tracker, "positions", []) or [])
+        actions = list(getattr(tracker, "actions", []) or [])
+        prices_full = list(getattr(tracker, "position_values", []) or [])
+        portfolio_values = list(getattr(tracker, "portfolio_values", []) or [])
+        transaction_costs = list(getattr(tracker, "transaction_costs", []) or [])
+        was_greedy = list(getattr(tracker, "was_greedy", []) or [])
+        if not positions or not actions or not portfolio_values:
+            return {}
+        # PerformanceTracker stores price implicitly via position_values/positions; we
+        # require an explicit price stream to segment trades. Recover price as
+        # ``position_value/position`` where possible; fall back to a flat 1.0 series
+        # otherwise. The resulting MAE/MFE will then be measured in PnL units, which
+        # is still useful for the headline KPIs (HitRate/Expectancy/PctGreedy).
+        prices: list[float] = []
+        for pos, pv in zip(positions, prices_full):
+            if abs(pos) > 1e-12 and pv is not None:
+                prices.append(float(pv) / float(pos))
+            else:
+                prices.append(prices[-1] if prices else 1.0)
+        if not prices:
+            prices = [1.0] * len(positions)
+        n = min(
+            len(positions),
+            len(actions),
+            len(prices),
+            len(portfolio_values) - 1 if len(portfolio_values) > 1 else 0,
+        )
+        if n <= 0:
+            return {}
+        steps: list[StepRecord] = []
+        for i in range(n):
+            wg = was_greedy[i] if i < len(was_greedy) else None
+            tc = transaction_costs[i] if i < len(transaction_costs) else 0.0
+            steps.append(
+                StepRecord(
+                    step_index=i,
+                    portfolio_value=float(portfolio_values[i + 1]),
+                    position=float(positions[i]),
+                    price=float(prices[i]),
+                    action=int(actions[i]),
+                    transaction_cost=float(tc or 0.0),
+                    was_greedy=None if wg is None else bool(wg),
+                )
+            )
+        trades = segment_trades(steps)
+        return aggregate_trade_metrics(trades)
 
     def _log_episode_summary(
         self,
@@ -772,6 +1389,63 @@ class RainbowTrainerModule:
                         action_rate = count / steps_safe if steps_safe > 0 else 0.0
                         self.writer.add_scalar(f"Train/Action Count/{action_idx}", count, episode)
                         self.writer.add_scalar(f"Train/Action Rate/{action_idx}", action_rate, episode)
+                # Tier 2c: per-action greedy/eps split + epsilon-forced trade fraction.
+                provenance = metrics.get("action_provenance_counts", {}) or {}
+                greedy_counts = provenance.get("greedy", {}) or {}
+                eps_counts = provenance.get("eps", {}) or {}
+                if greedy_counts or eps_counts:
+                    for action_idx in range(int(getattr(self.agent, "num_actions", 6))):
+                        gc = float(greedy_counts.get(action_idx, 0) or 0)
+                        ec = float(eps_counts.get(action_idx, 0) or 0)
+                        gr = gc / steps_safe if steps_safe > 0 else 0.0
+                        er = ec / steps_safe if steps_safe > 0 else 0.0
+                        self.writer.add_scalar(f"Train/Action Rate/Greedy/{action_idx}", gr, episode)
+                        self.writer.add_scalar(f"Train/Action Rate/Eps/{action_idx}", er, episode)
+                self.writer.add_scalar(
+                    "Train/EpsilonForcedTradeFraction",
+                    float(metrics.get("epsilon_forced_trade_fraction", 0.0) or 0.0),
+                    episode,
+                )
+                # Tier 2c: per-episode Train/Trade/* (HitRate/Expectancy/PctGreedy/...)
+                try:
+                    train_trade_metrics = self._trade_metrics_from_tracker(tracker)
+                except Exception:  # pragma: no cover - defensive, never block training
+                    logger.debug("Failed to compute Train/Trade metrics from tracker", exc_info=True)
+                    train_trade_metrics = {}
+                for key, value in train_trade_metrics.items():
+                    if not isinstance(value, (int, float, np.floating, np.integer)):
+                        continue
+                    fv = float(value)
+                    if math.isnan(fv) or math.isinf(fv):
+                        continue
+                    tag = "".join(part.capitalize() for part in str(key).split("_"))
+                    self.writer.add_scalar(f"Train/Trade/{tag}", fv, episode)
+                # Tier 4b: per-episode reward outlier guard. Cheap (one pass over
+                # the tracker's rewards) and gives an immediate "did we just blow
+                # up the loss?" signal independent of PER buffer audits, which
+                # are throttled to ~5x slower.
+                try:
+                    outlier_stats = tracker.get_reward_outlier_stats(self.reward_clip_value)
+                except Exception:  # pragma: no cover - defensive
+                    logger.debug("Failed to compute Tier 4b reward outlier stats", exc_info=True)
+                    outlier_stats = {}
+                if outlier_stats:
+                    self.writer.add_scalar("Train/Episode/RewardMin", outlier_stats["reward_min"], episode)
+                    self.writer.add_scalar("Train/Episode/RewardMax", outlier_stats["reward_max"], episode)
+                    self.writer.add_scalar("Train/Episode/RewardP99Abs", outlier_stats["reward_p99_abs"], episode)
+                    self.writer.add_scalar("Train/Episode/RewardOutlierFlag", outlier_stats["reward_outlier_flag"], episode)
+                # Tier 4c: per-action reward mean/std. Action 0 (hold)
+                # dominates avg_reward by count, so this is the only place we
+                # can read off "is action 5 actually pulling its weight?".
+                try:
+                    by_action = tracker.get_reward_by_action_stats()
+                except Exception:  # pragma: no cover - defensive
+                    logger.debug("Failed to compute Tier 4c reward-by-action stats", exc_info=True)
+                    by_action = {}
+                for k in range(int(getattr(self.agent, "num_actions", 6))):
+                    bucket = by_action.get(k, {"mean": 0.0, "std": 0.0})
+                    self.writer.add_scalar(f"Train/Reward/MeanByAction/{k}", float(bucket["mean"]), episode)
+                    self.writer.add_scalar(f"Train/Reward/StdByAction/{k}", float(bucket["std"]), episode)
 
             self.writer.add_scalar("Train/Final Portfolio Value", final_info.get("portfolio_value", np.nan), episode)
             self.writer.add_scalar("Train/Final Position", final_info.get("position", np.nan), episode)
@@ -894,6 +1568,56 @@ class RainbowTrainerModule:
                             avg_val_metrics.get("avg_balance", np.nan),
                             episode,
                         )
+                    # Tier 1b: parity with Train/Final Portfolio Value and Train/Transaction Costs.
+                    final_pv = avg_val_metrics.get("final_portfolio_value")
+                    if final_pv is None:
+                        final_pv = avg_val_metrics.get("portfolio_value")
+                    if final_pv is not None and not (isinstance(final_pv, float) and (math.isnan(final_pv) or math.isinf(final_pv))):
+                        self.writer.add_scalar("Validation/Final Portfolio Value", float(final_pv), episode)
+                    txn_costs = avg_val_metrics.get("transaction_costs")
+                    if txn_costs is not None and not (isinstance(txn_costs, float) and (math.isnan(txn_costs) or math.isinf(txn_costs))):
+                        self.writer.add_scalar("Validation/Transaction Costs", float(txn_costs), episode)
+                    # Tier 1b: per-action rate parity with Train/Action Rate/{0..5}.
+                    action_rates = avg_val_metrics.get("action_rates", {}) or {}
+                    for action_idx, rate in action_rates.items():
+                        if rate is None:
+                            continue
+                        rate_f = float(rate)
+                        if math.isnan(rate_f) or math.isinf(rate_f):
+                            continue
+                        self.writer.add_scalar(f"Validation/Action Rate/{int(action_idx)}", rate_f, episode)
+                    # Tier 2b: per-trade KPIs (Validation/Trade/* scalars + PnL histogram).
+                    trade_metrics = avg_val_metrics.get("trade_metrics", {}) or {}
+                    for key, value in trade_metrics.items():
+                        if value is None:
+                            continue
+                        try:
+                            value_f = float(value)
+                        except (TypeError, ValueError):
+                            continue
+                        if math.isnan(value_f) or math.isinf(value_f):
+                            continue
+                        self.writer.add_scalar(f"Validation/Trade/{key}", value_f, episode)
+                    trade_pnls = avg_val_metrics.get("trade_pnls", []) or []
+                    if trade_pnls:
+                        try:
+                            self.writer.add_histogram(
+                                "Validation/Trade/PnLDistribution",
+                                np.asarray(trade_pnls, dtype=np.float32),
+                                episode,
+                            )
+                        except Exception as exc:  # pragma: no cover - defensive
+                            logger.debug("Failed to emit Validation/Trade/PnLDistribution: %s", exc)
+
+                # Tier 2d: Train/EvalGap/* — diff between greedy validation and
+                # the most recent stochastic-training rolling window. Positive =
+                # greedy outperforms training. NaN-safe via _safe_eval_gap_scalar.
+                try:
+                    train_recent = tracker.get_recent_metrics() if tracker is not None else {}
+                except Exception:  # pragma: no cover - defensive
+                    train_recent = {}
+                if train_recent:
+                    self._emit_eval_gap_scalars(avg_val_metrics, train_recent, episode)
             # ---------------------------------------------------- #
 
             # --- Step LR Scheduler if it's ReduceLROnPlateau --- #
@@ -1019,9 +1743,19 @@ class RainbowTrainerModule:
     def _perform_evaluation_step(self, env: TradingEnv, obs: dict) -> tuple[dict, float, bool, dict, int, bool]:
         """Performs a single step of evaluation in the environment. Returns (next_obs, reward, done, info, action, error_occurred)."""
         try:
-            action = self.agent.select_action(obs)
+            # Tier 2c: ask the agent for action provenance. In eval mode the agent
+            # never explores, so was_greedy is True; capture it anyway so the
+            # downstream per-trade aggregator (Tier 2b) can attribute trades.
+            select_with_provenance = getattr(self.agent, "select_action_with_provenance", None)
+            if callable(select_with_provenance):
+                action, was_greedy = select_with_provenance(obs)
+            else:  # backward-compat with stub agents in tests
+                action = self.agent.select_action(obs)
+                was_greedy = True
             next_obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
+            if isinstance(info, dict):
+                info.setdefault("was_greedy", bool(was_greedy))
 
             # --- ADDED: Check for non-numeric reward --- #
             error_occurred = False  # Initialize error flag for this check
@@ -1070,8 +1804,13 @@ class RainbowTrainerModule:
         # assert isinstance(
         #     env, TradingEnv
         # ), "env must be an instance of TradingEnv for evaluation"
+        # Tier 2d: by default put the agent in deterministic ``greedy()`` mode
+        # for evaluation. ``--eval-stochastic`` (config: ``run.eval_stochastic``)
+        # leaves the agent in its current (training) mode so we can measure the
+        # gap between the policy being trained and its greedy projection.
         was_training = self.agent.training_mode
-        self.agent.set_training_mode(False)
+        if not getattr(self, "eval_stochastic", False):
+            self.agent.set_training_mode(False)
         tracker = None  # Initialize tracker to None
         final_info = {}  # Initialize final_info
         total_reward = -np.inf  # Default reward if reset fails
@@ -1095,6 +1834,9 @@ class RainbowTrainerModule:
 
             episode_had_error = False  # Flag to track errors
             step_index = 0
+            # Tier 2b: per-step trace used by trade segmentation. Kept lightweight
+            # (pure floats / ints) so memory stays bounded even on long episodes.
+            step_records: list[dict] = []
             while not done:
                 # Call the new helper method
                 next_obs, reward, step_done, step_info, action, error_occurred = self._perform_evaluation_step(env, obs)
@@ -1120,6 +1862,20 @@ class RainbowTrainerModule:
                         position=info.get("position"),
                         balance=info.get("balance"),
                         price=info.get("price"),
+                    )
+                    # Tier 2b: capture the minimal fields the trade segmenter needs.
+                    step_records.append(
+                        {
+                            "step_index": step_index,
+                            "portfolio_value": float(info["portfolio_value"]),
+                            "position": float(info.get("position", 0.0) or 0.0),
+                            "price": float(info.get("price", 0.0) or 0.0),
+                            "action": int(action),
+                            "transaction_cost": float(info.get("step_transaction_cost", 0.0) or 0.0),
+                            # Provenance is filled in by Tier 2c; default to None so the
+                            # segmenter reports pct_greedy_actions=NaN until then.
+                            "was_greedy": info.get("was_greedy"),
+                        }
                     )
                     total_reward += reward
                     obs = next_obs
@@ -1151,6 +1907,20 @@ class RainbowTrainerModule:
                     metrics["max_portfolio_value"] = np.nan
                     metrics["mean_portfolio_value"] = np.nan
                     metrics["median_portfolio_value"] = np.nan
+
+                # Tier 2b: trade segmentation + per-trade economics aggregation.
+                # ``trades`` is a list of dicts (JSON-serializable for sidecar files);
+                # ``trade_metrics`` is the flat dict consumed by the validation/test
+                # TensorBoard emitters (see _handle_validation_and_checkpointing and
+                # run_training._emit_trade_metrics).
+                try:
+                    trades = segment_trades(step_records)
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning(f"Trade segmentation failed in {context} episode: {exc}")
+                    trades = []
+                metrics["trades"] = [t.to_dict() for t in trades]
+                metrics["trade_metrics"] = aggregate_trade_metrics(trades)
+                metrics["total_steps"] = step_index
         except Exception as e:  # Catch any exception during the reset or main loop
             logger.error(f"Error during evaluation episode run: {e}", exc_info=True)
             # Return default/failure values
@@ -1292,7 +2062,18 @@ class RainbowTrainerModule:
                 "avg_abs_position": float(file_metrics.get("avg_abs_position", np.nan)),
                 "avg_balance": float(file_metrics.get("avg_balance", np.nan)),
                 "avg_position_value": float(file_metrics.get("avg_position_value", np.nan)),
+                # Tier 2b: surface per-trade economics so run_training._emit_trade_metrics
+                # and the validation TB block can mirror them. ``trades`` is also kept
+                # so the JSONL sidecar / offline analyzer (Tier 5c) can consume them.
+                "trade_metrics": dict(file_metrics.get("trade_metrics", {})) if file_metrics.get("trade_metrics") else {},
+                "trades": list(file_metrics.get("trades", [])),
+                "total_steps": int(file_metrics.get("total_steps", 0) or 0),
+                "action_counts": dict(file_metrics.get("action_counts", {}) or {}),
             }
+            # Persist per-trade JSONL sidecar so downstream tools (Tier 5c analyzer,
+            # KPI dashboards) have an append-only stream of trades per validation file.
+            if detailed_result["trades"]:
+                self._write_trades_jsonl(val_file, detailed_result["trades"], context=context)
         else:
             # Create placeholder if metrics were invalid
             detailed_result = {
@@ -1306,6 +2087,30 @@ class RainbowTrainerModule:
             "detailed_result": detailed_result,  # For saving to JSON
             "episode_score": episode_score,  # Return 0.0 if calculation failed
         }
+
+    def _write_trades_jsonl(self, val_file: Path, trades: list[dict], *, context: str) -> None:
+        """Append per-trade records to ``<model_dir>/trades_<context>.jsonl``.
+
+        The sidecar carries enough information (file name, entry/exit indices,
+        PnL %, MAE, MFE, transaction cost, action provenance) for the offline
+        analyzer (Tier 5c) and any external dashboard to reconstruct the trade
+        timeline without rerunning the agent.
+        """
+        if not trades:
+            return
+        try:
+            sidecar_path = Path(self.model_dir) / f"trades_{context}.jsonl"
+            sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().isoformat(timespec="seconds")
+            with open(sidecar_path, "a", encoding="utf-8") as f:
+                for trade in trades:
+                    record = dict(trade)
+                    record["file"] = val_file.name
+                    record["context"] = context
+                    record["written_at"] = timestamp
+                    f.write(json.dumps(record, default=float) + "\n")
+        except Exception as exc:  # pragma: no cover - persistence is best-effort
+            logger.debug("Failed to write trades JSONL sidecar: %s", exc)
 
     def close_cached_environments(self) -> None:
         """Close any cached validation/test environments."""
@@ -1342,9 +2147,58 @@ class RainbowTrainerModule:
         max_exposures = [m.get("max_exposure_pct", np.nan) for m in all_file_metrics]
         avg_position_values = [m.get("avg_position_value", np.nan) for m in all_file_metrics]
 
+        # Per-action rate aggregation (rate = count/total_steps per file, then mean across files).
+        # See logging plan Tier 1b: parity with Train/Action Rate/{0..5} and Test/Action Rate/{0..5}.
+        num_actions = int(getattr(self.agent, "num_actions", 6))
+        per_file_rates: list[dict[int, float]] = []
+        for m in all_file_metrics:
+            action_counts = m.get("action_counts", {}) or {}
+            steps = float(m.get("total_steps", 0) or 0)
+            if steps <= 0:
+                continue
+            rates: dict[int, float] = {}
+            for a in range(num_actions):
+                count = float(action_counts.get(a, 0) or 0)
+                rates[a] = count / steps
+            per_file_rates.append(rates)
+        action_rates: dict[int, float] = {}
+        if per_file_rates:
+            for a in range(num_actions):
+                action_rates[a] = float(np.mean([r.get(a, 0.0) for r in per_file_rates]))
+
+        # Tier 2b: average each per-trade KPI across files (skipping NaN values
+        # so files with zero trades don't poison the aggregate). Also flatten the
+        # per-trade PnL list for histogram emission.
+        trade_payloads = [
+            m.get("trade_metrics", {}) for m in all_file_metrics if isinstance(m.get("trade_metrics"), dict) and m.get("trade_metrics")
+        ]
+        avg_trade_metrics: dict[str, float] = {}
+        if trade_payloads:
+            keys: set[str] = set()
+            for payload in trade_payloads:
+                keys.update(payload.keys())
+            for key in keys:
+                values = [
+                    float(payload[key])
+                    for payload in trade_payloads
+                    if key in payload
+                    and payload[key] is not None
+                    and isinstance(payload[key], (int, float, np.integer, np.floating))
+                    and np.isfinite(payload[key])
+                ]
+                if values:
+                    avg_trade_metrics[key] = float(np.mean(values))
+        all_trade_pnls: list[float] = []
+        for m in all_file_metrics:
+            for trade in m.get("trades", []) or []:
+                pnl = trade.get("pnl_pct") if isinstance(trade, dict) else None
+                if pnl is not None and np.isfinite(pnl):
+                    all_trade_pnls.append(float(pnl))
+
         return {
             "avg_reward": float(np.nanmean(rewards)),
             "portfolio_value": float(np.nanmean(portfolios)),
+            "final_portfolio_value": float(np.nanmean(portfolios)),
             "total_return": float(np.nanmean(returns)),
             "sharpe_ratio": float(np.nanmean(sharpes)),
             "max_drawdown": float(np.nanmean(drawdowns)),
@@ -1355,6 +2209,9 @@ class RainbowTrainerModule:
             "avg_exposure_pct": float(np.nanmean(avg_exposures)),
             "max_exposure_pct": float(np.nanmean(max_exposures)),
             "avg_position_value": float(np.nanmean(avg_position_values)),
+            "action_rates": action_rates,
+            "trade_metrics": avg_trade_metrics,
+            "trade_pnls": all_trade_pnls,
         }
 
     def _save_validation_results(self, validation_score: float, avg_metrics: dict, detailed_results: list[dict]):
@@ -1616,6 +2473,7 @@ class RainbowTrainerModule:
                 position=info.get("position"),
                 balance=info.get("balance"),
                 price=info.get("price"),
+                was_greedy=info.get("was_greedy"),
             )
             recent_step_rewards.append(reward)
             episode_reward += reward
@@ -1688,6 +2546,20 @@ class RainbowTrainerModule:
             vec_env.envs[i].reset(options={"data_path": path})
         obs, _info = vec_env.reset()
 
+        # Push scheduled benchmark frac into every env at startup so the very
+        # first step uses the resumed/scheduled value, not the constructor
+        # default coming from env_config.
+        initial_benchmark_frac = self.current_benchmark_frac(start_episode)
+        for i in range(num_envs):
+            try:
+                vec_env.envs[i].trading_logic.set_benchmark_allocation_frac(initial_benchmark_frac)
+            except AttributeError:
+                logger.debug(
+                    "Vector env %d exposes no trading_logic.set_benchmark_allocation_frac; skipping.",
+                    i,
+                )
+        self._maybe_emit_benchmark_frac(start_episode, initial_benchmark_frac)
+
         # Per-env tracking
         per_env_episode_reward = np.zeros(num_envs)
         per_env_steps = np.zeros(num_envs, dtype=int)
@@ -1697,6 +2569,11 @@ class RainbowTrainerModule:
             per_env_trackers[i].add_initial_value(initial_info["portfolio_value"])
 
         completed_episodes = start_episode
+        # Track previous count so the validation/checkpoint gates fire even when
+        # multiple envs finish on the same vec_env.step (which can make
+        # ``completed_episodes`` jump by N in one iteration and silently skip a
+        # multiple of validation_freq with the naive ``% == 0`` check).
+        prev_completed_episodes = start_episode
         total_rewards: list[float] = []
         steps_since_last_learn = 0
 
@@ -1708,12 +2585,18 @@ class RainbowTrainerModule:
             if self._abort_training:
                 break
 
-            # Select actions
+            # Select actions (Tier 2c: capture greedy/eps provenance per env)
             if total_train_steps < self.warmup_steps:
                 actions = np.array([vec_env.envs[i].action_space.sample() for i in range(num_envs)])
+                was_greedy_batch = np.zeros(num_envs, dtype=bool)
             else:
                 self.agent.env_steps = total_train_steps - self.warmup_steps
-                actions = self.agent.select_actions_batch(obs)
+                select_batch_with_provenance = getattr(self.agent, "select_actions_batch_with_provenance", None)
+                if callable(select_batch_with_provenance):
+                    actions, was_greedy_batch = select_batch_with_provenance(obs)
+                else:  # backward-compat with stub agents
+                    actions = self.agent.select_actions_batch(obs)
+                    was_greedy_batch = np.ones(num_envs, dtype=bool)
 
             # Step all envs
             next_obs, rewards, terminateds, truncateds, infos = vec_env.step(actions)
@@ -1742,6 +2625,7 @@ class RainbowTrainerModule:
                     position=info_i.get("position"),
                     balance=info_i.get("balance"),
                     price=info_i.get("price"),
+                    was_greedy=bool(was_greedy_batch[i]),
                 )
 
             for a in actions:
@@ -1849,6 +2733,69 @@ class RainbowTrainerModule:
                             for action_idx, count in ep_action_counts.items():
                                 rate = count / max(ep_steps, 1)
                                 self.writer.add_scalar(f"Train/Action Rate/{action_idx}", rate, completed_episodes)
+                            # Tier 2c: greedy/eps split + epsilon-forced trade fraction.
+                            ep_provenance = ep_metrics.get("action_provenance_counts", {}) or {}
+                            ep_greedy = ep_provenance.get("greedy", {}) or {}
+                            ep_eps = ep_provenance.get("eps", {}) or {}
+                            if ep_greedy or ep_eps:
+                                steps_safe = max(ep_steps, 1)
+                                for action_idx in range(int(getattr(self.agent, "num_actions", 6))):
+                                    gr = float(ep_greedy.get(action_idx, 0) or 0) / steps_safe
+                                    er = float(ep_eps.get(action_idx, 0) or 0) / steps_safe
+                                    self.writer.add_scalar(f"Train/Action Rate/Greedy/{action_idx}", gr, completed_episodes)
+                                    self.writer.add_scalar(f"Train/Action Rate/Eps/{action_idx}", er, completed_episodes)
+                            self.writer.add_scalar(
+                                "Train/EpsilonForcedTradeFraction",
+                                float(ep_metrics.get("epsilon_forced_trade_fraction", 0.0) or 0.0),
+                                completed_episodes,
+                            )
+                            # Tier 2c: per-episode Train/Trade/* (HitRate/Expectancy/PctGreedy/...)
+                            try:
+                                vec_trade_metrics = self._trade_metrics_from_tracker(per_env_trackers[i])
+                            except Exception:  # pragma: no cover - defensive
+                                logger.debug("Failed to compute Train/Trade metrics for env %d", i, exc_info=True)
+                                vec_trade_metrics = {}
+                            for key, value in vec_trade_metrics.items():
+                                if not isinstance(value, (int, float, np.floating, np.integer)):
+                                    continue
+                                fv = float(value)
+                                if math.isnan(fv) or math.isinf(fv):
+                                    continue
+                                tag = "".join(part.capitalize() for part in str(key).split("_"))
+                                self.writer.add_scalar(f"Train/Trade/{tag}", fv, completed_episodes)
+                            # Tier 4b: per-episode reward outlier guard (vectorized loop).
+                            try:
+                                vec_outlier_stats = per_env_trackers[i].get_reward_outlier_stats(self.reward_clip_value)
+                            except Exception:  # pragma: no cover - defensive
+                                logger.debug("Failed to compute Tier 4b reward outlier stats for env %d", i, exc_info=True)
+                                vec_outlier_stats = {}
+                            if vec_outlier_stats:
+                                self.writer.add_scalar("Train/Episode/RewardMin", vec_outlier_stats["reward_min"], completed_episodes)
+                                self.writer.add_scalar("Train/Episode/RewardMax", vec_outlier_stats["reward_max"], completed_episodes)
+                                self.writer.add_scalar(
+                                    "Train/Episode/RewardP99Abs",
+                                    vec_outlier_stats["reward_p99_abs"],
+                                    completed_episodes,
+                                )
+                                self.writer.add_scalar(
+                                    "Train/Episode/RewardOutlierFlag",
+                                    vec_outlier_stats["reward_outlier_flag"],
+                                    completed_episodes,
+                                )
+                            # Tier 4c: per-action reward mean/std (vectorized).
+                            try:
+                                vec_by_action = per_env_trackers[i].get_reward_by_action_stats()
+                            except Exception:  # pragma: no cover - defensive
+                                logger.debug(
+                                    "Failed to compute Tier 4c reward-by-action stats for env %d",
+                                    i,
+                                    exc_info=True,
+                                )
+                                vec_by_action = {}
+                            for k in range(int(getattr(self.agent, "num_actions", 6))):
+                                bucket = vec_by_action.get(k, {"mean": 0.0, "std": 0.0})
+                                self.writer.add_scalar(f"Train/Reward/MeanByAction/{k}", float(bucket["mean"]), completed_episodes)
+                                self.writer.add_scalar(f"Train/Reward/StdByAction/{k}", float(bucket["std"]), completed_episodes)
                         self.writer.add_scalar("Train/Epsilon", self.agent.current_epsilon, completed_episodes)
                         self.writer.add_scalar("Train/Final Portfolio Value", ep_metrics.get("portfolio_value", 0), completed_episodes)
 
@@ -1856,8 +2803,34 @@ class RainbowTrainerModule:
                     per_env_steps[i] = 0
                     per_env_trackers[i] = PerformanceTracker()
 
-                # Validation and checkpointing at episode boundaries
-                if completed_episodes % self.validation_freq == 0:
+                # Validation and checkpointing at episode boundaries.
+                # Use a "crossed a multiple of N" gate (rather than ``% == 0``)
+                # so that when several envs finish on the same step and
+                # ``completed_episodes`` jumps over a multiple of
+                # validation_freq / checkpoint_save_freq, we still trigger
+                # exactly one validation/checkpoint event for that boundary.
+                validation_freq_safe = max(1, int(self.validation_freq))
+                checkpoint_freq_safe = max(1, int(self.checkpoint_save_freq))
+                crossed_validation_boundary = (completed_episodes // validation_freq_safe) > (
+                    prev_completed_episodes // validation_freq_safe
+                )
+                crossed_checkpoint_boundary = (completed_episodes // checkpoint_freq_safe) > (
+                    prev_completed_episodes // checkpoint_freq_safe
+                )
+                # One-time visibility scalar: would the legacy ``% == 0`` check
+                # have skipped this boundary? Useful while operators get used to
+                # the new behaviour.
+                if crossed_validation_boundary and (completed_episodes % validation_freq_safe != 0) and self.writer is not None:
+                    try:
+                        self.writer.add_scalar(
+                            "Train/Diagnostics/ValidationSkippedDueToVectorJump",
+                            1.0,
+                            completed_episodes,
+                        )
+                    except Exception:  # pragma: no cover - defensive
+                        logger.debug("Failed to emit Train/Diagnostics/ValidationSkippedDueToVectorJump", exc_info=True)
+
+                if crossed_validation_boundary:
                     last_tracker = per_env_trackers[done_indices[-1]]
                     should_stop = self._handle_validation_and_checkpointing(
                         completed_episodes - 1, total_train_steps, val_files, last_tracker
@@ -1865,7 +2838,7 @@ class RainbowTrainerModule:
                     if should_stop:
                         logger.info("Early stopping condition met. Exiting vectorized training loop.")
                         break
-                elif completed_episodes % self.checkpoint_save_freq == 0:
+                elif crossed_checkpoint_boundary:
                     self._save_checkpoint(
                         completed_episodes - 1,
                         total_train_steps,
@@ -1873,9 +2846,26 @@ class RainbowTrainerModule:
                         validation_score=None,
                     )
 
+                prev_completed_episodes = completed_episodes
+
                 # Reset done envs with new data
                 curriculum_frac = min(1.0, 0.3 + 0.7 * (completed_episodes / max(num_episodes, 1)))
                 next_obs = reset_done_envs(vec_env, dones, self.data_manager, curriculum_frac)
+
+                # Push scheduled benchmark frac into the freshly-reset envs.
+                # Anchored on ``completed_episodes`` so the schedule advances
+                # smoothly across the run regardless of how many envs finish
+                # together on a single vec_env.step.
+                fresh_benchmark_frac = self.current_benchmark_frac(completed_episodes)
+                for i in done_indices:
+                    try:
+                        vec_env.envs[i].trading_logic.set_benchmark_allocation_frac(fresh_benchmark_frac)
+                    except AttributeError:
+                        logger.debug(
+                            "Vector env %d exposes no trading_logic.set_benchmark_allocation_frac; skipping.",
+                            i,
+                        )
+                self._maybe_emit_benchmark_frac(completed_episodes, fresh_benchmark_frac)
 
                 for i in done_indices:
                     init_info = vec_env.envs[i]._get_info()
@@ -1926,6 +2916,8 @@ class RainbowTrainerModule:
         val_files = self.data_manager.get_validation_files()
         if not val_files:
             logger.warning("No validation files found. Training will proceed without validation.")
+
+        self._validate_validation_cadence_config(num_episodes=num_episodes, has_val_files=bool(val_files))
 
         # Dispatch to vectorized loop when num_vector_envs > 1
         if self.num_vector_envs > 1 and specific_file is None:

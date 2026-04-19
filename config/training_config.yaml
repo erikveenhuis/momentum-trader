@@ -77,7 +77,7 @@ environment:
   drawdown_penalty_lambda: 0.3   # Midpoint: 0.5 caused death spirals, 0.15 caused action collapse to 100% exposure
   slippage_bps: 5.0
   opportunity_cost_lambda: 0.0   # Disabled; subsumed by benchmark-relative reward
-  benchmark_allocation_frac: 0.5  # Reward = excess return over this fixed allocation; prevents action collapse
+  benchmark_allocation_frac: 0.5  # Default for live trader / random agent / single-shot eval; trainer overrides per-episode via the schedule below
   min_rebalance_pct: 0.02      # Minimum allocation delta to trigger a trade (2% of portfolio)
   min_trade_value: 1.0         # Minimum trade notional in USD (Alpaca crypto minimum)
 
@@ -94,6 +94,21 @@ trainer:
   per_stats_log_freq: 300
   validation_freq: 200      # Less frequent validation; avoids judging a still-learning policy too often
   checkpoint_save_freq: 50
+  # Disk hygiene: cap how many `checkpoint_trainer_latest_*` files are kept
+  # on disk after each save. Each checkpoint is ~9 GB (PER buffer dominates),
+  # so an unbounded 50k-episode run @ checkpoint_save_freq=50 would need
+  # ~9 TB. With keep_last_n=10 the periodic-checkpoint footprint stays
+  # bounded at ~90 GB — comfortable on a 500 GB partition while still
+  # giving `recover_from_collapse.py --from-episode N` a useful rollback
+  # window of the last ~10 saves (~500 episodes at default save_freq).
+  # Notes:
+  #   - 0 disables rotation (keep every save). Use only when disk is unlimited.
+  #   - `best_*.pt` files and `recover` script outputs at older episodes are
+  #     never auto-rotated; only the periodic `latest_*` stream is.
+  #   - The most recent N (sorted by episode number in the filename) survive.
+  #   - Safe to change between `--resume` runs; the new value takes effect on
+  #     the next periodic save.
+  latest_checkpoint_keep_last_n: 10
   reward_window: 20
   reward_clip: 0.5          # Clip to match C51 support [-1, 1]; per-step rewards are O(1e-4) to O(1e-3)
   min_episodes_before_early_stopping: 5000  # Defer best-tracking and early stopping until meaningful training
@@ -101,6 +116,20 @@ trainer:
   final_phase_lr_start_frac: 0.85  # Later start since cosine already decays smoothly
   final_phase_lr_multiplier: 0.3
   min_validation_threshold: 0.001
+
+  # Benchmark allocation frac schedule (linear anneal from start -> end across
+  # the first N episodes; anchored on absolute episode index so --resume keeps
+  # the schedule going). Reward = (market+trade)_return - frac * price_return,
+  # so a high frac forces the agent to clear that fraction of the bar's drift
+  # to be reward-neutral. Useful early as anti-collapse pressure; once the
+  # agent has demonstrated non-flat action diversity it becomes structural
+  # long bias, which fights the sniper objective.
+  # Anneal length is aligned with min_episodes_before_early_stopping so the
+  # benchmark reaches its low-pressure end value just as best-checkpoint
+  # selection becomes active.
+  benchmark_allocation_frac_start: 0.5
+  benchmark_allocation_frac_end: 0.10
+  benchmark_allocation_frac_anneal_episodes: 5000
 
 # --- Run Configuration --- #
 run:

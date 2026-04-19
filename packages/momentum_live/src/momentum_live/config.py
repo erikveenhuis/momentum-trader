@@ -57,6 +57,7 @@ class LiveTradingConfig:
     min_trade_value: float
     models_dir: str
     checkpoint_pattern: str
+    tb_log_dir: str | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.symbols, Iterable) and not isinstance(self.symbols, str):

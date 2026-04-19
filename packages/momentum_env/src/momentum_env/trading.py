@@ -42,6 +42,15 @@ class TradingLogic:
         self.peak_portfolio_value: float = 0.0
         self._prev_drawdown: float = 0.0
 
+    def set_benchmark_allocation_frac(self, value: float) -> None:
+        """Update the benchmark allocation fraction at runtime.
+
+        Used by the trainer to push a scheduled (annealed) value into the
+        env at the start of each episode without rebuilding the env. The
+        change takes effect on the next ``calculate_reward`` call.
+        """
+        self.benchmark_allocation_frac = float(value)
+
     def handle_buy(
         self,
         portfolio_state: PortfolioState,

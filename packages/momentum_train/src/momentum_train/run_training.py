@@ -84,11 +84,138 @@ def configure_logging(cli_log_level: str | None = None, config: dict[str, Any] |
     )
 
 
-def evaluate_on_test_data(agent: RainbowDQNAgent, trainer: RainbowTrainerModule, config: dict) -> None:
-    """Run evaluation across the test split and log aggregate results."""
+def _safe_add_scalar(writer: SummaryWriter, tag: str, value: Any, step: int) -> None:
+    """Write a scalar only when finite — TB rejects NaN/Inf and litters warnings otherwise."""
+    if value is None:
+        return
+    try:
+        scalar_value = float(value)
+    except (TypeError, ValueError):
+        return
+    if not np.isfinite(scalar_value):
+        return
+    writer.add_scalar(tag, scalar_value, step)
+
+
+def _emit_action_rates(
+    writer: SummaryWriter,
+    tag_prefix: str,
+    detailed_results: list[dict],
+    step: int,
+) -> None:
+    """Average per-action rates across files and emit one scalar per action index."""
+    if not detailed_results:
+        return
+    aggregate: dict[int, list[float]] = {}
+    for item in detailed_results:
+        action_rates = item.get("action_rates") if isinstance(item, dict) else None
+        if not action_rates:
+            counts = item.get("action_counts") if isinstance(item, dict) else None
+            steps_count = item.get("steps") if isinstance(item, dict) else None
+            if not counts or not steps_count:
+                continue
+            try:
+                steps_total = int(steps_count)
+            except (TypeError, ValueError):
+                continue
+            if steps_total <= 0:
+                continue
+            action_rates = {k: int(v) / steps_total for k, v in counts.items()}
+        for k, v in action_rates.items():
+            try:
+                k_int = int(k)
+                v_float = float(v)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(v_float):
+                continue
+            aggregate.setdefault(k_int, []).append(v_float)
+    for k_int, values in sorted(aggregate.items()):
+        if not values:
+            continue
+        _safe_add_scalar(writer, f"{tag_prefix}/{k_int}", float(np.mean(values)), step)
+
+
+def _emit_trade_metrics(
+    writer: SummaryWriter,
+    tag_prefix: str,
+    detailed_results: list[dict],
+    step: int,
+) -> None:
+    """Aggregate per-file trade KPIs into a single scalar per metric (mean across files)."""
+    if not detailed_results:
+        return
+    trade_payloads = [
+        item.get("trade_metrics") for item in detailed_results if isinstance(item, dict) and isinstance(item.get("trade_metrics"), dict)
+    ]
+    if not trade_payloads:
+        return
+    keys = set()
+    for payload in trade_payloads:
+        keys.update(payload.keys())
+    for key in sorted(keys):
+        values = [
+            float(payload[key]) for payload in trade_payloads if key in payload and payload[key] is not None and np.isfinite(payload[key])
+        ]
+        if not values:
+            continue
+        _safe_add_scalar(writer, f"{tag_prefix}/{key}", float(np.mean(values)), step)
+
+    # Tier 2b: aggregate per-trade PnL across all files into a histogram so the
+    # full sniper-PnL distribution (not just its mean) is visible in TB.
+    trade_pnls: list[float] = []
+    for item in detailed_results:
+        if not isinstance(item, dict):
+            continue
+        for trade in item.get("trades", []) or []:
+            pnl = trade.get("pnl_pct") if isinstance(trade, dict) else None
+            try:
+                pnl_f = float(pnl) if pnl is not None else None
+            except (TypeError, ValueError):
+                continue
+            if pnl_f is None or not np.isfinite(pnl_f):
+                continue
+            trade_pnls.append(pnl_f)
+    if trade_pnls:
+        try:
+            writer.add_histogram(
+                f"{tag_prefix}/PnLDistribution",
+                np.asarray(trade_pnls, dtype=np.float32),
+                step,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Failed to emit %s/PnLDistribution histogram: %s", tag_prefix, exc)
+
+
+def evaluate_on_test_data(
+    agent: RainbowDQNAgent,
+    trainer: RainbowTrainerModule,
+    config: dict,
+    *,
+    writer: SummaryWriter | None = None,
+    tb_step: int | None = None,
+) -> None:
+    """Run evaluation across the test split and log aggregate results.
+
+    If ``writer`` is provided (or ``trainer.writer`` is set), per-test scalars are also
+    mirrored to TensorBoard under ``Test/*`` and ``Test/Trade/*`` so the test pass is
+    visible alongside training/validation curves. ``tb_step`` controls the x-axis: it
+    defaults to ``trainer.agent.total_steps`` so the test scalar lines up with the last
+    training step in the same run.
+    """
     if not hasattr(trainer, "data_manager"):
         logger.error("Trainer does not expose a data_manager; cannot evaluate on test data.")
         return
+
+    if writer is None:
+        writer = getattr(trainer, "writer", None)
+    if tb_step is None:
+        agent_for_step = getattr(trainer, "agent", None) or agent
+        tb_step_raw = getattr(agent_for_step, "total_steps", 0) if agent_for_step is not None else 0
+        try:
+            tb_step = int(tb_step_raw or 0)
+        except (TypeError, ValueError):
+            tb_step = 0
 
     try:
         test_files = trainer.data_manager.get_test_files()
@@ -146,6 +273,35 @@ def evaluate_on_test_data(agent: RainbowDQNAgent, trainer: RainbowTrainerModule,
         logger.info(f"Average Transaction Costs: ${avg_metrics['transaction_costs']:.2f}")
         logger.info("============================================")
 
+        # Mirror aggregate test results to TensorBoard (Tier 1a).
+        # Portfolio-level scalars are namespaced under Test/Portfolio/* per the KPI
+        # hierarchy in the comprehensive logging plan: they're informational, not the
+        # sniper-edge optimisation target.
+        if writer is not None:
+            try:
+                _safe_add_scalar(writer, "Test/Score", average_score, tb_step)
+                _safe_add_scalar(writer, "Test/Avg Reward", avg_metrics.get("avg_reward"), tb_step)
+                _safe_add_scalar(writer, "Test/Avg Portfolio", avg_metrics.get("portfolio_value"), tb_step)
+                _safe_add_scalar(writer, "Test/Transaction Costs", avg_metrics.get("transaction_costs"), tb_step)
+                _safe_add_scalar(writer, "Test/Avg Position", avg_metrics.get("avg_position"), tb_step)
+                _safe_add_scalar(writer, "Test/Avg Abs Position", avg_metrics.get("avg_abs_position"), tb_step)
+                _safe_add_scalar(writer, "Test/Avg Exposure Pct", avg_metrics.get("avg_exposure_pct"), tb_step)
+                _safe_add_scalar(writer, "Test/Max Exposure Pct", avg_metrics.get("max_exposure_pct"), tb_step)
+
+                _safe_add_scalar(writer, "Test/Portfolio/Total Return Pct", avg_metrics.get("total_return"), tb_step)
+                _safe_add_scalar(writer, "Test/Portfolio/Sharpe Ratio", avg_metrics.get("sharpe_ratio"), tb_step)
+                max_dd = avg_metrics.get("max_drawdown")
+                if max_dd is not None and np.isfinite(max_dd):
+                    _safe_add_scalar(writer, "Test/Portfolio/Max Drawdown Pct", float(max_dd) * 100.0, tb_step)
+
+                # Per-action rates aggregated across test files.
+                _emit_action_rates(writer, "Test/Action Rate", detailed_results, tb_step)
+
+                # Per-trade aggregates (Tier 2b) when the evaluation populated trade KPIs.
+                _emit_trade_metrics(writer, "Test/Trade", detailed_results, tb_step)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(f"Failed to mirror test results to TensorBoard: {exc}")
+
         # Persist detailed test results alongside validation outputs
         model_dir = Path(config.get("run", {}).get("model_dir", "models"))
         model_dir.mkdir(parents=True, exist_ok=True)
@@ -176,6 +332,9 @@ def run_training(
     data_manager: DataManager,
     resume_training_flag: bool,
     reset_lr_on_resume: bool = False,
+    reset_noisy_on_resume: bool = False,
+    noisy_sigma_init: float | None = None,
+    benchmark_frac_override: float | None = None,
 ):
     """Runs the training loop for the Rainbow DQN agent."""
     # Extract relevant config sections directly (will raise KeyError if missing)
@@ -189,6 +348,13 @@ def run_training(
     # resume_training = run_config.get('resume', False) # Resume status now comes from flag
     num_episodes = run_config.get("episodes", 1000)  # Allow default
     specific_file = run_config.get("specific_file", None)  # Allow default (None)
+
+    if benchmark_frac_override is not None:
+        config.setdefault("run", {})["benchmark_frac_override"] = float(benchmark_frac_override)
+        logger.info(
+            "--benchmark-frac-override active: pinning benchmark_allocation_frac=%.4f for the entire run.",
+            float(benchmark_frac_override),
+        )
 
     set_seeds(trainer_config["seed"])
     # Update config dict to reflect actual resume status from flag for logging
@@ -308,6 +474,18 @@ def run_training(
                             )
                             agent.total_steps = trainer_steps_from_checkpoint
                         logger.info(f"Agent state loaded successfully. Resuming from Trainer Step: {start_total_steps}")
+
+                        if reset_noisy_on_resume:
+                            try:
+                                reset_count = agent.reset_noisy_sigma(std_init=noisy_sigma_init)
+                                logger.info(
+                                    "Reset NoisyNet sigma on resume: %d online + %d target layer(s) refilled (std_init=%s).",
+                                    reset_count,
+                                    reset_count,
+                                    "per-layer" if noisy_sigma_init is None else f"{float(noisy_sigma_init):.4f}",
+                                )
+                            except Exception as exc:
+                                logger.error("Failed to reset NoisyNet sigma on resume: %s", exc, exc_info=True)
                     else:
                         # Agent state loading failed, reset trainer progress
                         logger.error(
@@ -433,10 +611,11 @@ def run_training(
     except Exception:
         logger.debug("Error closing initial environment (may already be closed)", exc_info=True)
 
-    # --- Close TensorBoard Writer ---
-    writer.close()
-    logger.info("TensorBoard writer closed.")
-    # -----------------------------
+    # NOTE: the TensorBoard writer is intentionally NOT closed here. It is owned by
+    # the trainer (``trainer.writer``) and remains open so post-training evaluation
+    # (e.g. ``evaluate_on_test_data``) can mirror Test/* scalars under the same
+    # event file. ``main()`` is responsible for closing the writer once evaluation
+    # has completed.
 
     return agent, trainer
 
@@ -464,15 +643,49 @@ def main():  # Remove default config_path
         help="When resuming, discard optimizer/scheduler states so learning rate resets to config value.",
     )
     parser.add_argument(
+        "--reset-noisy-on-resume",
+        action="store_true",
+        help=(
+            "When resuming, refill NoisyLinear sigma parameters to re-energise exploration. "
+            "Mu (the deterministic part) is left untouched so the policy keeps what it learned."
+        ),
+    )
+    parser.add_argument(
+        "--noisy-sigma-init",
+        type=float,
+        default=None,
+        help=("Override the std_init scalar used by --reset-noisy-on-resume. Defaults to each layer's constructor value (typically 0.5)."),
+    )
+    parser.add_argument(
+        "--benchmark-frac-override",
+        type=float,
+        default=None,
+        help=("Pin benchmark_allocation_frac to this constant for the entire run, ignoring any scheduled anneal in trainer config."),
+    )
+    parser.add_argument(
         "--log-level",
         default=None,
         help="Logging level (e.g. DEBUG, INFO, WARNING). Overrides MOMENTUM_LOG_LEVEL* environment variables.",
+    )
+    # Tier 2d: by default validation/test runs in deterministic ``agent.greedy()``
+    # mode. ``--eval-stochastic`` opts back into the pre-Tier-2d behaviour where
+    # epsilon-greedy and NoisyNet noise are still active during evaluation; this
+    # is useful to measure the gap between the policy actually being trained and
+    # its greedy projection (Train/EvalGap/* in TensorBoard).
+    parser.add_argument(
+        "--eval-stochastic",
+        action="store_true",
+        help="Run validation/test in stochastic (training) mode instead of agent.greedy().",
     )
     args = parser.parse_args()
     config_path = args.config_path
     # Use the command-line flag directly for resuming
     resume_training_flag = args.resume
     reset_lr_on_resume = args.reset_lr_on_resume
+    reset_noisy_on_resume = args.reset_noisy_on_resume
+    noisy_sigma_init = args.noisy_sigma_init
+    benchmark_frac_override = args.benchmark_frac_override
+    eval_stochastic_flag = args.eval_stochastic
     configure_logging(args.log_level)
 
     logger.info("Starting Rainbow DQN training script...")
@@ -516,6 +729,12 @@ def main():  # Remove default config_path
     skip_evaluation = run_config.get("skip_evaluation", False)  # Default to False is reasonable
     data_base_dir = run_config.get("data_base_dir", "data")  # Default base dir is reasonable
 
+    # Tier 2d: surface --eval-stochastic into the config so the trainer reads it
+    # off ``run.eval_stochastic`` like every other run-level toggle.
+    config.setdefault("run", {})["eval_stochastic"] = eval_stochastic_flag
+    if eval_stochastic_flag:
+        logger.info("--eval-stochastic enabled: validation/test will run with epsilon-greedy + NoisyNet noise active.")
+
     # --- Initialize DataManager ---
     # Pass base_dir from config. Processed dir name defaults to 'processed' unless specified.
     data_manager = DataManager(base_dir=data_base_dir)
@@ -531,20 +750,32 @@ def main():  # Remove default config_path
             data_manager,
             resume_training_flag,
             reset_lr_on_resume=reset_lr_on_resume,
+            reset_noisy_on_resume=reset_noisy_on_resume,
+            noisy_sigma_init=noisy_sigma_init,
+            benchmark_frac_override=benchmark_frac_override,
         )
         assert isinstance(trained_agent, RainbowDQNAgent), "run_training did not return a valid agent"
         assert isinstance(trained_trainer, RainbowTrainerModule), "run_training did not return a valid trainer"
 
         if not skip_evaluation:  # Check the flag before running evaluation
             logger.info("--- Starting Evaluation on Test Data after Training (Rainbow) ---")
-            # Pass necessary config parts to evaluation function
+            # Pass necessary config parts to evaluation function. The trainer's writer
+            # is reused so Test/* TB scalars line up with Train/* / Validation/* views.
             evaluate_on_test_data(
                 agent=trained_agent,
-                trainer=trained_trainer,  # Trainer might hold metrics or env creation logic
-                config=config,  # Pass full config for evaluation needs
+                trainer=trained_trainer,
+                config=config,
             )
         else:
             logger.info("--- Skipping Evaluation on Test Data as per configuration (skip_evaluation=True) ---")
+
+        train_writer = getattr(trained_trainer, "writer", None)
+        if train_writer is not None:
+            try:
+                train_writer.close()
+                logger.info("TensorBoard writer closed.")
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("Failed to close TensorBoard writer", exc_info=True)
 
     elif mode == "eval":
         logger.info("--- Starting Evaluation Mode (Rainbow) --- ")

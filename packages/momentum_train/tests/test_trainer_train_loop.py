@@ -88,7 +88,7 @@ def test_trainer_runs_episodes_and_logs_progress(tmp_path):
             "gradient_updates_per_step": 1,
             "log_freq": 10,
             "per_stats_log_freq": 0,
-            "validation_freq": 100,
+            "validation_freq": 3,
             "checkpoint_save_freq": 100,
             "reward_window": 5,
             "reward_clip": 5.0,
@@ -133,4 +133,8 @@ def test_trainer_runs_episodes_and_logs_progress(tmp_path):
     for line in lines:
         record = json.loads(line)
         assert "event" in record
-        assert "episode" in record
+        # Episode-end records have ``episode``; validation records (now firing
+        # because validation_freq is no longer larger than num_episodes thanks
+        # to the new cadence guard) do not. Either is acceptable.
+        if record["event"] != "validation":
+            assert "episode" in record

@@ -83,21 +83,27 @@ def calculate_episode_score(metrics: dict[str, float]) -> float:
     assert abs(sum(weights.values()) - 1.0) < 1e-6, "Weights must sum to 1"
 
     score = 0.0
-    sharpe = metrics.get("sharpe_ratio", 0.0)
+    # Cast to Python float (float64) so downstream `np.exp` doesn't overflow
+    # when the upstream env / PerformanceTracker returned `np.float32` values.
+    # Without this, a moderately negative Sharpe (e.g. -10) silently produces
+    # a `RuntimeWarning: overflow encountered in exp` because float32's exp
+    # saturates above ~exp(88.7).
+    sharpe = float(metrics.get("sharpe_ratio", 0.0))
     # Convert total_return from percentage to decimal
-    total_return_pct = metrics.get("total_return", 0.0) / 100.0
+    total_return_pct = float(metrics.get("total_return", 0.0)) / 100.0
     # Default max_drawdown to 1.0 (worst case) if not provided
-    max_drawdown = metrics.get("max_drawdown", 1.0)
+    max_drawdown = float(metrics.get("max_drawdown", 1.0))
 
     # --- Normalization using Sigmoid: 1 / (1 + exp(-x)) ---
     # Introduce scaling factors for Sharpe and Total Return to increase sensitivity
     k_sharpe = 10.0  # Scaling factor for Sharpe Ratio
     k_return = 30.0  # Scaling factor for Total Return
 
-    # Clip values to prevent overflow in exp() function
-    # For numerical stability, limit the argument to exp() to reasonable bounds
-    # exp(-700) ≈ 0 (underflow), exp(700) ≈ inf (overflow)
-    max_exp_arg = 700.0
+    # Clip values to prevent overflow in exp(). 80 is the joint-safe ceiling:
+    # float32's exp saturates above ~exp(88.7) and float64's above ~exp(709.7),
+    # but the sigmoid is already < 1e-34 (or > 1 - 1e-34) past ±80, so
+    # clamping there is mathematically indistinguishable from the asymptote.
+    max_exp_arg = 80.0
 
     sharpe_arg = np.clip(-k_sharpe * sharpe, -max_exp_arg, max_exp_arg)
     return_arg = np.clip(-k_return * total_return_pct, -max_exp_arg, max_exp_arg)
@@ -148,6 +154,10 @@ class PerformanceTracker:
         self.balances = []
         self.position_values = []
         self.exposures = []
+        # Tier 2c: per-step greedy/eps provenance flag (parallel to ``actions``).
+        # None means "unknown" (e.g. legacy callers that don't track provenance);
+        # provenance-aware aggregations skip those entries.
+        self.was_greedy: list[bool | None] = []
 
     def update(
         self,
@@ -159,6 +169,7 @@ class PerformanceTracker:
         position: float | None = None,
         balance: float | None = None,
         price: float | None = None,
+        was_greedy: bool | None = None,
     ):
         """Update tracker with new values."""
         assert isinstance(portfolio_value, (float, np.float32, np.float64)) and portfolio_value >= 0, "Invalid portfolio value"
@@ -171,6 +182,7 @@ class PerformanceTracker:
         self.actions.append(action)
         self.rewards.append(reward)
         self.transaction_costs.append(transaction_cost)
+        self.was_greedy.append(None if was_greedy is None else bool(was_greedy))
 
         if position is not None:
             position_float = float(position)
@@ -202,6 +214,91 @@ class PerformanceTracker:
                 logger.warning(f"Encountered invalid action index {action} in tracker.")
         return counts
 
+    def get_action_provenance_counts(self) -> dict[str, dict[int, int]]:
+        """Per-action greedy/eps split (Tier 2c).
+
+        Returns a mapping ``{"greedy": {0: n0, ...}, "eps": {0: n0, ...},
+        "unknown": {...}}``. ``unknown`` captures steps where provenance was
+        not tracked (e.g. legacy callers); aggregators should ignore it.
+        """
+        num_actions = 6
+        greedy = {i: 0 for i in range(num_actions)}
+        eps = {i: 0 for i in range(num_actions)}
+        unknown = {i: 0 for i in range(num_actions)}
+        if len(self.was_greedy) != len(self.actions):
+            logger.warning("Provenance length mismatch: actions=%d was_greedy=%d", len(self.actions), len(self.was_greedy))
+        for action, flag in zip(self.actions, self.was_greedy):
+            a = int(action)
+            if not (0 <= a < num_actions):
+                continue
+            if flag is True:
+                greedy[a] += 1
+            elif flag is False:
+                eps[a] += 1
+            else:
+                unknown[a] += 1
+        return {"greedy": greedy, "eps": eps, "unknown": unknown}
+
+    def get_epsilon_forced_trade_fraction(self) -> float:
+        """Fraction of *non-flat* actions (any of 1..5) that were epsilon-forced.
+
+        Tier 2c. Returns 0.0 when there are no non-flat actions with known
+        provenance, so it is safe to log unconditionally.
+        """
+        prov = self.get_action_provenance_counts()
+        non_flat_eps = sum(v for k, v in prov["eps"].items() if k != 0)
+        non_flat_greedy = sum(v for k, v in prov["greedy"].items() if k != 0)
+        denom = non_flat_eps + non_flat_greedy
+        if denom <= 0:
+            return 0.0
+        return non_flat_eps / denom
+
+    def get_reward_outlier_stats(self, reward_clip: float | None = None) -> dict[str, float]:
+        """Per-episode reward outlier diagnostics (Tier 4b).
+
+        Returns min, max, p99 of |reward|, and a flag (0/1) indicating any
+        reward exceeded ``5 * reward_clip``. ``reward_clip = None`` disables
+        the flag (returns 0) — the min/max/p99 are still useful on their own.
+        Empty rewards collapse to all zeros so callers can log unconditionally.
+        """
+        if not self.rewards:
+            return {"reward_min": 0.0, "reward_max": 0.0, "reward_p99_abs": 0.0, "reward_outlier_flag": 0.0}
+        arr = np.asarray(self.rewards, dtype=np.float64)
+        abs_arr = np.abs(arr)
+        flag = 0.0
+        if reward_clip is not None and reward_clip > 0:
+            flag = 1.0 if float(abs_arr.max()) > 5.0 * float(reward_clip) else 0.0
+        return {
+            "reward_min": float(arr.min()),
+            "reward_max": float(arr.max()),
+            "reward_p99_abs": float(np.percentile(abs_arr, 99)),
+            "reward_outlier_flag": flag,
+        }
+
+    def get_reward_by_action_stats(self) -> dict[int, dict[str, float]]:
+        """Per-action reward mean + std for the episode (Tier 4c).
+
+        Returns ``{action_idx: {"mean": ..., "std": ...}}`` for every action
+        with at least one observation. Diagnostic for "is the agent learning
+        which action *actually* pays?"; without it, action-0 (hold)
+        dominates avg_reward via sheer count and washes out the per-trade
+        signal where it matters most.
+        """
+        if not self.actions or not self.rewards or len(self.actions) != len(self.rewards):
+            return {}
+        actions_arr = np.asarray(self.actions, dtype=np.int64)
+        rewards_arr = np.asarray(self.rewards, dtype=np.float64)
+        out: dict[int, dict[str, float]] = {}
+        for a in np.unique(actions_arr):
+            mask = actions_arr == a
+            sample = rewards_arr[mask]
+            out[int(a)] = {
+                "mean": float(sample.mean()),
+                "std": float(sample.std(ddof=0)) if sample.size > 1 else 0.0,
+                "count": float(sample.size),
+            }
+        return out
+
     def get_metrics(self) -> dict[str, float]:
         """Calculate all metrics from current data."""
         if not self.portfolio_values:
@@ -220,6 +317,9 @@ class PerformanceTracker:
             "transaction_costs": sum(self.transaction_costs) if self.transaction_costs else 0.0,
             "avg_reward": np.mean(self.rewards) if self.rewards else 0.0,
             "action_counts": self.get_action_counts(),
+            # Tier 2c: per-action greedy/eps counts and a non-flat-eps fraction.
+            "action_provenance_counts": self.get_action_provenance_counts(),
+            "epsilon_forced_trade_fraction": float(self.get_epsilon_forced_trade_fraction()),
         }
         if self.positions:
             metrics["avg_position"] = float(np.mean(self.positions))

@@ -3,7 +3,18 @@ split_output_base_dir: data/processed # Output train/val/test subdirs here
 train_subdir: train
 val_subdir: validation
 test_subdir: test
-test_months: 6  # Hold out the most recent 3 months for evaluation
-validation_months: 1  # Use the 3 months preceding the test window for validation
+# Test = the most recent N months, held out as a never-trained, never-selected
+# generalisation check. Validation = the M months immediately before that,
+# used every `validation_freq` episodes for best-checkpoint selection and
+# early-stopping. Train = everything older.
+#
+# Sizing rationale (see README "Recovering from a collapsed run" runbook):
+# - val ~ 4 months keeps per-cycle scores low-variance (~1k files) and spans
+#   multiple crypto regimes, so checkpoint selection isn't dominated by
+#   single-day outliers.
+# - test ~ 3 months is still multi-regime and roughly balances val/test
+#   sample sizes without eating too much into the most recent data.
+test_months: 3        # most recent 3 months held out for final evaluation
+validation_months: 4  # 4 months immediately preceding the test window
 seed: 42
 clear_output: true # Clears train/val/test subdirs before copying

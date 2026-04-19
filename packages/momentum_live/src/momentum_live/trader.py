@@ -2,21 +2,32 @@
 
 from __future__ import annotations
 
+import json
 import time
 from collections import deque
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
 from momentum_agent import RainbowDQNAgent
 from momentum_core.logging import get_logger
+from momentum_core.trade_metrics import (
+    StepRecord,
+    aggregate_trade_metrics,
+    segment_trades,
+)
 from momentum_env.data import N_RAW_FEATURES
 from momentum_env.trading import PortfolioState, TradingLogic
 
 from .config import LiveTradingConfig
+
+if TYPE_CHECKING:  # pragma: no cover
+    from torch.utils.tensorboard import SummaryWriter
 
 LOGGER = get_logger("momentum_live.trader")
 
@@ -124,6 +135,9 @@ class SymbolState:
     portfolio_state: PortfolioState
     prev_portfolio_value: float
     last_price: float = 0.0
+    step_count: int = 0
+    step_records: list[StepRecord] = field(default_factory=list)
+    closed_trade_count: int = 0
 
     def observation(self, shared_balance: float) -> dict[str, np.ndarray]:
         account_state = self._account_state(shared_balance)
@@ -177,9 +191,26 @@ class MomentumLiveTrader:
         5: 1.0,
     }
 
-    def __init__(self, agent: RainbowDQNAgent, config: LiveTradingConfig):
+    def __init__(
+        self,
+        agent: RainbowDQNAgent,
+        config: LiveTradingConfig,
+        writer: SummaryWriter | None = None,
+    ):
         self.agent = agent
         self.config = config
+        self.writer = writer if writer is not None else self._maybe_build_writer(config.tb_log_dir)
+        self._global_step: int = 0
+        self._action_counts = np.zeros(int(getattr(agent, "num_actions", 6)), dtype=np.int64)
+        self._trades_jsonl_path: Path | None = None
+        if self.writer is not None and config.tb_log_dir:
+            self._trades_jsonl_path = Path(config.tb_log_dir) / "live_trades.jsonl"
+            self._trades_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+            LOGGER.info(
+                "Live TensorBoard logging enabled | log_dir=%s | trades_jsonl=%s",
+                config.tb_log_dir,
+                self._trades_jsonl_path,
+            )
         self.trading_logic = TradingLogic(
             transaction_fee=config.transaction_fee,
             reward_scale=config.reward_scale,
@@ -287,8 +318,15 @@ class MomentumLiveTrader:
             symbol_state.normalizer.count,
         )
 
-        action_index = self.agent.select_action(observation)
+        select_with_provenance = getattr(self.agent, "select_action_with_provenance", None)
+        if callable(select_with_provenance):
+            action_index, was_greedy = select_with_provenance(observation)
+        else:
+            action_index = self.agent.select_action(observation)
+            was_greedy = True
         target_frac = self.TARGET_ALLOCATIONS[action_index]
+        live_q_values = getattr(self.agent, "_last_select_q_values", None)
+        self._emit_action_and_q_scalars(bar.symbol, action_index, live_q_values)
 
         current_price = float(bar.close)
 
@@ -379,6 +417,10 @@ class MomentumLiveTrader:
         post_shared_balance = self.shared_balance
         post_position = symbol_state.portfolio_state.position
         post_portfolio_value = self.shared_portfolio_value
+
+        self._emit_step_state(symbol_state, action_index, was_greedy)
+        self._maybe_emit_trade_close(symbol_state, pre_position)
+        self._global_step += 1
 
         order_result = None
         decision = {
@@ -859,6 +901,133 @@ class MomentumLiveTrader:
             raise ValueError(f"Received unsupported action index {action_index}")
         target = self.TARGET_ALLOCATIONS[action_index]
         return f"target_{int(target * 100)}pct", target
+
+    # ------------------------------------------------------------------
+    # Tier 6 — TensorBoard parity for live trading
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _maybe_build_writer(tb_log_dir: str | None) -> SummaryWriter | None:
+        """Construct a ``SummaryWriter`` lazily so the import stays optional."""
+        if not tb_log_dir:
+            return None
+        try:  # pragma: no cover - import-time path varies by env
+            from torch.utils.tensorboard import SummaryWriter
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning("Could not import SummaryWriter (%s); live TB disabled", exc)
+            return None
+        return SummaryWriter(log_dir=tb_log_dir)
+
+    def _emit_action_and_q_scalars(
+        self,
+        symbol: str,
+        action_index: int,
+        q_values: np.ndarray | None,
+    ) -> None:
+        """Emit per-bar ``Live/Action Rate/k`` and ``Live/Q/*`` scalars.
+
+        Action rates are cumulative running fractions across all symbols; this
+        mirrors how ``Train/Action Rate/*`` is reported per-episode but uses a
+        cumulative window because the live runner has no episode boundary.
+        """
+        if self.writer is None:
+            return
+        step = self._global_step
+        if 0 <= action_index < self._action_counts.size:
+            self._action_counts[action_index] += 1
+        total = max(int(self._action_counts.sum()), 1)
+        for k in range(self._action_counts.size):
+            self.writer.add_scalar(
+                f"Live/Action Rate/{k}",
+                float(self._action_counts[k]) / total,
+                step,
+            )
+        self.writer.add_scalar(f"Live/Action/{symbol}", action_index, step)
+
+        if q_values is not None and q_values.size > 0:
+            q = np.asarray(q_values, dtype=np.float32).reshape(-1)
+            self.writer.add_scalar("Live/Q/Mean", float(q.mean()), step)
+            self.writer.add_scalar("Live/Q/MaxAcrossActions", float(q.max()), step)
+            self.writer.add_scalar("Live/Q/MinAcrossActions", float(q.min()), step)
+            top2 = np.partition(q, -2)[-2:] if q.size >= 2 else q
+            margin = float(top2[-1] - top2[0]) if q.size >= 2 else 0.0
+            self.writer.add_scalar("Live/Q/ActionMargin", margin, step)
+            if 0 <= action_index < q.size:
+                self.writer.add_scalar("Live/Q/Selected", float(q[action_index]), step)
+
+    def _emit_step_state(self, symbol_state: SymbolState, action_index: int, was_greedy: bool) -> None:
+        """Emit per-step portfolio scalars and append to the symbol's StepRecord trace."""
+        if self.writer is not None:
+            step = self._global_step
+            self.writer.add_scalar(
+                f"Live/PortfolioValue/{symbol_state.symbol}",
+                float(self.shared_portfolio_value),
+                step,
+            )
+            self.writer.add_scalar(
+                f"Live/Position/{symbol_state.symbol}",
+                float(symbol_state.portfolio_state.position),
+                step,
+            )
+
+        symbol_state.step_records.append(
+            StepRecord(
+                step_index=symbol_state.step_count,
+                portfolio_value=float(self.shared_portfolio_value),
+                position=float(symbol_state.portfolio_state.position),
+                price=float(symbol_state.last_price),
+                action=int(action_index),
+                transaction_cost=0.0,
+                was_greedy=bool(was_greedy),
+            )
+        )
+        symbol_state.step_count += 1
+
+    def _maybe_emit_trade_close(self, symbol_state: SymbolState, pre_position: float) -> None:
+        """If a position just closed for this symbol, segment the trade and emit Live/Trade/* scalars."""
+        post_position = symbol_state.portfolio_state.position
+        # Only act on a real flat-close transition (was open, now flat).
+        if pre_position <= 1e-9 or post_position > 1e-9:
+            return
+        trades = segment_trades(symbol_state.step_records)
+        if not trades:
+            return
+        new_trades = trades[symbol_state.closed_trade_count :]
+        if not new_trades:
+            return
+        symbol_state.closed_trade_count = len(trades)
+
+        if self.writer is None and self._trades_jsonl_path is None:
+            return
+
+        agg = aggregate_trade_metrics(trades)
+        step = self._global_step
+        if self.writer is not None:
+            for tag, key in (
+                ("Live/Trade/Count", "trade_count"),
+                ("Live/Trade/HitRate", "hit_rate"),
+                ("Live/Trade/Expectancy", "expectancy_pct"),
+                ("Live/Trade/PerTradeSharpe", "per_trade_sharpe"),
+                ("Live/Trade/ProfitFactor", "profit_factor"),
+                ("Live/Trade/AvgDuration", "avg_duration_steps"),
+                ("Live/Trade/AvgMAE", "avg_mae_pct"),
+                ("Live/Trade/AvgMFE", "avg_mfe_pct"),
+                ("Live/Trade/PctGreedy", "pct_greedy_actions"),
+                ("Live/Trade/TotalPnLAbs", "total_pnl_absolute"),
+                ("Live/Trade/TotalTxnCost", "total_transaction_cost"),
+            ):
+                value = agg.get(key, float("nan"))
+                if value is None or (isinstance(value, float) and not np.isfinite(value)):
+                    continue
+                self.writer.add_scalar(f"{tag}/{symbol_state.symbol}", float(value), step)
+
+        if self._trades_jsonl_path is not None:
+            with self._trades_jsonl_path.open("a", encoding="utf-8") as fp:
+                for trade in new_trades:
+                    payload = trade.to_dict()
+                    payload["symbol"] = symbol_state.symbol
+                    payload["closed_at_step"] = step
+                    fp.write(json.dumps(payload, default=float) + "\n")
 
 
 __all__ = ["BarData", "LiveFeatureNormalizer", "MomentumLiveTrader"]

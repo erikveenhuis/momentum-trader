@@ -20,7 +20,7 @@ norecursedirs = [
     "data",
     "tests/test_networks_old.py",
 ]
-addopts = "-ra --color=yes -rP --cov=packages --cov-report=html"
+addopts = "-ra --color=yes -rP --cov=packages --cov-report=html -m 'not benchmark'"
 testpaths = [
     "packages/momentum_core/tests",
     "packages/momentum_env/tests",
@@ -42,4 +42,6 @@ python_functions = "test_*"
 markers = [
     "integration: marks tests as integration tests",
     "unit: marks tests as unit tests",
+    "tb_logging: marks tests that exercise TensorBoard SummaryWriter capture",
+    "benchmark: long-running performance benchmarks; excluded from the default suite (run explicitly with `pytest -m benchmark`).",
 ]
