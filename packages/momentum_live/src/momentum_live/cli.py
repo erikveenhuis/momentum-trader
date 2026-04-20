@@ -1,4 +1,4 @@
-"""Command line interface for running live momentum trading."""
+"""Command line interface for Broker-API live momentum trading."""
 
 from __future__ import annotations
 
@@ -8,12 +8,29 @@ import sys
 
 from momentum_core.logging import get_logger, setup_package_logging
 
-from .agent_loader import find_best_checkpoint, load_agent_from_checkpoint, resolve_live_device
-from .alpaca_stream import AlpacaStreamRunner
+from .account_registry import BrokerAccountRegistry
+from .agent_loader import find_best_checkpoint, load_agent_from_checkpoint
+from .broker import BrokerAccountManager, BrokerCredentials
 from .config import AlpacaCredentials, LiveTradingConfig, parse_symbols
-from .trader import MomentumLiveTrader
+from .multi_pair_runner import MultiPairRunner
 
-logger = get_logger("momentum_live.cli")
+LOGGER = get_logger("momentum_live.cli")
+
+
+def _parse_adopt_spec(spec: str) -> tuple[str, str]:
+    """Parse a ``PAIR:ACCOUNT_ID`` CLI argument into its components.
+
+    The pair itself contains a ``/`` (e.g. ``BTC/USD``) and the account id is
+    a UUID, so we split on the *last* ``:`` to be unambiguous.
+    """
+    if ":" not in spec:
+        raise ValueError(f"--adopt value {spec!r} must be in the form PAIR:ACCOUNT_ID, e.g. BTC/USD:a7880383-9924-446b-8be7-3d8b3bcdf68f")
+    pair, account_id = spec.rsplit(":", 1)
+    pair = pair.strip()
+    account_id = account_id.strip()
+    if not pair or not account_id:
+        raise ValueError(f"--adopt value {spec!r} has an empty pair or account id")
+    return pair, account_id
 
 
 def _configure_logging(level: str) -> None:
@@ -27,27 +44,73 @@ def _configure_logging(level: str) -> None:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the momentum agent against live Alpaca crypto data")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run the momentum agent against live Alpaca crypto data, with one Broker "
+            "sub-account per symbol. Source scripts/env-paper.sh first."
+        ),
+    )
     parser.add_argument("--symbols", required=True, help="Comma-separated crypto pairs (e.g. BTC/USD,ETH/USD)")
     parser.add_argument("--models-dir", default="models", help="Directory containing trained checkpoints")
     parser.add_argument("--checkpoint", default=None, help="Specific checkpoint file to load")
-    parser.add_argument("--checkpoint-pattern", default="checkpoint_trainer_best_*.pt", help="Glob pattern for checkpoint files")
+    parser.add_argument(
+        "--checkpoint-pattern",
+        default="checkpoint_trainer_best_*.pt",
+        help="Glob pattern for checkpoint files",
+    )
     parser.add_argument("--window-size", type=int, required=True, help="Rolling window size (must match training)")
-    parser.add_argument("--initial-balance", type=float, required=True, help="Initial balance in USD")
+    parser.add_argument(
+        "--initial-balance",
+        type=float,
+        required=True,
+        help="Per-sub-account starting balance in USD (also the soft-reset target)",
+    )
     parser.add_argument("--transaction-fee", type=float, required=True, help="Transaction fee fraction (e.g. 0.001)")
     parser.add_argument("--reward-scale", type=float, required=True, help="Reward scale (must match training)")
     parser.add_argument("--invalid-penalty", type=float, required=True, help="Invalid action penalty")
     parser.add_argument("--drawdown-penalty-lambda", type=float, required=True, help="Drawdown penalty weight")
     parser.add_argument("--slippage-bps", type=float, required=True, help="Slippage in basis points")
     parser.add_argument("--opportunity-cost-lambda", type=float, required=True, help="Opportunity cost weight")
-    parser.add_argument("--benchmark-allocation-frac", type=float, required=True, help="Benchmark allocation for relative reward")
+    parser.add_argument(
+        "--benchmark-allocation-frac",
+        type=float,
+        required=True,
+        help="Benchmark allocation for relative reward",
+    )
     parser.add_argument("--min-rebalance-pct", type=float, required=True, help="Min allocation delta to trigger trade")
     parser.add_argument("--min-trade-value", type=float, required=True, help="Min trade notional in USD")
-    parser.add_argument("--location", default=None, help="Alpaca crypto data feed location")
+    parser.add_argument("--location", default=None, help="Alpaca crypto data feed location (default: ALPACA_CRYPTO_FEED or 'us')")
+    parser.add_argument(
+        "--reset-mode",
+        choices=("none", "soft", "hard"),
+        default="soft",
+        help="Pre-run reset behaviour: 'none' leaves sub-accounts as is, 'soft' (default) "
+        "cancels orders + closes positions + JNLCs balance back to --initial-balance, "
+        "'hard' is reserved for a future revision",
+    )
+    parser.add_argument(
+        "--subaccount-registry",
+        default="models/broker_subaccounts.json",
+        help="Path to the JSON file mapping pair -> Broker sub-account id",
+    )
+    parser.add_argument(
+        "--adopt",
+        action="append",
+        default=[],
+        metavar="PAIR:ACCOUNT_ID",
+        help=(
+            "Upsert a pre-existing Broker sub-account id into the registry "
+            "before running (repeatable). Example: "
+            "--adopt BTC/USD:a7880383-9924-446b-8be7-3d8b3bcdf68f. Useful for "
+            "reusing accounts created via the Brokerdash tutorial when "
+            "programmatic sub-account creation or firm-level funding is "
+            "unavailable."
+        ),
+    )
     parser.add_argument(
         "--tb-log-dir",
         default=None,
-        help="If set, mirror Live/Trade/*, Live/Action Rate/*, Live/Q/* scalars to TensorBoard (Tier 6 parity).",
+        help="If set, mirror Live/Trade/*, Live/Action Rate/*, Live/Q/* scalars to TensorBoard.",
     )
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     return parser
@@ -77,101 +140,65 @@ def main(argv: list[str] | None = None) -> int:
             models_dir=args.models_dir,
             checkpoint_pattern=args.checkpoint_pattern,
             tb_log_dir=args.tb_log_dir,
+            reset_mode=args.reset_mode,
+            subaccount_registry_path=args.subaccount_registry,
         )
 
-        credentials = AlpacaCredentials.from_environment()
+        data_credentials = AlpacaCredentials.from_environment()
         if args.location:
-            credentials = AlpacaCredentials(
-                api_key=credentials.api_key,
-                secret_key=credentials.secret_key,
+            data_credentials = AlpacaCredentials(
+                api_key=data_credentials.api_key,
+                secret_key=data_credentials.secret_key,
                 location=args.location,
             )
 
-        checkpoint_path = args.checkpoint
-        if not checkpoint_path:
-            checkpoint_path = find_best_checkpoint(trading_config.models_dir, trading_config.checkpoint_pattern)
-
-        # Try to load agent from checkpoint, fallback to fresh agent if loading fails
-        try:
-            agent = load_agent_from_checkpoint(checkpoint_path)
-            logger.info(f"Loaded trained agent with {sum(p.numel() for p in agent.network.parameters()):,} parameters")
-        except Exception as e:
-            logger.warning(f"Could not load checkpoint ({e}), creating fresh agent for live trading")
-            # Create a fresh agent with the same config as the checkpoint
-            import torch
-            from momentum_agent import RainbowDQNAgent
-
-            # Extract agent config from checkpoint for fresh agent
-            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-            for config_key in ["agent_config", "config"]:
-                if config_key in checkpoint:
-                    agent_config = checkpoint[config_key]
-                    break
-            else:
-                # Fallback to a basic config if checkpoint doesn't have it
-                agent_config = {
-                    "gamma": 0.99,
-                    "lr": 0.001,
-                    "batch_size": 256,
-                    "replay_buffer_size": 500000,
-                    "target_update_freq": 2500,
-                    "window_size": 60,
-                    "n_features": 12,
-                    "hidden_dim": 256,
-                    "num_actions": 7,
-                    "nhead": 4,
-                    "num_encoder_layers": 3,
-                    "dim_feedforward": 512,
-                    "transformer_dropout": 0.2,
-                    "n_steps": 3,
-                    "num_atoms": 101,
-                    "v_min": -1.0,
-                    "v_max": 1.0,
-                    "alpha": 0.6,
-                    "beta_start": 0.5,
-                    "beta_frames": 1000000,
-                    "lr_scheduler_enabled": True,
-                    "lr_scheduler_type": "ReduceLROnPlateau",
-                    "lr_scheduler_params": {"mode": "max", "factor": 0.1, "patience": 5, "threshold": 0.0001, "min_lr": 1e-06},
-                    "grad_clip_norm": 1.0,
-                    "epsilon_start": 0.0,
-                    "epsilon_end": 0.0,
-                    "epsilon_decay_steps": 1,
-                    "entropy_coeff": 0.0,
-                    "debug": False,
-                    "seed": 42,
-                }
-
-            live_device = resolve_live_device(None)
-            agent = RainbowDQNAgent(
-                config=agent_config,
-                device=live_device,
-                scaler=None,
-                inference_only=True,
+        broker_credentials = BrokerCredentials.from_environment()
+        if trading_config.reset_mode != "none" and not broker_credentials.has_firm_account:
+            raise RuntimeError(
+                "ALPACA_BROKER_ACCOUNT_ID is not set but --reset-mode is "
+                f"{trading_config.reset_mode!r}. Either set the firm account "
+                "id in .env or re-run with --reset-mode none (agent-only "
+                "validation, no JNLC)."
             )
-            logger.info(f"Created fresh agent with {sum(p.numel() for p in agent.network.parameters()):,} parameters")
 
-        trader = MomentumLiveTrader(agent=agent, config=trading_config)
-        runner = AlpacaStreamRunner(credentials=credentials, trader=trader)
+        registry = BrokerAccountRegistry(trading_config.subaccount_registry_path)
+        broker_manager = BrokerAccountManager(broker_credentials, registry)
 
-        try:
-            runner.run_forever()
-        except KeyboardInterrupt:
-            logger.info("Received interrupt signal, shutting down...")
-            # Note: runner.stop() can cause asyncio event loop issues during shutdown
-            # The stream should naturally stop on KeyboardInterrupt
-        except RuntimeError as exc:
-            if "connection limit exceeded" in str(exc).lower():
-                logger.error(f"Failed to start live trading: {exc}")
-                logger.error("Please check that you don't have multiple instances running and try again later.")
-                return 1
-            else:
-                raise
-        except Exception:
-            logger.info("Unexpected error occurred")
-            raise
-    except Exception as exc:  # pragma: no cover - CLI level protection
-        logging.getLogger("momentum_live.cli").exception("Fatal error in live runner: %s", exc)
+        for spec in args.adopt or []:
+            pair, account_id = _parse_adopt_spec(spec)
+            broker_manager.adopt_subaccount(pair, account_id)
+
+        checkpoint_path = args.checkpoint or find_best_checkpoint(
+            trading_config.models_dir,
+            trading_config.checkpoint_pattern,
+        )
+        agent = load_agent_from_checkpoint(checkpoint_path)
+        n_params = sum(p.numel() for p in agent.network.parameters())
+        LOGGER.info(
+            "Loaded trained agent (%s parameters) from %s",
+            f"{n_params:,}",
+            checkpoint_path,
+        )
+
+        runner = MultiPairRunner(
+            agent=agent,
+            broker=broker_manager,
+            data_credentials=data_credentials,
+            config=trading_config,
+        )
+
+        if trading_config.reset_mode != "none":
+            LOGGER.info("Pre-run reset (mode=%s)", trading_config.reset_mode)
+            runner.reset_all(trading_config.reset_mode)
+
+        runner.run_forever()
+    except KeyboardInterrupt:
+        LOGGER.info("Received interrupt signal, shutting down")
+    except RuntimeError as exc:
+        LOGGER.error("Live trading runtime error: %s", exc)
+        return 1
+    except Exception as exc:  # pragma: no cover - CLI level guard
+        LOGGER.exception("Fatal error in live runner: %s", exc)
         return 1
 
     return 0

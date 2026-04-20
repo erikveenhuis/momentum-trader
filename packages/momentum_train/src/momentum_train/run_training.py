@@ -531,11 +531,21 @@ def run_training(
     resume_log_dir_str = checkpoint_data.get("tensorboard_log_dir") if checkpoint_data else None
     log_dir_path: Path
 
+    # Aggressive disk flush to survive hard freezes / power loss / driver hangs.
+    # Default flush_secs=120 can lose up to ~2 min of scalars on an unclean
+    # shutdown. flush_secs=1 caps that background-flush loss window at ~1 s.
+    # We leave max_queue at the default so the vectorized training loop (which
+    # emits many scalars per step across parallel envs) doesn't stall on the
+    # writer queue; the explicit _flush_writer() calls at episode and
+    # checkpoint boundaries provide synchronous guarantees at the points that
+    # actually matter for resume correctness.
+    tb_flush_kwargs: dict[str, Any] = {"flush_secs": 1}
+
     if resume_training_flag and resume_log_dir_str:
         resumed = Path(resume_log_dir_str)
         log_dir_path = resumed if resumed.is_absolute() else (Path.cwd() / resumed).resolve()
         log_dir_path.mkdir(parents=True, exist_ok=True)
-        writer_kwargs: dict[str, Any] = {"log_dir": str(log_dir_path)}
+        writer_kwargs: dict[str, Any] = {"log_dir": str(log_dir_path), **tb_flush_kwargs}
         if start_total_steps > 0:
             writer_kwargs["purge_step"] = start_total_steps
         writer = SummaryWriter(**writer_kwargs)
@@ -544,7 +554,7 @@ def run_training(
         current_time = time.strftime("%Y%m%d-%H%M%S")
         log_dir_path = log_dir_base / current_time
         log_dir_path.mkdir(parents=True, exist_ok=True)
-        writer = SummaryWriter(log_dir=str(log_dir_path))
+        writer = SummaryWriter(log_dir=str(log_dir_path), **tb_flush_kwargs)
         logger.info(f"TensorBoard logs: {log_dir_path}")
 
     # Store log dir for downstream components if needed
@@ -594,16 +604,26 @@ def run_training(
     # --- Run Training ---
     logger.debug(f"Agent config: {agent_config}")
     logger.debug(f"Environment config: {env_config}")
-    trainer.train(
-        # env=initial_env, # Removed argument
-        num_episodes=num_episodes,
-        start_episode=start_episode,
-        start_total_steps=start_total_steps,
-        initial_best_score=initial_best_score,
-        initial_early_stopping_counter=initial_early_stopping_counter,
-        specific_file=specific_file,
-        # Other params like validation_freq, gamma, batch_size etc. are now taken from config inside trainer
-    )
+    try:
+        trainer.train(
+            # env=initial_env, # Removed argument
+            num_episodes=num_episodes,
+            start_episode=start_episode,
+            start_total_steps=start_total_steps,
+            initial_best_score=initial_best_score,
+            initial_early_stopping_counter=initial_early_stopping_counter,
+            specific_file=specific_file,
+            # Other params like validation_freq, gamma, batch_size etc. are now taken from config inside trainer
+        )
+    finally:
+        # Force a flush to disk even if training crashed (FloatingPointError,
+        # KeyboardInterrupt, etc.). This is our last-chance sync before the
+        # process exits; a hard OS freeze still can't be helped here, but every
+        # normal exit path will have TB events and buffers on disk.
+        try:
+            trainer.writer.flush() if getattr(trainer, "writer", None) is not None else None
+        except Exception:
+            logger.debug("Failed to flush TensorBoard writer in run_training finally", exc_info=True)
 
     # Close the initial environment (might be redundant if trainer closes final env)
     try:

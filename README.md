@@ -5,7 +5,7 @@ Reinforcement learning workflow for intra-hour momentum-based cryptocurrency tra
 ## Requirements
 
 - Python 3.13+
-- Ubuntu Linux (tested on 6.17 kernel) with CUDA-capable GPU (RTX 5090 recommended)
+- Linux with a CUDA-capable GPU for training (CPU works for live inference)
 - Alpaca Markets account with crypto paper trading enabled (for live trading mode)
 
 ## Project Structure
@@ -34,7 +34,7 @@ Key design decisions:
 - **5-D account state**: position fraction, cash fraction, unrealized PnL, bars-in-position, cumulative fee fraction
 - **Benchmark-relative reward**: excess return vs a fixed allocation benchmark, minus drawdown penalty (`lambda * max_drawdown_increment`)
 - **Slippage model**: configurable basis-point slippage on all trades
-- **bfloat16 AMP**: native Blackwell tensor core support, no GradScaler needed
+- **bfloat16 AMP**: no GradScaler needed
 - **Polyak soft target updates** (tau=0.001) instead of hard copy
 - **Auxiliary return-prediction head** on the Transformer CLS output
 - **Target allocation actions**: 6 discrete exposure levels (0%–100% in 20% steps); every action is always valid
@@ -101,26 +101,20 @@ Each `.npz` contains:
 
 The preprocessor also **rejects dual-feed-contaminated files** (minute bars where historical Polygon/Massive aggregations interleaved two venue streams, producing close prices that alternate between two levels). A file is rejected if it has ≥100 alternating `>5%` bar pairs, or oracle log-growth ≥25 within a narrow (`<5×`) daily range — see `check_price_contamination()` in `scripts/data_processing/preprocess_npz.py`. Rejected symbols are logged with the reason and their `.npz` is not written.
 
-## GPU Stability (RTX 5090)
+## GPU notes
 
-The RTX 5090 requires the **open** NVIDIA kernel module (`nvidia-driver-590-open`) for display output. The `nvidia-powerd` daemon does not yet support this GPU (PCI ID `0x2b85`) and exits on startup; this is harmless on desktop since hardware power management is handled by the driver directly.
-
-To prevent system freezes during sustained training, cap the power, and enable persistence mode:
+Long training runs benefit from enabling persistence mode and capping the GPU's
+power draw to keep thermals predictable. The repo ships a sample systemd unit
+at `config/nvidia-powerlimit.service` — the wattage in that file is tuned for
+the developer's hardware, so adjust `nvidia-smi -pl <watts>` to a value
+appropriate for your card before installing it:
 
 ```bash
 sudo nvidia-smi -pm 1
-sudo nvidia-smi -pl 500
+sudo nvidia-smi -pl <watts>          # adjust to your card
 ```
 
-To persist across reboots, enable the provided systemd service:
-
-```bash
-sudo cp config/nvidia-powerlimit.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now nvidia-powerlimit.service
-```
-
-Monitor GPU thermals during training in a separate terminal:
+Optionally monitor thermals in a separate terminal during training:
 
 ```bash
 nvidia-smi dmon -s pucvmet -d 5 | tee gpu_monitor.log
@@ -521,64 +515,153 @@ TensorBoard event files (can be GBs over a long run), or stray
 `models/_archive_*` directories — `du -sh models/* runs/* logs/* | sort
 -h` is the right starting probe.
 
-## Live Trading (Alpaca)
+## Live Trading (Alpaca Broker API)
+
+### Architecture
+
+The agent is trained as a **single-asset allocator**: each training episode
+samples one `<date>_<SYMBOL>-USD.npz` file with one cash bucket. To preserve
+that distribution in production, the live runner uses the **Alpaca Broker API**
+(sandbox) and provisions **one sub-account per trading pair**. Each pair gets
+its own balance and its own positions, so a 100% allocation in BTC cannot
+starve ETH — the multi-asset cash-pool race that the agent never saw during
+training simply cannot occur.
+
+```
+                        ┌──────────────────────────────────┐
+   1× CryptoDataStream ─┤  MultiPairRunner (single agent)  │
+                        └─────┬──────────────────────┬─────┘
+                              │ BTC bar              │ ETH bar
+                              ▼                      ▼
+                ┌─────────────────────┐  ┌─────────────────────┐
+                │ MomentumLiveTrader  │  │ MomentumLiveTrader  │
+                │  symbol=BTC/USD     │  │  symbol=ETH/USD     │
+                │  → BrokerSubAcct A  │  │  → BrokerSubAcct B  │
+                └─────────────────────┘  └─────────────────────┘
+                          ▲                          ▲
+                          └─────── BrokerClient ─────┘
+                            (firm account funds JNLC)
+```
+
+### Credentials
+
+`scripts/env-paper.sh` loads two API surfaces from a gitignored `.env`:
+
+```bash
+# Data API (CryptoDataStream / CryptoHistoricalDataClient)
+ALPACA_API_KEY=...
+ALPACA_API_SECRET=...
+
+# Broker API sandbox (BrokerClient — sub-account creation, JNLC funding)
+ALPACA_BROKER_API_KEY=...
+ALPACA_BROKER_API_SECRET=...
+ALPACA_BROKER_BASE_URL=https://broker-api.sandbox.alpaca.markets
+ALPACA_BROKER_ACCOUNT_ID=<your-firm/funding-account-uuid>
+```
+
+`scripts/env-paper.sh` aborts loudly if any of these are missing. Source it
+**once per shell**:
+
+```bash
+source venv/bin/activate
+source scripts/env-paper.sh
+```
+
+### Required Broker sandbox limits
+
+The default sandbox JNLC limits are too low for typical funding/reset flows.
+In the Alpaca Broker sandbox UI, raise:
+
+- **JNLC Transaction Limit** to at least your `--initial-balance`
+  (recommended: $10,000 for headroom).
+- **JNLC Daily Transfer Limit** to $50,000 (matches firm cap; covers many
+  resets per day across multiple pairs).
 
 ### Quick start
 
 ```bash
-source venv/bin/activate
-source scripts/env-paper.sh   # loads ALPACA_API_KEY / ALPACA_API_SECRET from .env
-
-python -m momentum_live.cli \
+momentum-live \
     --symbols BTC/USD,ETH/USD \
     --models-dir models \
+    --window-size 60 \
+    --initial-balance 1000.0 \
+    --transaction-fee 0.001 \
+    --reward-scale 1.0 \
+    --invalid-penalty -0.1 \
+    --drawdown-penalty-lambda 0.3 \
+    --slippage-bps 5.0 \
+    --opportunity-cost-lambda 0.0 \
+    --benchmark-allocation-frac 0.10 \
+    --min-rebalance-pct 0.02 \
+    --min-trade-value 1.0 \
+    --reset-mode soft \
+    --tb-log-dir models/runs/live \
     --log-level INFO
 ```
 
-Pass `--tb-log-dir models/runs/live` to mirror the same `Live/Trade/*`,
-`Live/Action Rate/*`, and `Live/Q/*` scalars that the training pipeline
-emits — this gives parity between the training-time TensorBoard view and
-the deployed agent's live behavior. A `live_trades.jsonl` sidecar with
-per-trade `TradeRecord`s is written alongside the run logs.
+The first run **creates** one Broker sub-account per `--symbols` entry and
+records them in `models/broker_subaccounts.json` (the registry is gitignored).
+Subsequent runs **reuse** the same sub-accounts — IDs are stable across
+restarts and across new checkpoints.
 
-The CLI picks the best checkpoint in `--models-dir` (by validation score) and falls back to a fresh agent if loading fails. Live inference uses `inference_only=True` with eager forward (no `torch.compile`); default device is CPU. Set `MOMENTUM_LIVE_DEVICE=cuda` for GPU inference.
+#### `--reset-mode {none, soft, hard}`
 
-### Credentials
+Controls the pre-run reset, the standard way to start a clean evaluation
+of a new checkpoint:
 
-Put these in a gitignored `.env` at the repo root and use `scripts/env-paper.sh` to load them:
+- `none` — leave sub-accounts as is.
+- `soft` (default) — for each sub-account: cancel open orders, close all
+  positions, wait for fills, then JNLC the cash delta back to
+  `--initial-balance`. Idempotent (delta < $0.01 → no journal).
+- `hard` — reserved for a future revision (recreate sub-accounts).
+
+A marker line is appended to `live_trades.jsonl` at every reset so downstream
+tooling can split the log by checkpoint.
+
+#### Manual reset between checkpoints
+
+For ad-hoc resets without starting the live runner:
 
 ```bash
-ALPACA_API_KEY=your_key_here
-ALPACA_API_SECRET=your_secret_here
-ALPACA_PAPER_TRADING=true
+momentum-live-reset --initial-balance 1000.0
+# or restrict to a subset:
+momentum-live-reset --initial-balance 1000.0 --symbols BTC/USD,ETH/USD
 ```
 
-Verify with `echo $ALPACA_API_KEY` before running the CLI.
+This script holds an advisory file lock on `models/broker_subaccounts.lock`
+so you cannot accidentally race the live runner or another reset.
 
-### What it does
+### TensorBoard parity
 
-- Connects to Alpaca's live crypto data stream.
-- Processes real-time minute bars into the same 12-feature observation + 5-D account state used in training (identical window-level z-score + derived features).
-- Queries the Rainbow agent for a target-allocation action (0%, 20%, 40%, 60%, 80%, 100%).
-- Executes buy/sell deltas on your Alpaca paper account, with shared cash balance across symbols.
+`--tb-log-dir` mirrors the same `Live/Trade/*`, `Live/Action Rate/*`, and
+`Live/Q/*` scalars that the training pipeline emits — direct parity between
+the training-time TB view and the deployed agent's live behavior. A
+`live_trades.jsonl` sidecar with per-trade `TradeRecord`s is written
+alongside the run logs.
 
-Log line format:
-```
-BTC/USD BUY 25% at 45123.45 | Shared PV 1050.67 (Balance: 750.23) | valid=True | Order: abc123
-ETH/USD HOLD 0% at 2456.78 | Shared PV 1050.67 (Balance: 750.23) | valid=True
-```
+### Checkpoint selection
 
-Stop with `Ctrl+C`; connections close gracefully and final state is logged.
+By default the CLI picks the best checkpoint in `--models-dir` matching
+`checkpoint_trainer_best_*.pt` (by validation score parsed from the
+filename). Override with `--checkpoint <path>` or `--checkpoint-pattern
+<glob>`. If checkpoint loading fails the CLI **fails loudly** rather than
+trading with a fresh agent. Inference uses `inference_only=True` with eager
+forward (no `torch.compile`); default device is CPU. Set
+`MOMENTUM_LIVE_DEVICE=cuda` for GPU inference.
 
 ### Safety features
 
-- Paper trading by default (never uses real money unless `ALPACA_PAPER_TRADING=false` is set explicitly).
-- Position limits (cannot sell more than owned).
-- Cash checks (cannot buy with insufficient balance).
-- Target-allocation actions (all 6 exposure levels are always valid, no action masking needed).
-- `min_trade_notional` = $10 (matches Alpaca live requirement) to avoid tiny, costly orders.
+- All trading is sandbox via the Broker API — no production endpoint reachable
+  unless you swap the URL.
+- Position limits (cannot sell more than owned per sub-account).
+- Cash checks against the live sub-account balance before every order.
+- Target-allocation actions (all 6 exposure levels are always valid, no
+  action masking needed).
+- `min_trade_value` enforced at order submission to avoid tiny, costly
+  rounding errors.
 - Basis-point slippage modeled during training for realism.
-- Graceful error recovery on transient stream errors.
+- Graceful error recovery on transient stream errors and Alpaca connection
+  limits.
 
 ## Tests
 

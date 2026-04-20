@@ -544,6 +544,29 @@ class RainbowTrainerModule:
             )
         return deleted
 
+    def _flush_writer(self) -> None:
+        """Force-flush TensorBoard events to disk.
+
+        The default ``SummaryWriter`` buffers scalars in-memory for up to
+        ``flush_secs`` (120s) or until ``max_queue`` events accumulate. If the
+        machine hard-freezes (GPU driver hang, power loss, kernel deadlock) the
+        buffered events are lost even though the writer never crashed, which
+        produces a gap in TensorBoard between the last flush and the freeze.
+        Calling this after every checkpoint / episode guarantees the on-disk
+        event file is in lockstep with the on-disk checkpoint state, so the
+        largest gap we can ever lose is the few events added since the last
+        flush call (rather than up to 2 minutes of training).
+
+        Safe to call when ``self.writer`` is ``None``; errors are swallowed.
+        """
+        writer = getattr(self, "writer", None)
+        if writer is None:
+            return
+        try:
+            writer.flush()
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("Failed to flush TensorBoard writer", exc_info=True)
+
     def _save_checkpoint(
         self,
         episode: int,
@@ -651,6 +674,12 @@ class RainbowTrainerModule:
                     logger.info("  No improvement over previous best model")
             except Exception as e:
                 logger.error(f"Error saving best checkpoint: {e}", exc_info=True)  # Kept traceback
+
+        # Keep TB event file in sync with the checkpoint we just flushed to
+        # disk. Without this, a hard freeze right after a checkpoint save can
+        # leave TB scalars stuck ~2 minutes behind the checkpoint's
+        # ``total_train_steps``, producing the visible step-axis gap on resume.
+        self._flush_writer()
 
     # --- Refactored Helper Methods ---
 
@@ -1456,6 +1485,12 @@ class RainbowTrainerModule:
 
         # Always log PER stats at episode boundaries (unless explicitly disabled)
         self._maybe_log_per_stats(total_train_steps, force=True)
+
+        # End-of-episode flush: ensure every episode's scalars are on disk
+        # before we start the next one. Combined with the per-checkpoint flush
+        # in ``_save_checkpoint``, this bounds the "lost on freeze" window to a
+        # single episode's worth of step-axis scalars.
+        self._flush_writer()
 
     def _handle_validation_and_checkpointing(
         self,
@@ -2798,6 +2833,10 @@ class RainbowTrainerModule:
                                 self.writer.add_scalar(f"Train/Reward/StdByAction/{k}", float(bucket["std"]), completed_episodes)
                         self.writer.add_scalar("Train/Epsilon", self.agent.current_epsilon, completed_episodes)
                         self.writer.add_scalar("Train/Final Portfolio Value", ep_metrics.get("portfolio_value", 0), completed_episodes)
+
+                    # Vectorized episodes are long; flush after each one so the
+                    # gap-on-freeze window is bounded by a single env-episode.
+                    self._flush_writer()
 
                     per_env_episode_reward[i] = 0.0
                     per_env_steps[i] = 0

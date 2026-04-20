@@ -9,12 +9,16 @@ from dataclasses import dataclass
 
 @dataclass(slots=True)
 class AlpacaCredentials:
-    """Connection credentials for the Alpaca crypto data and trading APIs."""
+    """Connection credentials for the Alpaca crypto **data** API only.
+
+    Trading is performed through the Broker API (see ``momentum_live.broker``);
+    these credentials are used only by ``CryptoDataStream`` /
+    ``CryptoHistoricalDataClient`` to receive market data.
+    """
 
     api_key: str
     secret_key: str
     location: str = "us"
-    paper: bool = True
 
     @classmethod
     def from_environment(
@@ -22,21 +26,17 @@ class AlpacaCredentials:
         api_key_var: str = "ALPACA_API_KEY",
         secret_key_var: str = "ALPACA_API_SECRET",
         location_var: str = "ALPACA_CRYPTO_FEED",
-        paper_var: str = "ALPACA_PAPER_TRADING",
     ) -> AlpacaCredentials:
-        """Build credentials from environment variables."""
-
         api_key = os.getenv(api_key_var)
         secret_key = os.getenv(secret_key_var)
         location = os.getenv(location_var, "us")
-        paper = os.getenv(paper_var, "true").lower() in ("true", "1", "yes")
 
         if not api_key:
             raise OSError(f"Missing Alpaca API key in environment variable '{api_key_var}'.")
         if not secret_key:
             raise OSError(f"Missing Alpaca API secret in environment variable '{secret_key_var}'.")
 
-        return cls(api_key=api_key, secret_key=secret_key, location=location, paper=paper)
+        return cls(api_key=api_key, secret_key=secret_key, location=location)
 
 
 @dataclass(slots=True)
@@ -58,6 +58,8 @@ class LiveTradingConfig:
     models_dir: str
     checkpoint_pattern: str
     tb_log_dir: str | None = None
+    reset_mode: str = "soft"
+    subaccount_registry_path: str = "models/broker_subaccounts.json"
 
     def __post_init__(self) -> None:
         if isinstance(self.symbols, Iterable) and not isinstance(self.symbols, str):
@@ -76,6 +78,9 @@ class LiveTradingConfig:
 
         if not (0.0 <= self.transaction_fee < 1.0):
             raise ValueError("transaction_fee must be in the range [0, 1)")
+
+        if self.reset_mode not in ("none", "soft", "hard"):
+            raise ValueError(f"reset_mode must be one of: none, soft, hard (got {self.reset_mode!r})")
 
 
 def parse_symbols(symbols: str | Sequence[str]) -> list[str]:
