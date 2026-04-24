@@ -12,9 +12,20 @@ LOG_DIR_ENV_VAR = "MOMENTUM_LOG_DIR"
 GLOBAL_LEVEL_ENV_VAR = "MOMENTUM_LOG_LEVEL"
 PACKAGE_LEVEL_ENV_PREFIX = "MOMENTUM_LOG_LEVEL_"
 
-# Define default logs directory relative to project root
-_PROJECT_ROOT = Path(__file__).resolve().parents[4]
-DEFAULT_LOGS_DIR = _PROJECT_ROOT / "logs"
+
+def _default_logs_dir() -> Path:
+    """Best-effort default logs directory.
+
+    Tries ``<repo-root>/logs`` when this file lives inside a development
+    checkout (``packages/<pkg>/src/<pkg>/logging.py``); falls back to
+    ``<cwd>/logs`` otherwise (e.g. when installed into site-packages).
+    """
+
+    # packages/<pkg>/src/<pkg>/logging.py -> parents[4] == repo root in dev mode.
+    candidate_root = Path(__file__).resolve().parents[4]
+    if (candidate_root / "packages").is_dir():
+        return candidate_root / "logs"
+    return Path.cwd() / "logs"
 
 
 def _coerce_level(level: int | str | None) -> int | None:
@@ -46,7 +57,7 @@ def _resolve_logs_dir(logs_dir: str | Path | None) -> Path:
         resolved = Path(logs_dir)
     else:
         env_dir = os.getenv(LOG_DIR_ENV_VAR)
-        resolved = Path(env_dir) if env_dir else DEFAULT_LOGS_DIR
+        resolved = Path(env_dir) if env_dir else _default_logs_dir()
 
     resolved = resolved.expanduser().resolve()
     resolved.mkdir(parents=True, exist_ok=True)

@@ -116,10 +116,10 @@ def _fetch_one_minute_bars_btc(
         out.append(
             BarData(
                 symbol="BTC/USD",
-                open=float(getattr(raw_bar, "open")),
-                high=float(getattr(raw_bar, "high")),
-                low=float(getattr(raw_bar, "low")),
-                close=float(getattr(raw_bar, "close")),
+                open=float(raw_bar.open),
+                high=float(raw_bar.high),
+                low=float(raw_bar.low),
+                close=float(raw_bar.close),
                 volume=float(getattr(raw_bar, "volume", 0.0)),
                 timestamp=getattr(raw_bar, "timestamp", datetime.now(UTC)),
             )

@@ -5,8 +5,11 @@ import os
 
 import gymnasium as gym
 from gymnasium.utils.env_checker import check_env
+from momentum_core.logging import get_logger
 
 from momentum_env.config import TradingEnvConfig
+
+logger = get_logger(__name__)
 
 
 def main():
@@ -41,9 +44,9 @@ def main():
 
     # Conditionally run check_env
     if not args.skip_env_check:
-        print("Checking environment validity...")
+        logger.info("Checking environment validity...")
         check_env(env.unwrapped)
-        print("Environment check passed!")
+        logger.info("Environment check passed!")
 
     observation, info = env.reset()
     env.render()
@@ -58,9 +61,9 @@ def main():
             env.render()
 
         if terminated or truncated:
-            print(f"\nEpisode finished after {step} steps!")
-            print(f"Final portfolio value: ${info['portfolio_value']:.2f}")
-            print(f"Total transaction cost: ${info['transaction_cost']:.2f}")
+            logger.info("Episode finished after %d steps!", step)
+            logger.info("Final portfolio value: $%.2f", info["portfolio_value"])
+            logger.info("Total transaction cost: $%.2f", info["transaction_cost"])
             break
 
     env.close()

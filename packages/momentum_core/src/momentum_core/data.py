@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .logging import get_logger
 
-logger = get_logger("DataManager")
+logger = get_logger(__name__)
 
 
 class DataManager:

@@ -17,7 +17,7 @@ from pathlib import Path
 
 from momentum_core.logging import get_logger
 
-LOGGER = get_logger("momentum_live.account_registry")
+LOGGER = get_logger(__name__)
 
 
 @dataclass(slots=True, frozen=True)

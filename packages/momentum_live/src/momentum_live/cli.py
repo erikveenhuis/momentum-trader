@@ -14,7 +14,7 @@ from .broker import BrokerAccountManager, BrokerCredentials
 from .config import AlpacaCredentials, LiveTradingConfig, parse_symbols
 from .multi_pair_runner import MultiPairRunner
 
-LOGGER = get_logger("momentum_live.cli")
+LOGGER = get_logger(__name__)
 
 
 def _parse_adopt_spec(spec: str) -> tuple[str, str]:

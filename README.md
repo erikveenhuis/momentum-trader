@@ -43,23 +43,23 @@ Key design decisions:
 
 ## Setup
 
-1. Create and activate a Python 3.13 virtual environment:
+The repo is a single [uv](https://docs.astral.sh/uv/) workspace; the five
+packages under `packages/` are the workspace members. Install them all with:
+
+1. Install [uv](https://docs.astral.sh/uv/) (one-time):
    ```bash
-   python -m venv venv
-   source venv/bin/activate
-   python -m pip install --upgrade pip
+   curl -LsSf https://astral.sh/uv/install.sh | sh
    ```
 
-2. Install packages in editable mode:
+2. From the repo root, create the virtualenv and sync every workspace
+   member (plus dev extras) in one shot:
    ```bash
-   python install_packages.py
-   # or manually:
-   pip install -e packages/momentum_core \
-               -e packages/momentum_env \
-               -e packages/momentum_agent \
-               -e packages/momentum_train \
-               -e packages/momentum_live
+   uv sync --all-packages --all-extras
+   source .venv/bin/activate
    ```
+
+   `uv sync` is idempotent: re-run it any time a `pyproject.toml` changes
+   to pick up new dependencies.
 
 3. (Optional) Enable Git hooks:
    ```bash

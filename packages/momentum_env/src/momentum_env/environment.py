@@ -1,6 +1,7 @@
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
+from momentum_core.constants import ACCOUNT_STATE_DIM
 
 from momentum_env.config import TradingEnvConfig
 from momentum_env.data import MarketDataProcessor, get_observation_at_step
@@ -57,7 +58,7 @@ class TradingEnv(gym.Env):
                 "account_state": spaces.Box(
                     low=-1,
                     high=1,
-                    shape=(5,),
+                    shape=(ACCOUNT_STATE_DIM,),
                     dtype=np.float32,
                 ),
             }

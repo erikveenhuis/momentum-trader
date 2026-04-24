@@ -27,7 +27,7 @@ except ImportError:
     logging.error("Could not import utility functions from data_utils. Ensure the file exists in the same directory.")
     sys.exit(1)
 
-logger = get_logger("data_processing.extract_raw")
+logger = get_logger(__name__)
 
 
 class DiskWriteError(RuntimeError):

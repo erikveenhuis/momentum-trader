@@ -22,6 +22,7 @@ def _create_minimal_trainer(tmp_path) -> RainbowTrainerModule:
     trainer.reward_window = 10
     trainer.min_episodes_before_early_stopping = 0
     trainer.agent = SimpleNamespace(lr_scheduler_enabled=False, num_actions=6)
+    trainer._progress_path = str(tmp_path / "progress.jsonl")
     # Tier 4a default for tests: disabled unless explicitly opted in. Avoids
     # AttributeError in _maybe_log_per_stats -> _maybe_audit_per_buffer_distribution.
     trainer.per_buffer_audit_interval = 0
@@ -191,7 +192,7 @@ def test_handle_validation_emits_action_rate_and_portfolio_scalars(tmp_path):
     trainer.validate = fake_validate.__get__(trainer, RainbowTrainerModule)
     trainer._check_early_stopping = fake_check_early_stopping
     trainer._save_checkpoint = lambda *a, **kw: None
-    trainer.should_validate = lambda episode, recent_metrics: True
+    trainer.should_validate = lambda episode, recent_metrics, force=False: True
 
     tracker = SimpleNamespace(get_recent_metrics=lambda: {})
     trainer._handle_validation_and_checkpointing(
@@ -345,7 +346,7 @@ def _make_per_buffer_for_audit(rewards, actions, priorities):
     tree = np.zeros(2 * capacity - 1, dtype=np.float64)
     for i, p in enumerate(priorities):
         tree[i + capacity - 1] = float(p)
-    stored = [SimpleNamespace(reward=float(r), action=int(a)) for r, a in zip(rewards, actions)]
+    stored = [SimpleNamespace(reward=float(r), action=int(a)) for r, a in zip(rewards, actions, strict=False)]
     sum_tree = SimpleNamespace(tree=tree, capacity=capacity)
     fake_buffer = SimpleNamespace(buffer=stored, tree=sum_tree)
     return fake_buffer
@@ -491,6 +492,137 @@ def test_handle_validation_and_checkpointing_triggers_best_checkpoint(tmp_path):
     assert call["total_steps"] == 42
     assert call["is_best"] is True
     assert call["validation_score"] == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# Regression: vectorized training loop silently skipped validation and the
+# paired best-checkpoint save whenever ``num_vector_envs > 1`` caused
+# ``completed_episodes`` to jump past an exact multiple of ``validation_freq``
+# (observed April 21-22 2026 run: ep2000/2200/2400 validations + checkpoints
+# all missing).
+# ---------------------------------------------------------------------------
+
+
+def _capture_handler_setup(tmp_path, *, validation_freq: int, checkpoint_save_freq: int):
+    """Build a trainer + recording stubs for exercising
+    ``_handle_validation_and_checkpointing``. Returns
+    ``(trainer, validate_calls, save_calls, tracker)``.
+    """
+    trainer = _create_minimal_trainer(tmp_path)
+    trainer.validation_freq = validation_freq
+    trainer.checkpoint_save_freq = checkpoint_save_freq
+    trainer.best_validation_metric = 0.2
+
+    validate_calls: list[int] = []
+    save_calls: list[dict] = []
+
+    def fake_validate(self, val_files, episode=0):
+        validate_calls.append(int(episode))
+        trainer.best_validation_metric = 0.5
+        return False, 0.5, {"avg_reward": 1.0}
+
+    def capture_save(self, episode, total_steps, is_best, validation_score=None):
+        save_calls.append(
+            {
+                "episode": int(episode),
+                "total_steps": int(total_steps),
+                "is_best": bool(is_best),
+                "validation_score": validation_score,
+            }
+        )
+
+    trainer.validate = fake_validate.__get__(trainer, RainbowTrainerModule)
+    trainer._save_checkpoint = capture_save.__get__(trainer, RainbowTrainerModule)
+    trainer._check_early_stopping = lambda score, episode=0: False
+
+    tracker = SimpleNamespace(get_recent_metrics=lambda: {})
+    return trainer, validate_calls, save_calls, tracker
+
+
+@pytest.mark.unit
+def test_handle_validation_skips_silently_when_vec_env_jump_and_not_forced(tmp_path):
+    """Documents the pre-fix regression mode: when 4 vec envs cause
+    ``completed_episodes`` to jump 1998 -> 2002, the outer crossing gate fires
+    with ``episode=2001`` but both validation and checkpoint save fall through
+    because ``(2001 + 1) % 200 != 0`` and ``(2001 + 1) % 50 != 0``. Without the
+    ``force_*`` overrides this path produced the silent April 2026 outage.
+    """
+    trainer, validate_calls, save_calls, tracker = _capture_handler_setup(tmp_path, validation_freq=200, checkpoint_save_freq=50)
+
+    should_stop = trainer._handle_validation_and_checkpointing(
+        episode=2001,
+        total_train_steps=123_456,
+        val_files=[Path("val1.csv")],
+        tracker=tracker,
+    )
+
+    assert should_stop is False
+    assert validate_calls == []
+    assert save_calls == []
+
+
+@pytest.mark.unit
+def test_handle_validation_fires_on_vec_env_jump_when_forced(tmp_path):
+    """With ``force_validation=force_save=True`` (set by the vectorized loop on
+    a crossed validation boundary) we run validation and save the paired best
+    checkpoint at the jumped-past boundary even though ``episode`` is 2001,
+    not 1999 (the exact ``validation_freq`` multiple we overshot).
+    """
+    trainer, validate_calls, save_calls, tracker = _capture_handler_setup(tmp_path, validation_freq=200, checkpoint_save_freq=50)
+
+    should_stop = trainer._handle_validation_and_checkpointing(
+        episode=2001,
+        total_train_steps=123_456,
+        val_files=[Path("val1.csv")],
+        tracker=tracker,
+        force_validation=True,
+        force_save=True,
+    )
+
+    assert should_stop is False
+    assert validate_calls == [2001]
+    assert len(save_calls) == 1
+    call = save_calls[0]
+    assert call["episode"] == 2002
+    assert call["total_steps"] == 123_456
+    assert call["is_best"] is True
+    assert call["validation_score"] == pytest.approx(0.5)
+
+
+@pytest.mark.unit
+def test_handle_validation_still_fires_on_exact_boundary_without_force(tmp_path):
+    """Regression guard: the legacy ``% == 0`` path (no force) must keep working
+    when the episode counter *does* land exactly on a validation/checkpoint
+    boundary — i.e. we did not break the legacy single-env loop.
+    """
+    trainer, validate_calls, save_calls, tracker = _capture_handler_setup(tmp_path, validation_freq=200, checkpoint_save_freq=50)
+
+    trainer._handle_validation_and_checkpointing(
+        episode=1999,
+        total_train_steps=999,
+        val_files=[Path("val1.csv")],
+        tracker=tracker,
+    )
+
+    assert validate_calls == [1999]
+    assert len(save_calls) == 1
+    assert save_calls[0]["episode"] == 2000
+    assert save_calls[0]["is_best"] is True
+
+
+@pytest.mark.unit
+def test_should_validate_force_flag_semantics(tmp_path):
+    trainer = _create_minimal_trainer(tmp_path)
+    trainer.validation_freq = 200
+
+    assert trainer.should_validate(1999, {}) is True  # exact boundary
+    assert trainer.should_validate(2001, {}) is False  # off-boundary, no force
+    assert trainer.should_validate(2001, {}, force=True) is True  # force wins
+
+    trainer.validation_freq = 0
+    # Disabling validation (freq <= 0) must stay disabled even with force=True;
+    # otherwise opt-out users would start getting spurious validation runs.
+    assert trainer.should_validate(2001, {}, force=True) is False
 
 
 # ---------------------------------------------------------------------------
@@ -757,7 +889,6 @@ def test_eval_stochastic_flag_keeps_agent_in_training_mode_during_eval(tmp_path,
     """Tier 2d: with eval_stochastic=True, _run_single_evaluation_episode does NOT flip eval mode."""
     trainer = _create_minimal_trainer(tmp_path)
     trainer.eval_stochastic = True
-    trainer._render_on_reset_if_enabled = lambda *a, **kw: None
 
     states: list[bool] = []
 
@@ -813,7 +944,6 @@ def test_eval_default_runs_in_greedy_mode(tmp_path):
     """Tier 2d: default eval flips into eval mode on entry and restores on exit."""
     trainer = _create_minimal_trainer(tmp_path)
     trainer.eval_stochastic = False
-    trainer._render_on_reset_if_enabled = lambda *a, **kw: None
 
     states: list[bool] = []
 

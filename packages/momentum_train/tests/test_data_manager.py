@@ -9,7 +9,7 @@ from momentum_train.data import DataManager
 def _write_csv(directory: Path, name: str) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     file_path = directory / name
-    file_path.write_text("timestamp,open,high,low,close,volume\n" "2024-01-01T00:00:00Z,100,101,99,100,10\n")
+    file_path.write_text("timestamp,open,high,low,close,volume\n2024-01-01T00:00:00Z,100,101,99,100,10\n")
     return file_path
 
 
@@ -54,7 +54,7 @@ def test_data_manager_csv_fallback(tmp_path, monkeypatch):
 def test_data_manager_curriculum_frac(tmp_path, monkeypatch):
     processed_dir = tmp_path / "processed"
     for i in range(10):
-        _write_npz(processed_dir / "train", f"2024-01-{i+1:02d}_BTC-USD.npz")
+        _write_npz(processed_dir / "train", f"2024-01-{i + 1:02d}_BTC-USD.npz")
     _write_npz(processed_dir / "validation", "2024-06-01_ETH-USD.npz")
     _write_npz(processed_dir / "test", "2025-01-01_BTC-USD.npz")
 

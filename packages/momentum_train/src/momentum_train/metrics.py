@@ -2,7 +2,7 @@ import numpy as np
 from momentum_core.logging import get_logger
 
 # Get logger instance
-logger = get_logger("Metrics")
+logger = get_logger(__name__)
 
 
 def calculate_sharpe_ratio(returns: list[float], risk_free_rate: float = 0.02) -> float:
@@ -227,7 +227,7 @@ class PerformanceTracker:
         unknown = {i: 0 for i in range(num_actions)}
         if len(self.was_greedy) != len(self.actions):
             logger.warning("Provenance length mismatch: actions=%d was_greedy=%d", len(self.actions), len(self.was_greedy))
-        for action, flag in zip(self.actions, self.was_greedy):
+        for action, flag in zip(self.actions, self.was_greedy, strict=False):
             a = int(action)
             if not (0 <= a < num_actions):
                 continue

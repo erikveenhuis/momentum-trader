@@ -43,7 +43,7 @@ except ImportError:
     )
     get_logger = logging.getLogger
 
-logger = get_logger("preprocess_npz")
+logger = get_logger(__name__)
 
 from momentum_env.features import compute_derived_features  # noqa: E402
 

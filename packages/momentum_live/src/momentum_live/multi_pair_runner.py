@@ -29,7 +29,7 @@ from .config import AlpacaCredentials, LiveTradingConfig
 from .subaccount_client import BrokerSubAccountClient
 from .trader import BarData, MomentumLiveTrader
 
-LOGGER = get_logger("momentum_live.multi_pair_runner")
+LOGGER = get_logger(__name__)
 
 
 class MultiPairRunner:
@@ -186,13 +186,13 @@ class MultiPairRunner:
             try:
                 self._stream.stop()
                 LOGGER.info("Requested Alpaca stream shutdown")
-            except Exception as exc:  # pragma: no cover - defensive
+            except (RuntimeError, OSError, AttributeError) as exc:  # pragma: no cover - defensive
                 LOGGER.warning("Error during stream shutdown: %s", exc)
 
     async def _handle_bar(self, bar) -> None:
         try:
             bar_data = BarData.from_alpaca(bar)
-        except Exception as exc:  # pragma: no cover - defensive
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:  # pragma: no cover - defensive
             LOGGER.exception("Could not normalize incoming bar: %s", exc)
             return
 
@@ -212,7 +212,7 @@ class MultiPairRunner:
             )
         try:
             self.traders[canonical].process_bar(bar_data)
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception as exc:  # noqa: BLE001 - live-trading safety boundary; must keep stream alive across other pairs
             LOGGER.exception("[%s] error while processing bar: %s", canonical, exc)
 
     # ------------------------------------------------------------------
@@ -239,7 +239,7 @@ class MultiPairRunner:
                 secret_key=self.data_credentials.secret_key,
             )
             LOGGER.info("Initialized Alpaca historical data client for warmup")
-        except Exception as exc:  # pragma: no cover - defensive
+        except (ImportError, RuntimeError, ValueError, OSError, AttributeError) as exc:  # pragma: no cover - defensive
             self._historical_client = None
             LOGGER.warning("Could not initialize historical client: %s", exc)
 
@@ -366,10 +366,10 @@ class MultiPairRunner:
             try:
                 bar = BarData(
                     symbol=canonical,
-                    open=float(getattr(raw_bar, "open")),
-                    high=float(getattr(raw_bar, "high")),
-                    low=float(getattr(raw_bar, "low")),
-                    close=float(getattr(raw_bar, "close")),
+                    open=float(raw_bar.open),
+                    high=float(raw_bar.high),
+                    low=float(raw_bar.low),
+                    close=float(raw_bar.close),
                     volume=float(getattr(raw_bar, "volume", 0.0)),
                     timestamp=getattr(raw_bar, "timestamp", datetime.now(UTC)),
                 )

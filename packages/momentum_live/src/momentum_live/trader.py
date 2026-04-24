@@ -25,8 +25,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
-import pandas as pd
 from momentum_agent import RainbowDQNAgent
+from momentum_core.constants import ROLLING_WINDOW
+from momentum_core.features import compute_derived_features_np
 from momentum_core.logging import get_logger
 from momentum_core.trade_metrics import (
     StepRecord,
@@ -42,12 +43,11 @@ from .subaccount_client import BrokerSubAccountClient
 if TYPE_CHECKING:  # pragma: no cover
     from torch.utils.tensorboard import SummaryWriter
 
-LOGGER = get_logger("momentum_live.trader")
+LOGGER = get_logger(__name__)
 
 RAW_COLS = ("open", "high", "low", "close", "volume")
 N_DERIVED = 6
 N_TOTAL = N_RAW_FEATURES + N_DERIVED
-ROLLING_WINDOW = 20
 
 
 @dataclass(slots=True)
@@ -67,11 +67,11 @@ class BarData:
         """Create ``BarData`` from an ``alpaca-py`` bar object."""
 
         return cls(
-            symbol=getattr(bar, "symbol"),
-            open=float(getattr(bar, "open")),
-            high=float(getattr(bar, "high")),
-            low=float(getattr(bar, "low")),
-            close=float(getattr(bar, "close")),
+            symbol=bar.symbol,
+            open=float(bar.open),
+            high=float(bar.high),
+            low=float(bar.low),
+            close=float(bar.close),
             volume=float(getattr(bar, "volume", 0.0)),
             timestamp=getattr(bar, "timestamp", datetime.now(UTC)),
         )
@@ -99,30 +99,16 @@ class LiveFeatureNormalizer:
 
     def window(self) -> np.ndarray:
         raw_arr = np.array(list(self._raw), dtype=np.float32)
-        T = len(raw_arr)
 
-        closes = np.array(list(self._close_history), dtype=np.float64)
-        volumes = np.array(list(self._volume_history), dtype=np.float64)
-
-        safe_closes = np.where(closes > 0, closes, 1e-20)
-        log_ret_1 = np.zeros(T, dtype=np.float32)
-        log_ret_5 = np.zeros(T, dtype=np.float32)
-        log_ret_10 = np.zeros(T, dtype=np.float32)
-        if T > 1:
-            log_ret_1[1:] = np.log(safe_closes[1:] / safe_closes[:-1]).astype(np.float32)
-        if T > 5:
-            log_ret_5[5:] = np.log(safe_closes[5:] / safe_closes[:-5]).astype(np.float32)
-        if T > 10:
-            log_ret_10[10:] = np.log(safe_closes[10:] / safe_closes[:-10]).astype(np.float32)
-
-        realized_vol = pd.Series(log_ret_1).rolling(ROLLING_WINDOW, min_periods=1).std().fillna(0).values.astype(np.float32)
-        vol_mean = pd.Series(volumes).rolling(ROLLING_WINDOW, min_periods=1).mean().values
-        volume_ratio = (volumes / np.where(vol_mean > 1e-20, vol_mean, 1e-20)).astype(np.float32)
-        hl_range = (raw_arr[:, 1] - raw_arr[:, 2]) / np.where(raw_arr[:, 3] > 0, raw_arr[:, 3], 1e-20)
-        hl_mean = pd.Series(hl_range).rolling(ROLLING_WINDOW, min_periods=1).mean().values
-        hl_range_ratio = (hl_range / np.where(hl_mean > 1e-20, hl_mean, 1e-20)).astype(np.float32)
-
-        derived = np.column_stack([log_ret_1, log_ret_5, log_ret_10, realized_vol, volume_ratio, hl_range_ratio])
+        # Delegate to the canonical numpy implementation so training and
+        # live always see byte-identical derived features given the same
+        # OHLCV inputs. (Tier 4.2)
+        derived = compute_derived_features_np(
+            close=np.array(list(self._close_history), dtype=np.float64),
+            high=raw_arr[:, 1].astype(np.float64),
+            low=raw_arr[:, 2].astype(np.float64),
+            volume=np.array(list(self._volume_history), dtype=np.float64),
+        )
         full = np.concatenate([raw_arr, derived], axis=1)
 
         window = full[-self.window_size :]
@@ -235,6 +221,16 @@ class MomentumLiveTrader:
         )
 
     def process_bar(self, bar: BarData) -> dict[str, object] | None:
+        """Full end-to-end live step: observe → decide → rebalance → record.
+
+        Decomposed into three helpers so each phase can be unit-tested and
+        profiled independently:
+
+        * :meth:`_decide_action`   - update normalizer, query agent
+        * :meth:`_execute_rebalance` - translate target allocation into an order
+        * :meth:`_record_step`      - update bookkeeping, emit TB scalars, build
+          the decision dict that callers log/forward.
+        """
         if bar.symbol != self.symbol:
             LOGGER.debug("[%s] ignoring bar for %s", self.symbol, bar.symbol)
             return None
@@ -252,9 +248,49 @@ class MomentumLiveTrader:
 
         cash_pre = self.get_account_cash()
         position_pre = self.portfolio_state.position
-        portfolio_pre = cash_pre + max(0.0, position_pre * float(bar.close))
+        current_price = float(bar.close)
+        portfolio_pre = cash_pre + max(0.0, position_pre * current_price)
 
-        self.last_price = float(bar.close)
+        self.last_price = current_price
+
+        decision_inputs = self._decide_action(bar, cash_pre)
+        if decision_inputs is None:
+            return None
+        action_index, was_greedy, target_frac = decision_inputs
+
+        is_valid, order_result = self._execute_rebalance(
+            bar=bar,
+            action_index=action_index,
+            target_frac=target_frac,
+            cash_pre=cash_pre,
+            position_pre=position_pre,
+            current_price=current_price,
+        )
+
+        return self._record_step(
+            bar=bar,
+            action_index=action_index,
+            was_greedy=was_greedy,
+            target_frac=target_frac,
+            current_price=current_price,
+            cash_pre=cash_pre,
+            position_pre=position_pre,
+            portfolio_pre=portfolio_pre,
+            is_valid=is_valid,
+            order_result=order_result,
+        )
+
+    def _decide_action(
+        self,
+        bar: BarData,
+        cash_pre: float,
+    ) -> tuple[int, bool, float] | None:
+        """Advance the rolling window and ask the agent for an action.
+
+        Returns ``None`` while the normalizer is still warming up; otherwise
+        returns ``(action_index, was_greedy, target_allocation_frac)`` and
+        emits the per-step action/Q TB scalars as a side-effect.
+        """
         ready = self.normalizer.update(bar)
         if not ready:
             LOGGER.debug(
@@ -277,23 +313,39 @@ class MomentumLiveTrader:
         live_q_values = getattr(self.agent, "_last_select_q_values", None)
         self._emit_action_and_q_scalars(action_index, live_q_values)
 
-        current_price = float(bar.close)
-        portfolio_value = cash_pre + max(0.0, position_pre * current_price)
-        position_value = max(0.0, position_pre * current_price)
-        current_frac = position_value / max(portfolio_value, 1e-9)
-        delta_frac = target_frac - current_frac
-        delta_value = target_frac * portfolio_value - position_value
-
         LOGGER.info(
             "[%s] action selected | ts=%s | action=%d (%.0f%%) | price=%.2f | cash=%.2f | position=%.6f",
             self.symbol,
             bar.timestamp,
             action_index,
             target_frac * 100,
-            current_price,
+            float(bar.close),
             cash_pre,
-            position_pre,
+            self.portfolio_state.position,
         )
+        return action_index, was_greedy, target_frac
+
+    def _execute_rebalance(
+        self,
+        *,
+        bar: BarData,
+        action_index: int,
+        target_frac: float,
+        cash_pre: float,
+        position_pre: float,
+        current_price: float,
+    ) -> tuple[bool, dict[str, object] | None]:
+        """Translate ``target_frac`` into a buy/sell order (or a no-op).
+
+        Returns ``(is_valid, order_result)``. ``is_valid`` is ``False`` only
+        when a broker order was attempted and rejected; no-op rebalances
+        (below ``min_rebalance_pct``) still count as valid.
+        """
+        portfolio_value = cash_pre + max(0.0, position_pre * current_price)
+        position_value = max(0.0, position_pre * current_price)
+        current_frac = position_value / max(portfolio_value, 1e-9)
+        delta_frac = target_frac - current_frac
+        delta_value = target_frac * portfolio_value - position_value
 
         is_valid = True
         order_result: dict[str, object] | None = None
@@ -305,7 +357,9 @@ class MomentumLiveTrader:
                 abs(delta_frac) * 100,
                 self.min_rebalance_pct * 100,
             )
-        elif delta_value > 0:
+            return is_valid, order_result
+
+        if delta_value > 0:
             buy_cash = min(delta_value, cash_pre)
             if buy_cash / max(portfolio_value, 1e-9) < self.min_rebalance_pct:
                 LOGGER.debug("[%s] buy cash below min notional, skipping", self.symbol)
@@ -350,6 +404,23 @@ class MomentumLiveTrader:
                 if is_valid:
                     self.portfolio_state = new_ps
 
+        return is_valid, order_result
+
+    def _record_step(
+        self,
+        *,
+        bar: BarData,
+        action_index: int,
+        was_greedy: bool,
+        target_frac: float,
+        current_price: float,
+        cash_pre: float,
+        position_pre: float,
+        portfolio_pre: float,
+        is_valid: bool,
+        order_result: dict[str, object] | None,
+    ) -> dict[str, object]:
+        """Finalise bookkeeping after the rebalance phase and emit the decision dict."""
         if self.portfolio_state.position > 1e-9:
             self.bars_in_position += 1
         else:
@@ -364,7 +435,7 @@ class MomentumLiveTrader:
         self._maybe_emit_trade_close(position_pre)
         self._global_step += 1
 
-        decision = {
+        decision: dict[str, object] = {
             "symbol": self.symbol,
             "timestamp": bar.timestamp,
             "action_index": action_index,
@@ -423,7 +494,12 @@ class MomentumLiveTrader:
         if self.portfolio_state.position > 1e-9 and self.portfolio_state.position_price > 1e-9:
             unrealized_pnl = (price - self.portfolio_state.position_price) / self.portfolio_state.position_price
 
-        safe_initial = max(self.prev_portfolio_value, 1e-9)
+        # Match training's feature[4] exactly: cumulative_fees are normalized
+        # against the constant initial balance, not the current portfolio value.
+        # Using the live portfolio value here would silently shift the feature
+        # distribution vs. what the agent saw during training (see
+        # `get_observation_at_step` in momentum_env/data.py).
+        safe_initial = max(float(self.config.initial_balance), 1e-9)
 
         return np.array(
             [
@@ -709,7 +785,7 @@ class MomentumLiveTrader:
         if hasattr(value, "isoformat"):
             try:
                 return value.isoformat()
-            except Exception:  # pragma: no cover - defensive
+            except (AttributeError, TypeError, ValueError):  # pragma: no cover - defensive
                 return str(value)
         return str(value)
 
@@ -726,7 +802,7 @@ class MomentumLiveTrader:
             return None
         try:  # pragma: no cover - import-time path varies by env
             from torch.utils.tensorboard import SummaryWriter
-        except Exception as exc:  # pragma: no cover - defensive
+        except ImportError as exc:  # pragma: no cover - defensive
             LOGGER.warning("Could not import SummaryWriter (%s); live TB disabled", exc)
             return None
         # flush_secs=1 caps how long a scalar can sit in the background queue

@@ -20,46 +20,63 @@ from momentum_agent.model import RainbowNetwork
 # --- Test Configuration ---
 @pytest.fixture(scope="module")
 def default_config():
-    """Provides a default configuration dictionary for the agent."""
+    """Provides a default configuration dictionary for the agent.
+
+    Must include every key listed in :class:`momentum_agent.config_schema.AgentConfig`
+    since the agent validates via ``from_dict`` at construction and raises on
+    any missing key (see ``.cursor/rules/no-defaults.mdc``).
+    """
     return {
         "seed": 42,
         "gamma": 0.99,
         "lr": 1e-4,
-        "replay_buffer_size": 1000,  # Keep small for tests
-        "batch_size": 4,  # Small batch size for tests
-        "target_update_freq": 5,  # Frequent updates for testing
+        "replay_buffer_size": 1000,
+        "batch_size": 4,
+        "target_update_freq": 5,
+        "polyak_tau": 0.005,
         "num_atoms": 51,
         "v_min": -1,
         "v_max": 1,
         "alpha": 0.6,
         "beta_start": 0.4,
-        "beta_frames": 100,  # Short annealing for tests
+        "beta_frames": 100,
         "n_steps": 3,
         "window_size": 10,
         "n_features": 12,
         "hidden_dim": 64,
-        "num_actions": 3,  # e.g., Hold, Buy, Sell
-        "debug": True,  # Enable debug checks
+        "num_actions": 3,
+        "debug": True,
+        "store_partial_n_step": False,
         "grad_clip_norm": 10.0,
         "epsilon_start": 0.3,
         "epsilon_end": 0.01,
         "epsilon_decay_steps": 1000,
         "entropy_coeff": 0.03,
-        # Add missing network params required by RainbowNetwork
-        "transformer_nhead": 2,  # Value from test_model config
-        "transformer_layers": 1,  # Value from test_model config
-        "dropout": 0.1,  # Value from test_model config
-        # Rename transformer_nhead to nhead for consistency with error? Check RainbowNetwork init
-        # --> Checking model.py: RainbowNetwork expects nhead, n_layers, dropout directly
         "nhead": 2,
-        "num_encoder_layers": 1,  # Add correct key
-        "dim_feedforward": 256,  # hidden_dim * 4 = 64 * 4
-        "transformer_dropout": 0.1,  # Add missing key
+        "num_encoder_layers": 1,
+        "dim_feedforward": 256,
+        "transformer_dropout": 0.1,
+        # Diagnostic logging cadences (0 disables).
+        "categorical_logging_interval": 2000,
+        "categorical_logging_percentiles": [5, 25, 50, 75, 95],
+        "noisy_sigma_logging_interval": 0,
+        "q_value_logging_interval": 0,
+        "q_value_histogram_interval": 0,
+        "grad_logging_interval": 0,
+        "target_net_logging_interval": 0,
+        "td_error_logging_interval": 0,
+        # Tier 2.1 auxiliary head.
+        "aux_loss_weight": 0.1,
+        "aux_target_feature_index": 6,
+        # Scheduler.
+        "lr_scheduler_enabled": False,
+        "lr_scheduler_type": "StepLR",
+        "lr_scheduler_params": {},
     }
 
 
 # --- Test Agent Instance ---
-@pytest.fixture(scope="function")  # Recreate agent for each test function
+@pytest.fixture
 def agent(default_config):
     """Creates a RainbowDQNAgent instance for testing."""
     # Use CUDA if available, otherwise CPU - respect actual device availability
@@ -324,8 +341,9 @@ def test_learn_step(agent, default_config):
     mock_next_market = np.random.rand(batch_size, default_config["window_size"], default_config["n_features"]).astype(np.float32)
     mock_next_account = np.random.rand(batch_size, ACCOUNT_STATE_DIM).astype(np.float32)
     mock_done = np.zeros(batch_size, dtype=np.bool_)  # Assume not done for simplicity
-    # Create mock batch data (previously used for mocking)
-    (
+    # Mock batch data retained above for reference; mocking removed
+
+    _ = (
         mock_market,
         mock_account,
         mock_action,
@@ -334,7 +352,6 @@ def test_learn_step(agent, default_config):
         mock_next_account,
         mock_done,
     )
-
     # Mocking removed
     # mocker.patch.object(
     #     agent.buffer, "sample", return_value=(mock_batch, mock_indices, mock_weights)
@@ -357,7 +374,7 @@ def test_learn_step(agent, default_config):
 
     # Check if network parameters changed
     params_changed = False
-    for p_initial, p_final in zip(initial_net_params, agent.network.parameters()):
+    for p_initial, p_final in zip(initial_net_params, agent.network.parameters(), strict=False):
         if not torch.equal(p_initial, p_final):
             params_changed = True
             break
@@ -398,13 +415,13 @@ def test_target_network_update(agent, default_config):
     online_params = [p.clone().detach() for p in agent.network.parameters()]
 
     tau = agent.polyak_tau
-    for p_initial, p_final, p_online in zip(initial_target_params, final_target_params, online_params):
+    for p_initial, p_final, p_online in zip(initial_target_params, final_target_params, online_params, strict=False):
         expected = (1.0 - tau) * p_initial + tau * p_online
         assert torch.allclose(p_final, expected, atol=1e-6), "Polyak soft update did not produce expected result."
 
     # Check if target params are different from initial target params
     params_updated = False
-    for p_initial, p_final in zip(initial_target_params, final_target_params):
+    for p_initial, p_final in zip(initial_target_params, final_target_params, strict=False):
         if not torch.equal(p_initial, p_final):
             params_updated = True
             break

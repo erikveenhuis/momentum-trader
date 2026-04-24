@@ -9,7 +9,7 @@ from momentum_core.logging import get_logger
 from .constants import ACCOUNT_STATE_DIM
 
 # Get logger instance
-logger = get_logger("TransformerModel")
+logger = get_logger(__name__)
 
 
 # --- Start: Noisy Linear Layer ---
@@ -221,6 +221,34 @@ class RainbowNetwork(nn.Module):
                 m.reset_parameters()
         nn.init.zeros_(self.cls_token)
 
+    def _encode_market(self, market_data: torch.Tensor) -> torch.Tensor:
+        """Run the (expensive) Transformer encoder once and return the CLS token.
+
+        Shared by :meth:`forward` and :meth:`predict_return` so a single
+        training step does only one encoder pass instead of two. At batch 8192
+        this shaves ~128 ms/step (see Tier 2.1 in the cleanup plan).
+        """
+        batch_size = market_data.shape[0]
+        market_emb = self.feature_embedding(market_data)
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        market_emb = torch.cat([cls_tokens, market_emb], dim=1)
+        market_emb = self.pos_encoder(market_emb)
+        market_features = self.transformer_encoder(market_emb)
+        return market_features[:, 0, :]  # CLS output: (B, hidden_dim)
+
+    def _heads_from_cls(self, cls_out: torch.Tensor, account_state: torch.Tensor) -> torch.Tensor:
+        """Compute log_probs from a cached CLS encoding + account state."""
+        batch_size = cls_out.shape[0]
+        account_features = self.account_processor(account_state)
+        shared_features = torch.cat([cls_out, account_features], dim=1)
+        shared_features = self.head_norm(shared_features)
+
+        value_logits = self.value_stream(shared_features).view(batch_size, 1, self.num_atoms)
+        advantage_logits = self.advantage_stream(shared_features).view(batch_size, self.num_actions, self.num_atoms)
+        q_logits = value_logits + advantage_logits - advantage_logits.mean(dim=1, keepdim=True)
+        q_logits = torch.clamp(q_logits, min=-1e4, max=1e4)
+        return F.log_softmax(q_logits, dim=2)
+
     def forward(self, market_data: torch.Tensor, account_state: torch.Tensor) -> torch.Tensor:
         if self.debug_mode:
             if market_data.ndim != 3:
@@ -236,67 +264,10 @@ class RainbowNetwork(nn.Module):
             if market_data.shape[0] != account_state.shape[0]:
                 raise ValueError("Batch size mismatch between market_data and account_state")
 
-        batch_size = market_data.shape[0]
-
-        market_emb = self.feature_embedding(market_data)
-        if self.debug_mode and market_emb.shape != (batch_size, self.window_size, self.hidden_dim):
-            raise ValueError("market_emb shape mismatch")
-
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-        market_emb = torch.cat([cls_tokens, market_emb], dim=1)
-        if self.debug_mode and market_emb.shape != (batch_size, self.window_size + 1, self.hidden_dim):
-            raise ValueError("market_emb shape with CLS token mismatch")
-
-        market_emb = self.pos_encoder(market_emb)
-        if self.debug_mode and market_emb.shape != (batch_size, self.window_size + 1, self.hidden_dim):
-            raise ValueError("market_emb shape after pos_encoder mismatch")
-
-        market_features = self.transformer_encoder(market_emb)
-        if self.debug_mode and market_features.shape != (batch_size, self.window_size + 1, self.hidden_dim):
-            raise ValueError("market_features shape mismatch")
-
-        market_agg = market_features[:, 0, :]
-        if self.debug_mode and market_agg.shape != (batch_size, self.hidden_dim):
-            raise ValueError("market_agg shape mismatch")
-
-        account_features = self.account_processor(account_state)
-        if self.debug_mode and account_features.shape != (batch_size, self.hidden_dim // 4):
-            raise ValueError("account_features shape mismatch")
-
-        shared_features = torch.cat([market_agg, account_features], dim=1)
-        expected_shared_dim = self.hidden_dim + self.hidden_dim // 4
-        if self.debug_mode and shared_features.shape != (batch_size, expected_shared_dim):
-            raise ValueError("shared_features shape mismatch")
-
-        shared_features = self.head_norm(shared_features)
-
-        value_logits = self.value_stream(shared_features)
-        if self.debug_mode and value_logits.shape != (batch_size, self.num_atoms):
-            raise ValueError("value_logits shape mismatch")
-
-        advantage_logits = self.advantage_stream(shared_features)
-        if self.debug_mode and advantage_logits.shape != (batch_size, self.num_actions * self.num_atoms):
-            raise ValueError("advantage_logits shape mismatch")
-
-        value_logits = value_logits.view(batch_size, 1, self.num_atoms)
-        advantage_logits = advantage_logits.view(batch_size, self.num_actions, self.num_atoms)
-
-        q_logits = value_logits + advantage_logits - advantage_logits.mean(dim=1, keepdim=True)
-        q_logits = torch.clamp(q_logits, min=-1e4, max=1e4)
+        cls_out = self._encode_market(market_data)
+        log_probs = self._heads_from_cls(cls_out, account_state)
 
         if self.debug_mode:
-            if q_logits.shape != (batch_size, self.num_actions, self.num_atoms):
-                raise ValueError("q_logits shape mismatch")
-            if torch.isnan(q_logits).any():
-                raise ValueError("NaN detected in q_logits before log_softmax")
-            if torch.isinf(q_logits).any():
-                raise ValueError("Inf detected in q_logits before log_softmax")
-
-        log_probs = F.log_softmax(q_logits, dim=2)
-
-        if self.debug_mode:
-            if log_probs.shape != (batch_size, self.num_actions, self.num_atoms):
-                raise ValueError("log_probs shape mismatch")
             if torch.isnan(log_probs).any():
                 raise ValueError("NaN detected in final log_probs")
             if torch.isinf(log_probs).any():
@@ -304,15 +275,28 @@ class RainbowNetwork(nn.Module):
 
         return log_probs
 
+    def forward_with_cls(self, market_data: torch.Tensor, account_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (log_probs, cls_out) with a single encoder pass.
+
+        Used by the training loss so the auxiliary return-prediction head can
+        reuse the Transformer output instead of running a second full encoder
+        pass via :meth:`predict_return`.
+        """
+        cls_out = self._encode_market(market_data)
+        log_probs = self._heads_from_cls(cls_out, account_state)
+        return log_probs, cls_out
+
     def predict_return(self, market_data: torch.Tensor) -> torch.Tensor:
-        """Auxiliary head: predict next-step log return from CLS features."""
-        market_emb = self.feature_embedding(market_data)
-        batch_size = market_data.shape[0]
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-        market_emb = torch.cat([cls_tokens, market_emb], dim=1)
-        market_emb = self.pos_encoder(market_emb)
-        market_features = self.transformer_encoder(market_emb)
-        cls_out = market_features[:, 0, :]
+        """Auxiliary head: predict next-step log return from CLS features.
+
+        Kept for backward-compat with callers outside ``_compute_loss``. The
+        training loop uses :meth:`forward_with_cls` + :meth:`aux_from_cls` to
+        avoid the duplicated encoder pass.
+        """
+        return self.aux_from_cls(self._encode_market(market_data))
+
+    def aux_from_cls(self, cls_out: torch.Tensor) -> torch.Tensor:
+        """Apply the auxiliary return-prediction head to a cached CLS encoding."""
         return self.aux_return_head(cls_out).squeeze(-1)
 
     def get_q_values(self, market_data: torch.Tensor, account_state: torch.Tensor) -> torch.Tensor:

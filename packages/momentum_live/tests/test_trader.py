@@ -216,3 +216,84 @@ def test_process_bar_ignores_other_symbols():
     trader = MomentumLiveTrader(agent=agent, symbol="BTC/USD", config=config)
     timestamp = datetime.now(UTC)
     assert trader.process_bar(BarData("ETH/USD", 1.0, 1.0, 1.0, 1.0, 1.0, timestamp)) is None
+
+
+def test_account_state_cumulative_fees_match_training_observation():
+    """Live `_account_state` must normalize cumulative fees by the constant
+    ``initial_balance`` just like the training-side ``get_observation_at_step``.
+
+    Regression for the bug where live used ``prev_portfolio_value`` (current
+    portfolio value), which silently shifted the feature[4] distribution as
+    soon as the portfolio drifted away from the initial balance.
+    """
+
+    from momentum_env.data import MarketData, get_observation_at_step
+
+    config = _make_live_config()
+    trader = MomentumLiveTrader(
+        agent=_StubAgent([0]),
+        symbol="BTC/USD",
+        config=config,
+    )
+
+    initial_balance = float(config.initial_balance)
+    position = 0.5
+    price = 80.0
+    cumulative_fees = 3.0
+    cash = 20.0
+    bars_in_position = 10
+    position_price = 100.0
+
+    trader.last_price = price
+    trader.bars_in_position = bars_in_position
+    trader.portfolio_state.position = position
+    trader.portfolio_state.position_price = position_price
+    trader.portfolio_state.total_transaction_cost = cumulative_fees
+    # Simulate portfolio drift: prev_portfolio_value != initial_balance.
+    trader.prev_portfolio_value = position * price + cash
+
+    live_state = trader._account_state(cash)
+
+    window_size = config.window_size
+    feature_names = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "transactions",
+        "log_ret_1",
+        "log_ret_5",
+        "log_ret_10",
+        "realized_vol",
+        "volume_ratio",
+        "hl_range_ratio",
+    ]
+    dummy_features = np.zeros((window_size, len(feature_names)), dtype=np.float32)
+    market_data = MarketData(
+        close_prices=np.full(window_size, price, dtype=np.float32),
+        features=dummy_features,
+        feature_names=feature_names,
+        data_length=window_size,
+        window_size=window_size,
+    )
+    train_obs = get_observation_at_step(
+        market_data=market_data,
+        step=window_size - 1,
+        position=position,
+        balance=cash,
+        initial_balance=initial_balance,
+        current_price=price,
+        position_price=position_price,
+        bars_in_position=bars_in_position,
+        cumulative_fees_frac=cumulative_fees,
+    )
+
+    np.testing.assert_allclose(
+        live_state[4],
+        train_obs["account_state"][4],
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    # Whole vector should match too (position, balance, pnl, time, fees).
+    np.testing.assert_allclose(live_state, train_obs["account_state"], rtol=1e-5, atol=1e-5)

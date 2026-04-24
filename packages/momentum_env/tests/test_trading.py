@@ -121,49 +121,6 @@ def test_invalid_actions(trading_logic, portfolio_state):
     assert not is_valid
 
 
-def test_apply_trade(trading_logic, portfolio_state):
-    """Test trade application."""
-    current_price = 100.0
-
-    # Test hold action
-    new_state, is_valid = trading_logic.apply_trade(
-        portfolio_state=portfolio_state,
-        current_price=current_price,
-        action=0,  # Hold
-        action_value=0.0,
-    )
-    assert is_valid  # Hold should always be valid
-    assert new_state == portfolio_state  # State should be unchanged
-
-    # Test buy action
-    new_state, is_valid = trading_logic.apply_trade(
-        portfolio_state=portfolio_state,
-        current_price=current_price,
-        action=1,  # Buy
-        action_value=0.5,
-    )
-    assert is_valid  # Buy should be valid here
-    assert new_state.balance < portfolio_state.balance
-    assert new_state.position > portfolio_state.position
-
-    # Test sell action (after setting up a position)
-    portfolio_state_with_pos = PortfolioState(
-        balance=portfolio_state.balance,  # Start with original balance
-        position=1.0,
-        position_price=90.0,
-        total_transaction_cost=0.0,
-    )
-    new_state, is_valid = trading_logic.apply_trade(
-        portfolio_state=portfolio_state_with_pos,  # Use state with position
-        current_price=current_price,
-        action=2,  # Sell
-        action_value=0.5,
-    )
-    assert is_valid  # Sell should be valid here
-    assert new_state.balance > portfolio_state_with_pos.balance
-    assert new_state.position < portfolio_state_with_pos.position
-
-
 def test_calculate_reward_pnl(trading_logic):
     """Test PnL component of reward (benchmark-relative)."""
     trading_logic.reset_peak(10000.0)

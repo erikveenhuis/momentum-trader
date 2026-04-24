@@ -1,5 +1,4 @@
 import math
-import os  # Added for save/load path handling
 import random
 from collections import deque
 from contextlib import contextmanager
@@ -12,68 +11,49 @@ import torch.optim.lr_scheduler as lr_scheduler
 from momentum_core.logging import get_logger
 from torch.amp import autocast
 
+from .agent_checkpoint import (
+    AgentCheckpointMixin,
+    _load_state_dict_with_orig_mod_fallback,
+    _maybe_unwrap_orig_mod_state_dict,
+    _maybe_wrap_orig_mod_state_dict,
+)
+from .agent_compile import compile_networks_or_raise
+from .agent_diagnostics import AgentDiagnosticsMixin
 from .buffer import PrioritizedReplayBuffer
+from .config_schema import AgentConfig
 from .constants import ACCOUNT_STATE_DIM  # Import constant
 from .model import RainbowNetwork
 
 # Get logger instance
-logger = get_logger("Agent")
+logger = get_logger(__name__)
+
+# Re-exported for backward-compat with external callers / tests.
+__all__ = [
+    "RainbowDQNAgent",
+    "_load_state_dict_with_orig_mod_fallback",
+    "_maybe_unwrap_orig_mod_state_dict",
+    "_maybe_wrap_orig_mod_state_dict",
+]
 
 
-def _maybe_unwrap_orig_mod_state_dict(state_dict: dict) -> dict:
-    """If ``state_dict`` was saved from ``torch.compile`` (``OptimizedModule``), keys are ``_orig_mod.*``; map to plain module keys."""
-
-    if not state_dict:
-        return state_dict
-    keys = list(state_dict.keys())
-    if not keys:
-        return state_dict
-    if all(isinstance(k, str) and k.startswith("_orig_mod.") for k in keys):
-        return {k[len("_orig_mod.") :]: v for k, v in state_dict.items()}
-    return state_dict
+def _network_forward_with_cls(
+    network: torch.nn.Module,
+    market_data: torch.Tensor,
+    account_state: torch.Tensor,
+):
+    """Call RainbowNetwork.forward_with_cls, unwrapping torch.compile if needed."""
+    target = getattr(network, "_orig_mod", network)
+    return target.forward_with_cls(market_data, account_state)
 
 
-def _maybe_wrap_orig_mod_state_dict(state_dict: dict) -> dict:
-    """Reverse of :func:`_maybe_unwrap_orig_mod_state_dict`.
-
-    If ``state_dict`` has plain keys but we're loading into an
-    ``OptimizedModule``, add the ``_orig_mod.`` prefix back. Returns the
-    original dict unchanged if any key already has the prefix (so we don't
-    double-prefix).
-    """
-
-    if not state_dict:
-        return state_dict
-    keys = list(state_dict.keys())
-    if not keys:
-        return state_dict
-    if any(isinstance(k, str) and k.startswith("_orig_mod.") for k in keys):
-        return state_dict
-    return {f"_orig_mod.{k}": v for k, v in state_dict.items()}
-
-
-def _load_state_dict_with_orig_mod_fallback(module: torch.nn.Module, state_dict: dict) -> None:
-    try:
-        module.load_state_dict(state_dict)
-    except Exception:
-        unwrapped = _maybe_unwrap_orig_mod_state_dict(state_dict)
-        if unwrapped is not state_dict:
-            try:
-                module.load_state_dict(unwrapped)
-                logger.info("Loaded weights from torch.compile checkpoint (_orig_mod keys) into eager module.")
-                return
-            except Exception:
-                pass
-        wrapped = _maybe_wrap_orig_mod_state_dict(state_dict)
-        if wrapped is not state_dict:
-            module.load_state_dict(wrapped)
-            logger.info("Loaded weights from eager checkpoint (plain keys) into torch.compile module.")
-            return
-        raise
+def _network_aux_from_cls(network: torch.nn.Module, cls_out: torch.Tensor) -> torch.Tensor:
+    """Call RainbowNetwork.aux_from_cls, unwrapping torch.compile if needed."""
+    target = getattr(network, "_orig_mod", network)
+    return target.aux_from_cls(cls_out)
 
 
 # --- Start: Rainbow DQN Agent ---
-class RainbowDQNAgent:
+class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
     """
     Rainbow DQN Agent incorporating:
     - Distributional RL (C51)
@@ -84,17 +64,22 @@ class RainbowDQNAgent:
     - Noisy Nets for exploration
     """
 
-    def __init__(self, config: dict, device: str = "cuda", scaler=None, inference_only: bool = False):
+    def __init__(self, config: dict, device: str = "cuda", inference_only: bool = False):
         """
         Initializes the Rainbow DQN Agent.
 
         Args:
             config (dict): A dictionary containing all hyperparameters and network settings.
             device (str): The device to run the agent on ('cuda' or 'cpu').
-            scaler: Deprecated, kept for checkpoint compatibility. Ignored.
             inference_only: If True, build for forward-only use (live trading, CPU allowed, no
                 ``torch.compile`` requirement, small replay buffer). Training must use
                 ``inference_only=False`` with CUDA.
+
+        Notes:
+            The old ``scaler`` parameter (``torch.cuda.amp.GradScaler``) was removed;
+            we now use bfloat16 autocast which doesn't need loss scaling. Old
+            checkpoints with a ``scaler_state_dict`` entry still load — see
+            :meth:`load_state`, which pops the key if present.
         """
         self.inference_only = inference_only
         cfg = dict(config)
@@ -102,6 +87,10 @@ class RainbowDQNAgent:
             cfg["batch_size"] = 1
             orig_rb = int(cfg.get("replay_buffer_size", 1_000_000))
             cfg["replay_buffer_size"] = min(orig_rb, 4096)
+
+        # Validate all required keys up front (loud failure, no silent fallbacks).
+        # See ``.cursor/rules/no-defaults.mdc`` and ``config_schema.AgentConfig``.
+        self._cfg = AgentConfig.from_dict(cfg)
 
         self.config = cfg
         self.device = self._resolve_device(device)
@@ -122,85 +111,66 @@ class RainbowDQNAgent:
         elif self.device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError(f"CUDA device requested for inference_only agent but CUDA is not available (got device={self.device}).")
 
-        # Use direct access for mandatory parameters
-        self.seed = config["seed"]
-        self.gamma = config["gamma"]
-        self.lr = config["lr"]
-        self.batch_size = config["batch_size"]
-        self.target_update_freq = config["target_update_freq"]
-        self.polyak_tau = config.get("polyak_tau", 0.005)
-        self.n_steps = config["n_steps"]
-        self.num_atoms = config["num_atoms"]
-        self.v_min = config["v_min"]
-        self.v_max = config["v_max"]
-        self.num_actions = config["num_actions"]
-        self.window_size = config["window_size"]
-        self.n_features = config["n_features"]
-        self.hidden_dim = config["hidden_dim"]
-        self.replay_buffer_size = config["replay_buffer_size"]
-        self.alpha = config["alpha"]
-        self.beta_start = config["beta_start"]
-        self.beta_frames = config["beta_frames"]
-        self.grad_clip_norm = config["grad_clip_norm"]
-        self.epsilon_start = float(config["epsilon_start"])
-        self.epsilon_end = float(config["epsilon_end"])
-        self.epsilon_decay_steps = int(config["epsilon_decay_steps"])
-        self.entropy_coeff = float(config["entropy_coeff"])
-        self.store_partial_n_step = self.config.get("store_partial_n_step", False)
-        self.categorical_logging_interval = int(config.get("categorical_logging_interval", 2000))
+        # All tunables now sourced from the validated dataclass — no more
+        # silent-default fallbacks. Keys that fail range-validation in
+        # ``AgentConfig.__post_init__``/``_validate_agent_config`` have already
+        # raised.
+        c = self._cfg
+        self.seed = c.seed
+        self.gamma = c.gamma
+        self.lr = c.lr
+        self.batch_size = c.batch_size
+        self.target_update_freq = c.target_update_freq
+        self.polyak_tau = c.polyak_tau
+        self.n_steps = c.n_steps
+        self.num_atoms = c.num_atoms
+        self.v_min = c.v_min
+        self.v_max = c.v_max
+        self.num_actions = c.num_actions
+        self.window_size = c.window_size
+        self.n_features = c.n_features
+        self.hidden_dim = c.hidden_dim
+        self.replay_buffer_size = c.replay_buffer_size
+        self.alpha = c.alpha
+        self.beta_start = c.beta_start
+        self.beta_frames = c.beta_frames
+        self.grad_clip_norm = c.grad_clip_norm
+        self.epsilon_start = float(c.epsilon_start)
+        self.epsilon_end = float(c.epsilon_end)
+        self.epsilon_decay_steps = int(c.epsilon_decay_steps)
+        self.entropy_coeff = float(c.entropy_coeff)
+        self.store_partial_n_step = c.store_partial_n_step
+        self.categorical_logging_interval = int(c.categorical_logging_interval)
         if self.categorical_logging_interval <= 0:
-            logger.warning("categorical_logging_interval must be a positive integer; falling back to default of 2000 learner steps.")
-            self.categorical_logging_interval = 2000
-        # Tier 3a: NoisyNet sigma stats. Default cadence matches categorical
-        # logging so the diagnostics line up on the same time axis. Set to 0 to
-        # disable.
-        self.noisy_sigma_logging_interval = int(config.get("noisy_sigma_logging_interval", self.categorical_logging_interval))
-        if self.noisy_sigma_logging_interval < 0:
-            logger.warning("noisy_sigma_logging_interval must be >= 0; disabling NoisyNet sigma logging.")
-            self.noisy_sigma_logging_interval = 0
-        # Tier 3b: Q-value scalar stats are cheap; default to log every 250
-        # learn steps. The histogram is far heavier so it gets its own (longer)
-        # cadence (~10x slower).
-        self.q_value_logging_interval = int(config.get("q_value_logging_interval", 250))
-        if self.q_value_logging_interval < 0:
-            logger.warning("q_value_logging_interval must be >= 0; disabling Q-value logging.")
-            self.q_value_logging_interval = 0
-        self.q_value_histogram_interval = int(config.get("q_value_histogram_interval", max(self.q_value_logging_interval * 10, 2500)))
-        if self.q_value_histogram_interval < 0:
-            self.q_value_histogram_interval = 0
-        # Tier 3c: gradient norms + param-update-ratio. Same-cadence as Q-value
-        # scalars by default — both are cheap and benefit from being plotted on
-        # a shared time axis.
-        self.grad_logging_interval = int(config.get("grad_logging_interval", self.q_value_logging_interval or 250))
-        if self.grad_logging_interval < 0:
-            logger.warning("grad_logging_interval must be >= 0; disabling gradient diagnostics.")
-            self.grad_logging_interval = 0
-        # Tier 3d: target-network deviation. Polyak runs every learn step so we
-        # MUST throttle — the L2 sweep over every param tensor is otherwise the
-        # most expensive thing in the train loop. Default = same cadence as
-        # gradient stats, since these are diagnostic siblings.
-        self.target_net_logging_interval = int(config.get("target_net_logging_interval", self.grad_logging_interval or 250))
-        if self.target_net_logging_interval < 0:
-            logger.warning("target_net_logging_interval must be >= 0; disabling target-net diagnostics.")
-            self.target_net_logging_interval = 0
+            raise ValueError(f"categorical_logging_interval must be a positive integer, got {self.categorical_logging_interval}")
+        # Tier 3a/3b/3c/3d diagnostic cadences. Set to 0 in YAML to disable.
+        self.noisy_sigma_logging_interval = max(0, int(c.noisy_sigma_logging_interval))
+        self.q_value_logging_interval = max(0, int(c.q_value_logging_interval))
+        self.q_value_histogram_interval = max(0, int(c.q_value_histogram_interval))
+        self.grad_logging_interval = max(0, int(c.grad_logging_interval))
+        self.target_net_logging_interval = max(0, int(c.target_net_logging_interval))
+        self.td_error_logging_interval = max(0, int(c.td_error_logging_interval))
         # Cumulative counter, surfaced as ``Train/TargetNet/SoftUpdates``. Lets
         # the caller verify Polyak is actually running at the expected cadence.
         self._soft_update_count: int = 0
-        raw_percentiles = config.get("categorical_logging_percentiles", [5, 25, 50, 75, 95])
         filtered_percentiles: list[float] = []
-        for value in raw_percentiles if isinstance(raw_percentiles, (list, tuple)) else [raw_percentiles]:
+        for value in c.categorical_logging_percentiles:
             try:
                 numeric = float(value)
             except (TypeError, ValueError):
                 continue
             if 0 < numeric < 100:
                 filtered_percentiles.append(numeric)
-        if filtered_percentiles:
-            self.categorical_logging_percentiles = sorted(filtered_percentiles)
-        else:
-            self.categorical_logging_percentiles = [5.0, 25.0, 50.0, 75.0, 95.0]
-        # Optional flags can still use .get()
-        self.debug_mode = config.get("debug", False)
+        if not filtered_percentiles:
+            raise ValueError(
+                "categorical_logging_percentiles must contain at least one value in (0, 100), "
+                f"got {list(c.categorical_logging_percentiles)}"
+            )
+        self.categorical_logging_percentiles = sorted(filtered_percentiles)
+        # Tier 2.1: auxiliary return-prediction head config (required, no default).
+        self.aux_loss_weight = float(c.aux_loss_weight)
+        self.aux_target_feature_index = int(c.aux_target_feature_index)
+        self.debug_mode = c.debug
         self.scaler = None  # GradScaler removed; bfloat16 autocast doesn't need it
         # Setup seeds
         np.random.seed(self.seed)
@@ -250,96 +220,33 @@ class RainbowDQNAgent:
         self.network = RainbowNetwork(config=self.config, device=self.device).to(self.device)
         self.target_network = RainbowNetwork(config=self.config, device=self.device).to(self.device)
 
-        # # Check if PyTorch version >= 2.0 to use torch.compile
-        # if int(torch.__version__.split('.')[0]) >= 2:
-        #     logger.info("Applying torch.compile to network and target_network.")
-        #     # Add error handling in case compile fails on specific setups
-        #     try:
-        #         # Try the default compilation mode first
-        #         self.network = torch.compile(self.network)
-        #         self.target_network = torch.compile(self.target_network)
-        #         logger.info("torch.compile applied successfully with default mode.")
-        #     except ImportError as imp_err: # Catch potential import errors if compile isn't fully set up
-        #          logger.warning(f"torch.compile skipped due to potential import issue: {imp_err}. Proceeding without compilation.")
-        #     except Exception as e:
-        #          # Check if it's the TritonMissing error specifically
-        #          # Check class name string as direct import might fail if torch._inductor isn't available
-        #          if "TritonMissing" in str(e.__class__):
-        #              logger.warning(f"torch.compile failed as Triton backend is not available (common on non-Linux/CUDA setups): {e}. Proceeding without compilation.")
-        #          else:
-        #              logger.warning(f"torch.compile failed with an unexpected error: {e}. Proceeding without compilation.")
-        # else:
-        #     logger.warning("torch version < 2.0, torch.compile not available.")
-
         self.target_network.load_state_dict(self.network.state_dict())
         self.target_network.eval()  # Target network is not trained directly
 
         if not self.inference_only:
-            # REQUIRE torch.compile for optimal performance (training path)
-            if not hasattr(torch, "compile"):
-                raise RuntimeError(
-                    "torch.compile is not available in this PyTorch version. Please upgrade to PyTorch 2.0+ for optimal performance."
-                )
-
-            logger.info("Applying torch.compile to network and target_network (REQUIRED for training).")
-            compile_success = False
-
-            # Try different compilation modes in order of preference
-            compile_modes = ["default", "reduce-overhead", "max-autotune"]
-
-            for mode in compile_modes:
-                try:
-                    logger.info(f"Trying torch.compile with mode='{mode}'...")
-                    compiled_network = torch.compile(self.network, mode=mode)
-                    compiled_target_network = torch.compile(self.target_network, mode=mode)
-
-                    # Test compilation by running a small forward pass
-                    with torch.no_grad():
-                        test_market = torch.zeros((1, self.window_size, self.n_features), device=self.device)
-                        test_account = torch.zeros((1, ACCOUNT_STATE_DIM), device=self.device)
-                        _ = compiled_network(test_market, test_account)
-
-                    # Only assign if compilation and test succeeded
-                    self.network = compiled_network
-                    self.target_network = compiled_target_network
-                    logger.info(f"torch.compile applied successfully with mode='{mode}'.")
-                    compile_success = True
-                    break
-
-                except ImportError as imp_err:
-                    logger.error(f"torch.compile mode '{mode}' failed due to import issue: {imp_err}.")
-                except RuntimeError as runtime_err:
-                    # Handle cases where compilation fails due to backend issues
-                    if "Triton" in str(runtime_err) or "triton" in str(runtime_err).lower():
-                        logger.error(f"torch.compile mode '{mode}' failed due to Triton backend issues: {runtime_err}.")
-                    else:
-                        logger.error(f"torch.compile mode '{mode}' failed with runtime error: {runtime_err}.")
-                except Exception as e:
-                    logger.error(f"torch.compile mode '{mode}' failed with unexpected error: {e}.")
-
-            if not compile_success:
-                raise RuntimeError(
-                    "All torch.compile modes failed. torch.compile is REQUIRED for training. "
-                    "Please ensure you have:\n"
-                    "1. CUDA-compatible GPU\n"
-                    "2. GCC compiler installed (sudo apt install build-essential)\n"
-                    "3. Python development headers (sudo apt install python3-dev)\n"
-                    "4. Working Triton installation\n"
-                    "Training cannot proceed without compilation optimization."
-                )
+            self.network, self.target_network = compile_networks_or_raise(
+                self.network,
+                self.target_network,
+                device=self.device,
+                window_size=self.window_size,
+                n_features=self.n_features,
+            )
         else:
             logger.info("inference_only=True: skipping torch.compile (eager inference for live / CPU).")
 
         # Optimizer
         self.optimizer = optim.Adam(self.network.parameters(), lr=self.lr)
 
-        # Learning Rate Scheduler Initialization (moved after optimizer init)
-        self.lr_scheduler_enabled = self.config.get("lr_scheduler_enabled", False)  # Get from self.config
+        # Learning Rate Scheduler Initialization (moved after optimizer init).
+        # All three keys (enabled/type/params) are now required in YAML and
+        # surfaced via ``AgentConfig`` — no silent fallback to the old
+        # ``StepLR`` default if a config drops them.
+        self.lr_scheduler_enabled = self._cfg.lr_scheduler_enabled
         self.scheduler = None
         self._scheduler_requires_metric = False
         if self.lr_scheduler_enabled:
-            scheduler_type = self.config.get("lr_scheduler_type", "StepLR")
-            scheduler_params = self.config.get("lr_scheduler_params", {})
+            scheduler_type = self._cfg.lr_scheduler_type
+            scheduler_params = dict(self._cfg.lr_scheduler_params)
 
             # Ensure optimizer is defined before scheduler initialization
             if hasattr(self, "optimizer") and self.optimizer is not None:
@@ -549,7 +456,12 @@ class RainbowDQNAgent:
             if self.debug_mode:
                 assert isinstance(action, int), f"Selected action is not an integer: {action}"
                 assert 0 <= action < self.num_actions, f"Selected action ({action}) is out of bounds [0, {self.num_actions})"
-            self._last_select_q_values = q_values.detach().to(torch.float32).cpu().numpy().reshape(-1)
+            # Tier 2.2: only the live trader consumes ``_last_select_q_values``.
+            # In training_mode, no consumer reads it and the D->H sync every
+            # action is pure overhead. Skip the copy unless we're evaluating
+            # or live-trading.
+            if not self.training_mode:
+                self._last_select_q_values = q_values.detach().to(torch.float32).cpu().numpy().reshape(-1)
 
         was_greedy = True
         if self.training_mode and random.random() < self.current_epsilon:
@@ -999,328 +911,6 @@ class RainbowDQNAgent:
 
             return m
 
-    def _accumulate_categorical_target_stats(self, target_distribution: torch.Tensor) -> None:
-        """Accumulates categorical target distributions for periodic logging."""
-        if self.categorical_logging_interval <= 0 or target_distribution is None:
-            return
-
-        if target_distribution.numel() == 0:
-            return
-
-        try:
-            batch_mass = target_distribution.detach().sum(dim=0).to(device="cpu", dtype=torch.float64).numpy()
-        except (RuntimeError, ValueError) as error:
-            logger.warning(f"Failed to accumulate categorical target stats: {error}")
-            return
-
-        if not np.isfinite(batch_mass).all():
-            logger.warning("Non-finite values encountered while accumulating categorical target stats; skipping update.")
-            return
-
-        self._categorical_target_accumulator["mass"] += batch_mass
-        self._categorical_target_accumulator["samples"] += target_distribution.shape[0]
-
-    def _log_categorical_target_stats(self) -> None:
-        """Logs histogram and percentiles for accumulated categorical target distributions."""
-        accumulator = self._categorical_target_accumulator
-
-        total_samples = accumulator["samples"]
-        if total_samples == 0:
-            return
-
-        mass = accumulator["mass"]
-        total_mass = mass.sum()
-        if not np.isfinite(total_mass) or total_mass <= 0:
-            logger.warning("Invalid total mass encountered while logging categorical target stats; resetting accumulator.")
-            accumulator["mass"].fill(0.0)
-            accumulator["samples"] = 0
-            return
-
-        probs = mass / total_mass
-        if not np.isfinite(probs).all():
-            logger.warning("Non-finite probabilities encountered in categorical target stats; resetting accumulator.")
-            accumulator["mass"].fill(0.0)
-            accumulator["samples"] = 0
-            return
-
-        cdf = np.cumsum(probs)
-        percentile_strings = []
-        for percentile in self.categorical_logging_percentiles:
-            target = percentile / 100.0
-            idx = int(np.searchsorted(cdf, target, side="left"))
-            idx = min(max(idx, 0), self.num_atoms - 1)
-            percentile_strings.append(f"{percentile:.1f}%={self.support_cpu[idx]:.4f}")
-
-        mean_value = float(np.dot(probs, self.support_cpu))
-        edge_min = float(probs[0])
-        edge_max = float(probs[-1])
-
-        # Build {percentile -> support_value} mapping for both logs and TB scalars.
-        percentile_values: dict[float, float] = {}
-        for percentile in self.categorical_logging_percentiles:
-            target = percentile / 100.0
-            idx = int(np.searchsorted(cdf, target, side="left"))
-            idx = min(max(idx, 0), self.num_atoms - 1)
-            percentile_values[float(percentile)] = float(self.support_cpu[idx])
-
-        logger.info(
-            "Categorical target stats at learn step %s (accumulated over %s samples): mean=%.4f, edge_mass=(min=%.4f, max=%.4f), percentiles=[%s]",
-            self.total_steps,
-            total_samples,
-            mean_value,
-            edge_min,
-            edge_max,
-            ", ".join(percentile_strings),
-        )
-        logger.info(
-            "Categorical target histogram (avg prob per atom, sum=1.0): %s",
-            np.array2string(probs, precision=4, suppress_small=True),
-        )
-
-        # Tier 1c: mirror categorical-target diagnostics to TensorBoard.
-        if self.tb_writer is not None:
-            try:
-                step = int(self.total_steps)
-                self.tb_writer.add_scalar("Train/CategoricalTarget/Mean", mean_value, step)
-                self.tb_writer.add_scalar("Train/CategoricalTarget/Edge_Mass_Min", edge_min, step)
-                self.tb_writer.add_scalar("Train/CategoricalTarget/Edge_Mass_Max", edge_max, step)
-                self.tb_writer.add_scalar("Train/CategoricalTarget/Samples", float(total_samples), step)
-                for percentile, support_value in percentile_values.items():
-                    tag = f"Train/CategoricalTarget/P{percentile:g}"
-                    self.tb_writer.add_scalar(tag, support_value, step)
-                # Histogram: weighted distribution over the 101 atoms.
-                # Use the per-atom probability directly so the TB histogram view shows
-                # the full target distribution shape.
-                self.tb_writer.add_histogram(
-                    "Train/CategoricalTarget/Distribution",
-                    probs.astype(np.float32),
-                    step,
-                )
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.debug("Failed to mirror categorical target stats to TensorBoard: %s", exc)
-
-        accumulator["mass"].fill(0.0)
-        accumulator["samples"] = 0
-
-    def _log_n_step_reward_window_stats(self) -> None:
-        """Logs statistics of the rolling n-step reward window to logger and TensorBoard.
-
-        Tier 1e: realized n-step returns are mirrored to TB so they can be compared
-        directly against the categorical target distribution (Tier 1c) and PER stats
-        (Tier 1d) on the same time axis.
-        """
-        if len(self.n_step_reward_window) == 0:
-            return
-        try:
-            rewards_array = np.fromiter(self.n_step_reward_window, dtype=float)
-        except ValueError:  # pragma: no cover - safeguard
-            logger.warning("Could not materialize n-step reward window for stats.")
-            return
-
-        min_r = float(rewards_array.min())
-        max_r = float(rewards_array.max())
-        mean_r = float(rewards_array.mean())
-        std_r = float(rewards_array.std(ddof=0))
-        window_len = len(self.n_step_reward_window)
-
-        logger.info(
-            "N-Step Reward Window (last %s learns): Min=%.4f, Max=%.4f, Mean=%.4f, Std=%.4f",
-            window_len,
-            min_r,
-            max_r,
-            mean_r,
-            std_r,
-        )
-
-        if self.tb_writer is not None:
-            try:
-                step = int(self.total_steps)
-                self.tb_writer.add_scalar("Train/NStepReward/Mean", mean_r, step)
-                self.tb_writer.add_scalar("Train/NStepReward/Std", std_r, step)
-                self.tb_writer.add_scalar("Train/NStepReward/Min", min_r, step)
-                self.tb_writer.add_scalar("Train/NStepReward/Max", max_r, step)
-                self.tb_writer.add_scalar("Train/NStepReward/WindowSize", float(window_len), step)
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.debug(
-                    "Failed to mirror n-step reward window stats to TensorBoard: %s",
-                    exc,
-                )
-
-    def _log_grad_stats(self, pre_clip_norm: torch.Tensor | float | None) -> None:
-        """Mirror gradient norms + param-update-ratio per module group to TB.
-
-        Tier 3c. Called immediately after :func:`torch.nn.utils.clip_grad_norm_`
-        and before :meth:`optimizer.step`, so:
-
-        * ``Train/Grad/Norm`` reports the *pre-clip* global L2 norm — this is
-          what would have been applied without clipping. Watching it spike past
-          ``grad_clip_norm`` quickly explains otherwise-invisible loss plateaus.
-        * ``Train/Grad/PerGroup/{group}/Norm`` mirrors per-top-level-module
-          gradients (encoder, advantage stream, etc.). A single dominating
-          group is the canonical signature of a wonky aux head or transformer
-          collapse.
-        * ``Train/ParamUpdateRatio`` ≈ ``lr * ||grad|| / ||param||`` — the
-          textbook "is the optimizer actually moving the weights?" metric.
-        """
-        if self.tb_writer is None or self.network is None:
-            return
-        step = int(self.total_steps + 1)
-        # Use the underlying compiled module so group names are clean
-        # (no ``_orig_mod`` prefix injected by torch.compile).
-        net = getattr(self.network, "_orig_mod", self.network)
-        try:
-            if pre_clip_norm is not None:
-                norm_val = float(pre_clip_norm) if not torch.is_tensor(pre_clip_norm) else float(pre_clip_norm.item())
-                if math.isfinite(norm_val):
-                    self.tb_writer.add_scalar("Train/Grad/Norm", norm_val, step)
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.debug("Failed to mirror Train/Grad/Norm: %s", exc)
-
-        # Per-top-level-module group L2 norms.
-        group_grad_sq: dict[str, float] = {}
-        group_param_sq: dict[str, float] = {}
-        try:
-            for name, param in net.named_parameters():
-                if param.grad is None:
-                    continue
-                group = name.split(".", 1)[0] or "root"
-                g_sq = float(param.grad.detach().pow(2).sum().item())
-                p_sq = float(param.detach().pow(2).sum().item())
-                if not (math.isfinite(g_sq) and math.isfinite(p_sq)):
-                    continue
-                group_grad_sq[group] = group_grad_sq.get(group, 0.0) + g_sq
-                group_param_sq[group] = group_param_sq.get(group, 0.0) + p_sq
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.debug("Failed to compute per-group grad stats: %s", exc)
-            return
-
-        try:
-            for group in sorted(group_grad_sq):
-                self.tb_writer.add_scalar(
-                    f"Train/Grad/PerGroup/{group}/Norm",
-                    math.sqrt(group_grad_sq[group]),
-                    step,
-                )
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.debug("Failed to mirror per-group grad norms: %s", exc)
-
-        # Param-update ratio: lr * ||grad|| / ||param||. Computed across the
-        # whole network so we get a single, comparable scalar per step.
-        try:
-            total_grad = math.sqrt(sum(group_grad_sq.values()))
-            total_param = math.sqrt(sum(group_param_sq.values()))
-            lr = float(self.optimizer.param_groups[0].get("lr", 0.0)) if self.optimizer is not None else 0.0
-            if total_param > 0 and math.isfinite(total_grad) and math.isfinite(lr):
-                ratio = (lr * total_grad) / total_param
-                if math.isfinite(ratio):
-                    self.tb_writer.add_scalar("Train/ParamUpdateRatio", ratio, step)
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.debug("Failed to mirror Train/ParamUpdateRatio: %s", exc)
-
-    def _log_q_value_stats(self, *, emit_histogram: bool = False) -> None:
-        """Mirror Q-value distribution stats from the most recent training batch.
-
-        Tier 3b. Reads the cached online ``[B, num_actions]`` Q tensor stashed
-        by :meth:`_compute_loss` and emits:
-
-        * ``Train/Q/Mean`` / ``Train/Q/Std``
-        * ``Train/Q/MaxAcrossActions`` / ``Train/Q/MinAcrossActions``
-        * ``Train/Q/ActionMargin`` — mean over the batch of ``q_max - q_2nd``,
-          a direct readout of how *decisive* the policy is. A collapsing margin
-          flags the canonical "policy goes flat" failure mode.
-        * ``Train/Q/PerAction/Mean/{0..num_actions-1}``
-        * ``Train/Q/Distribution`` (histogram, sub-sampled cadence)
-
-        All emissions are silent no-ops if the writer or the cached tensor are
-        missing — keeps the call idempotent for tests / CPU smoke runs.
-        """
-        if self.tb_writer is None:
-            return
-        q = getattr(self, "_last_batch_q", None)
-        if q is None:
-            return
-        try:
-            q_np = q.detach().to(torch.float32).cpu().numpy()
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.debug("Failed to materialize cached Q-values: %s", exc)
-            return
-        if q_np.ndim != 2 or q_np.size == 0:
-            return
-        step = int(self.total_steps)
-        try:
-            self.tb_writer.add_scalar("Train/Q/Mean", float(q_np.mean()), step)
-            self.tb_writer.add_scalar("Train/Q/Std", float(q_np.std(ddof=0)), step)
-            self.tb_writer.add_scalar("Train/Q/MaxAcrossActions", float(q_np.max()), step)
-            self.tb_writer.add_scalar("Train/Q/MinAcrossActions", float(q_np.min()), step)
-            # Per-batch action margin: top-1 minus top-2 across the action axis,
-            # averaged over the batch. Robust to ties / single-action collapse.
-            sorted_q = np.sort(q_np, axis=1)
-            if sorted_q.shape[1] >= 2:
-                margin = float((sorted_q[:, -1] - sorted_q[:, -2]).mean())
-                self.tb_writer.add_scalar("Train/Q/ActionMargin", margin, step)
-            for action_idx in range(q_np.shape[1]):
-                self.tb_writer.add_scalar(
-                    f"Train/Q/PerAction/Mean/{action_idx}",
-                    float(q_np[:, action_idx].mean()),
-                    step,
-                )
-            if emit_histogram:
-                try:
-                    self.tb_writer.add_histogram("Train/Q/Distribution", q_np.astype(np.float32), step)
-                except Exception as exc:  # pragma: no cover - defensive
-                    logger.debug("Failed to emit Train/Q/Distribution histogram: %s", exc)
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.debug("Failed to mirror Q-value stats to TB: %s", exc)
-
-    def _log_noisy_sigma_stats(self) -> None:
-        """Mirror NoisyLinear sigma stats per module to TensorBoard.
-
-        Tier 3a. Tracks ``Train/Noisy/{module}/SigmaMean/Max/Min`` for every
-        :class:`NoisyLinear` layer in the online network. Sigma collapse is the
-        canonical NoisyNet failure mode (the agent stops exploring); this lets
-        us catch it early without parsing distributions by eye. The target
-        network is intentionally excluded — its noise is independent and has no
-        bearing on the policy that's currently being optimized.
-        """
-        if self.tb_writer is None or self.network is None:
-            return
-        # Walk the *underlying* network so torch.compile wrappers don't pollute
-        # the module path with ``_orig_mod`` segments.
-        net = getattr(self.network, "_orig_mod", self.network)
-        try:
-            from .model import NoisyLinear  # local import to avoid cycles
-        except Exception:  # pragma: no cover - defensive
-            return
-        step = int(self.total_steps)
-        all_means: list[float] = []
-        for name, module in net.named_modules():
-            if not isinstance(module, NoisyLinear):
-                continue
-            tag = name.replace(".", "/") if name else "root"
-            try:
-                w_sigma = module.weight_sigma.detach().abs()
-                b_sigma = module.bias_sigma.detach().abs()
-                sigma_mean = float((w_sigma.sum() + b_sigma.sum()) / (w_sigma.numel() + b_sigma.numel()))
-                sigma_max = float(max(w_sigma.max().item(), b_sigma.max().item()))
-                sigma_min = float(min(w_sigma.min().item(), b_sigma.min().item()))
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.debug("Failed to read NoisyLinear sigma for %s: %s", name, exc)
-                continue
-            try:
-                self.tb_writer.add_scalar(f"Train/Noisy/{tag}/SigmaMean", sigma_mean, step)
-                self.tb_writer.add_scalar(f"Train/Noisy/{tag}/SigmaMax", sigma_max, step)
-                self.tb_writer.add_scalar(f"Train/Noisy/{tag}/SigmaMin", sigma_min, step)
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.debug("Failed to mirror NoisyLinear sigma to TB: %s", exc)
-                continue
-            all_means.append(sigma_mean)
-        if all_means:
-            try:
-                self.tb_writer.add_scalar("Train/Noisy/AggregateSigmaMean", float(np.mean(all_means)), step)
-                self.tb_writer.add_scalar("Train/Noisy/ModuleCount", float(len(all_means)), step)
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.debug("Failed to mirror aggregate NoisyLinear sigma to TB: %s", exc)
-
     def reset_noisy_sigma(self, std_init: float | None = None) -> int:
         """Re-initialise sigma parameters of every NoisyLinear layer in-place.
 
@@ -1385,7 +975,7 @@ class RainbowDQNAgent:
             try:
                 step = int(self.total_steps)
                 self.tb_writer.add_scalar("Agent/NoisySigmaReset", float(online_count), step)
-            except Exception as exc:  # pragma: no cover - defensive
+            except (OSError, RuntimeError, ValueError) as exc:  # pragma: no cover - defensive
                 logger.debug("Failed to log Agent/NoisySigmaReset: %s", exc)
         return online_count
 
@@ -1496,8 +1086,11 @@ class RainbowDQNAgent:
             # ---------------------------------------- #
 
             # --- Calculate Online Distribution and Loss --- #
-            # Get log probabilities Z(s_t, a) from the online network
-            log_ps = self.network(market_data_batch, account_state_batch)  # [B, num_actions, num_atoms]
+            # Tier 2.1: one encoder pass feeds both the distributional head and
+            # the auxiliary return-prediction head. The old code called
+            # ``self.network.predict_return(...)`` afterwards, forcing a second
+            # full Transformer forward pass at ~128 ms/step at batch 8192.
+            log_ps, cls_out = _network_forward_with_cls(self.network, market_data_batch, account_state_batch)
             if self.debug_mode:
                 assert log_ps.shape == (
                     self.batch_size,
@@ -1534,12 +1127,16 @@ class RainbowDQNAgent:
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Loss calculation resulted in NaN or Inf: {loss.item()}")
 
-            aux_pred = self.network.predict_return(market_data_batch)
-            log_ret_col = 6
+            # Tier 2.1: auxiliary return-prediction head reuses the CLS
+            # encoding computed above. Previous implementation called
+            # ``predict_return`` which ran the full Transformer encoder a
+            # second time on the same batch.
+            aux_pred = _network_aux_from_cls(self.network, cls_out)
+            log_ret_col = self.aux_target_feature_index
             if market_data_batch.shape[2] > log_ret_col:
                 target_return = market_data_batch[:, -1, log_ret_col].detach()
                 aux_loss = torch.nn.functional.mse_loss(aux_pred, target_return)
-                loss = loss + 0.1 * aux_loss
+                loss = loss + self.aux_loss_weight * aux_loss
 
             # --- Action entropy regularization --- #
             if self.entropy_coeff > 0:
@@ -1569,13 +1166,19 @@ class RainbowDQNAgent:
         loss = loss.float()
         td_errors_tensor = td_errors_tensor.float()
 
-        td_errors_np = td_errors_tensor.detach().cpu().numpy()
-        td_mean = float(td_errors_np.mean())
-        td_std = float(td_errors_np.std())
-        self.last_td_error_stats = {
-            "mean": td_mean,
-            "std": td_std,
-        }
+        # Tier 2.2: only sync TD-error mean/std to host when the logging
+        # interval fires. Previously this copied the whole batch every step
+        # even though ``last_td_error_stats`` was only read every 100 learn
+        # steps. Keep the reductions on device and use ``.item()`` so only two
+        # scalars cross the bus.
+        if self.td_error_logging_interval > 0 and (self.total_steps % self.td_error_logging_interval == 0):
+            with torch.no_grad():
+                td_mean_t = td_errors_tensor.mean()
+                td_std_t = td_errors_tensor.std(unbiased=False)
+            self.last_td_error_stats = {
+                "mean": float(td_mean_t.item()),
+                "std": float(td_std_t.item()),
+            }
 
         return loss, td_errors_tensor
 
@@ -1638,12 +1241,10 @@ class RainbowDQNAgent:
         # Step LR scheduler when appropriate (no-op for schedulers that require validation metrics)
         self._step_scheduler()
 
-        # Update priorities in PER using the TD errors (ensure they are positive)
-        # Add a small epsilon to prevent priorities of 0
-        priorities = td_errors_tensor.cpu().numpy() + 1e-6
-        if not np.isfinite(priorities).all():
-            raise FloatingPointError("Non-finite priorities calculated for PER update")
-        self.buffer.update_priorities(tree_indices, td_errors_tensor)  # Pass tree_indices and the original tensor
+        # Tier 2.2: the buffer accepts the raw TD-error tensor; the prior
+        # ``priorities = td_errors_tensor.cpu().numpy() + 1e-6`` block was a
+        # dead D->H sync whose result was never read. Deleted.
+        self.buffer.update_priorities(tree_indices, td_errors_tensor)
 
         # Reset noise in Noisy Linear layers (important!)
         self.network.reset_noise()
@@ -1729,14 +1330,14 @@ class RainbowDQNAgent:
         if should_log:
             try:
                 acc = 0.0
-                for tp, op in zip(self.target_network.parameters(), self.network.parameters()):
+                for tp, op in zip(self.target_network.parameters(), self.network.parameters(), strict=False):
                     acc += float((op.data - tp.data).pow(2).sum().item())
                 deviation_sq = acc
-            except Exception as exc:  # pragma: no cover - defensive
+            except (RuntimeError, ValueError) as exc:  # pragma: no cover - defensive
                 logger.debug("Failed to compute target-net param deviation: %s", exc)
                 deviation_sq = None
 
-        for tp, op in zip(self.target_network.parameters(), self.network.parameters()):
+        for tp, op in zip(self.target_network.parameters(), self.network.parameters(), strict=False):
             tp.data.mul_(1.0 - tau).add_(op.data, alpha=tau)
         logger.debug(f"Target network soft-updated (tau={tau}).")
 
@@ -1746,256 +1347,8 @@ class RainbowDQNAgent:
                 self.tb_writer.add_scalar("Train/TargetNet/SoftUpdates", float(self._soft_update_count), step)
                 if deviation_sq is not None and math.isfinite(deviation_sq):
                     self.tb_writer.add_scalar("Train/TargetNet/ParamDeviation", math.sqrt(deviation_sq), step)
-            except Exception as exc:  # pragma: no cover - defensive
+            except (OSError, RuntimeError, ValueError) as exc:  # pragma: no cover - defensive
                 logger.debug("Failed to mirror target-net diagnostics: %s", exc)
-
-    def save_model(self, path_prefix):
-        """Saves the agent's model and optimizer state."""
-        if self.network is None or self.optimizer is None:
-            logger.error("Network or optimizer not initialized. Cannot save model.")
-            return
-
-        # Ensure path_prefix ends with something to distinguish components if needed
-        # For example, if path_prefix is "model_checkpoint", files will be "model_checkpoint_network.pth", etc.
-
-        # --- Create a unified checkpoint dictionary ---
-        checkpoint = {
-            "network_state_dict": self.network.state_dict(),
-            "target_network_state_dict": self.target_network.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "total_steps": self.total_steps,  # Save total steps for resuming
-            "config": self.config,  # Save the agent's config
-            "scaler_state_dict": None,
-        }
-        if self.scheduler and self.lr_scheduler_enabled:
-            checkpoint["scheduler_state_dict"] = self.scheduler.state_dict()
-
-        # Save the unified checkpoint
-        # Path prefix here should ideally be the full path including filename, e.g., "models/my_agent_checkpoint.pt"
-        # If path_prefix is just a directory + base name like "models/rainbow_agent",
-        # we might append "_checkpoint.pt" or similar.
-        # For now, assuming path_prefix is a full path like "models/rainbow_transformer_best_XYZ.pt"
-
-        try:
-            # The path_prefix now includes date, episode, and score, making it unique.
-            # So, we directly save to this path.
-            final_save_path = f"{path_prefix}_agent_checkpoint.pt"  # Distinguish agent chkpt
-
-            # If path_prefix already contains ".pt", we might want to adjust
-            if path_prefix.endswith(".pt"):
-                base_name = path_prefix[:-3]  # Remove .pt
-                final_save_path = f"{base_name}_agent_state.pt"  # Use a more descriptive suffix
-            else:
-                # If it's just a prefix like "models/rainbow_transformer_best"
-                final_save_path = f"{path_prefix}_agent_state.pt"
-
-            torch.save(checkpoint, final_save_path)
-            logger.info(f"Unified agent checkpoint saved to {final_save_path}")
-            logger.info(
-                "  Includes: Network, Target Network, Optimizer, Scaler (if applicable), Scheduler (if applicable), Total Steps, Config"
-            )
-
-        except Exception as e:
-            logger.error(f"Error saving unified agent checkpoint to {final_save_path}: {e}", exc_info=True)
-
-    def load_model(self, path_prefix):
-        """Loads the agent's model and optimizer state from a unified checkpoint."""
-        # --- Path for the unified checkpoint ---
-        # Consistent with how save_model constructs it.
-        # If path_prefix is "models/rainbow_transformer_best_XYZ.pt", then:
-        if path_prefix.endswith(".pt"):
-            base_name = path_prefix[:-3]
-            checkpoint_path = f"{base_name}_agent_state.pt"
-        else:
-            checkpoint_path = f"{path_prefix}_agent_state.pt"  # Fallback if not ending with .pt
-
-        if not os.path.exists(checkpoint_path):
-            logger.error(f"Unified agent checkpoint file not found at {checkpoint_path}. Cannot load model.")
-            return False  # Indicate failure
-
-        try:
-            logger.info(f"Attempting to load unified agent checkpoint from: {checkpoint_path}")
-            # Ensure map_location is correctly set, especially if loading a CUDA-trained model on CPU
-            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-
-            # Load network and target network
-            if "network_state_dict" in checkpoint and self.network is not None:
-                self.network.load_state_dict(checkpoint["network_state_dict"])
-                logger.info("Network state loaded.")
-            else:
-                logger.warning("Network state_dict not found in checkpoint or network not initialized.")
-                return False
-
-            if "target_network_state_dict" in checkpoint and self.target_network is not None:
-                self.target_network.load_state_dict(checkpoint["target_network_state_dict"])
-                logger.info("Target network state loaded.")
-            else:
-                logger.warning("Target network state_dict not found in checkpoint or target_network not initialized.")
-                # This might be acceptable if target network is re-initialized from network after load
-                # but for full resume, it's better to have it.
-
-            # Load optimizer state
-            if "optimizer_state_dict" in checkpoint and self.optimizer is not None:
-                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-                logger.info("Optimizer state loaded.")
-            else:
-                logger.warning("Optimizer state_dict not found in checkpoint or optimizer not initialized.")
-                # Not returning False here, as sometimes one might want to load just weights with a new optimizer
-
-            # Load total steps
-            if "total_steps" in checkpoint:
-                self.total_steps = checkpoint["total_steps"]
-                logger.info(f"Total steps loaded: {self.total_steps}")
-            else:
-                logger.warning("Total steps not found in checkpoint. Resetting to 0.")
-                self.total_steps = 0  # Or handle as error depending on requirements
-
-            # Load scheduler state
-            if "scheduler_state_dict" in checkpoint and self.scheduler and self.lr_scheduler_enabled:
-                try:
-                    self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-                    logger.info("LR Scheduler state loaded.")
-                except Exception as e:
-                    logger.error(
-                        f"Error loading LR scheduler state: {e}. Scheduler may not resume correctly.",
-                        exc_info=True,
-                    )
-            elif self.scheduler and self.lr_scheduler_enabled and "scheduler_state_dict" not in checkpoint:
-                logger.warning("LR Scheduler is enabled but its state was not found in the checkpoint. Scheduler will start fresh.")
-
-            # Optionally, compare or restore config (self.config vs checkpoint['config'])
-            if "config" in checkpoint:
-                # Basic check: e.g., if checkpoint['config']['lr'] != self.config['lr'], log a warning or error.
-                # For now, just log that config was present.
-                logger.info("Agent config found in checkpoint. Consider validating compatibility.")
-            else:
-                logger.warning("Agent config not found in checkpoint.")
-
-            logger.info(f"Agent model and associated states loaded successfully from {checkpoint_path}")
-            self.network.to(self.device)
-            self.target_network.to(self.device)
-            # Ensure target network is synchronised with the online network after loading
-            self._update_target_network()
-            # Ensure optimizer state is also on the correct device after loading
-            # This is generally handled by PyTorch, but good to be mindful of.
-            return True  # Indicate success
-
-        except FileNotFoundError:
-            logger.error(f"Checkpoint file not found at {checkpoint_path}")
-            return False
-        except Exception as e:
-            logger.error(f"Error loading agent checkpoint from {checkpoint_path}: {e}", exc_info=True)
-            return False
-
-    def load_state(self, agent_state_dict: dict):
-        """
-        Loads the agent's state from a dictionary (typically part of a larger checkpoint).
-        This is used by the trainer when resuming.
-
-        Args:
-            agent_state_dict (dict): A dictionary containing the agent's state.
-                                     Expected keys: 'network_state_dict',
-                                                    'target_network_state_dict',
-                                                    'optimizer_state_dict',
-                                                    'total_steps',
-                                                    'scaler_state_dict' (optional),
-                                                    'scheduler_state_dict' (optional).
-        Returns:
-            bool: True if loading was successful, False otherwise.
-        """
-        logger.info("Attempting to load agent state from provided dictionary...")
-
-        if not isinstance(agent_state_dict, dict):
-            logger.error("Provided agent_state_dict is not a dictionary.")
-            return False
-
-        successful_load = True
-
-        # Load network state
-        if "network_state_dict" in agent_state_dict and self.network is not None:
-            try:
-                _load_state_dict_with_orig_mod_fallback(self.network, agent_state_dict["network_state_dict"])
-                self.network.to(self.device)  # Ensure model is on the correct device
-                logger.info("Network state loaded from dictionary.")
-            except Exception as e:
-                logger.error(f"Error loading network state_dict from dictionary: {e}", exc_info=True)
-                successful_load = False
-        else:
-            logger.warning("Network state_dict not found in provided dictionary or agent.network is None.")
-            successful_load = False  # Critical component
-
-        # Load target network state
-        if "target_network_state_dict" in agent_state_dict and self.target_network is not None:
-            try:
-                _load_state_dict_with_orig_mod_fallback(
-                    self.target_network,
-                    agent_state_dict["target_network_state_dict"],
-                )
-                self.target_network.to(self.device)  # Ensure model is on the correct device
-                logger.info("Target network state loaded from dictionary.")
-            except Exception as e:
-                logger.error(f"Error loading target_network state_dict from dictionary: {e}", exc_info=True)
-                # successful_load = False # Could be considered non-critical if re-synced
-        else:
-            logger.warning("Target network state_dict not found in provided dictionary or agent.target_network is None.")
-            # successful_load = False
-
-        # Load optimizer state
-        if "optimizer_state_dict" in agent_state_dict and self.optimizer is not None:
-            try:
-                self.optimizer.load_state_dict(agent_state_dict["optimizer_state_dict"])
-                # Ensure optimizer's state is on the correct device if parameters were moved
-                # This is usually handled by PyTorch loading mechanism if map_location was used or model params are already on device.
-                logger.info("Optimizer state loaded from dictionary.")
-            except Exception as e:
-                logger.error(f"Error loading optimizer state_dict from dictionary: {e}", exc_info=True)
-                # successful_load = False # Can be critical for proper resume
-        else:
-            logger.warning("Optimizer state_dict not found in provided dictionary or agent.optimizer is None.")
-            # successful_load = False
-
-        # Load total steps
-        if "total_steps" in agent_state_dict:
-            self.total_steps = agent_state_dict["total_steps"]
-            logger.info(f"Total steps loaded from dictionary: {self.total_steps}")
-
-        if "agent_env_steps" in agent_state_dict:
-            self.env_steps = agent_state_dict["agent_env_steps"]
-            logger.info(f"Env steps loaded from dictionary: {self.env_steps} (epsilon={self.current_epsilon:.4f})")
-        else:
-            logger.warning("Total steps not found in provided dictionary. Agent's total_steps not updated.")
-            # Consider if this should be an error or if agent's current total_steps is acceptable.
-
-        # Load scheduler state
-        if (
-            "scheduler_state_dict" in agent_state_dict
-            and agent_state_dict["scheduler_state_dict"] is not None
-            and self.scheduler
-            and self.lr_scheduler_enabled
-        ):
-            try:
-                self.scheduler.load_state_dict(agent_state_dict["scheduler_state_dict"])
-                logger.info("LR Scheduler state loaded from dictionary.")
-            except Exception as e:
-                logger.error(
-                    f"Error loading LR scheduler state_dict from dictionary: {e}. Scheduler may not resume correctly.",
-                    exc_info=True,
-                )
-        elif (
-            self.scheduler
-            and self.lr_scheduler_enabled
-            and ("scheduler_state_dict" not in agent_state_dict or agent_state_dict.get("scheduler_state_dict") is None)
-        ):
-            logger.warning("LR Scheduler is enabled but its state was not found in the dictionary. Scheduler will start fresh.")
-
-        # Agent config compatibility check could also be done here if agent_config is part of agent_state_dict
-
-        if successful_load:
-            logger.info("Agent state loaded successfully from dictionary.")
-        else:
-            logger.error("One or more critical components failed to load from the agent state dictionary.")
-
-        return successful_load
 
     def set_training_mode(self, training=True):
         """Sets the agent and network to training or evaluation mode."""
@@ -2038,7 +1391,7 @@ class RainbowDQNAgent:
                 # greedy block.
                 try:
                     self.network.reset_noise()
-                except Exception:  # pragma: no cover - defensive
+                except (AttributeError, RuntimeError):  # pragma: no cover - defensive
                     logger.debug("Failed to reset NoisyNet noise after greedy() exit", exc_info=True)
 
     def _apply_network_mode(self, training: bool) -> None:

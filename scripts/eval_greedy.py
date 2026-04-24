@@ -261,14 +261,14 @@ def _rollout(
         "snapshot_steps": snapshot_steps,
         "snapshot_dists": snapshot_dists,
         "non_a0_triggers": non_a0_triggers,
-        "support": getattr(getattr(agent.network, "_orig_mod", agent.network), "support").detach().cpu().numpy(),
+        "support": getattr(agent.network, "_orig_mod", agent.network).support.detach().cpu().numpy(),
     }
 
 
 def _write_steps_table(steps: list[StepRecord], rewards: list[float], path: Path) -> None:
     """Persist per-step trace as parquet (preferred) or CSV fallback."""
     rows = []
-    for step, r in zip(steps, rewards):
+    for step, r in zip(steps, rewards, strict=False):
         d = asdict(step)
         d["reward"] = float(r)
         rows.append(d)
@@ -362,7 +362,7 @@ def main() -> int:
     device = _select_device(args.allow_cpu)
     logger.info("Greedy eval on device %s; splits=%s", device, splits)
 
-    agent = RainbowDQNAgent(config=agent_cfg, device=device, scaler=None)
+    agent = RainbowDQNAgent(config=agent_cfg, device=device)
 
     model_dir = Path(run_cfg.get("model_dir", "models")).expanduser()
     ckpt_path = (

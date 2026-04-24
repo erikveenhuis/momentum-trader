@@ -43,6 +43,13 @@ agent:
   v_max: 1.0
   categorical_logging_interval: 2000
   categorical_logging_percentiles: [5, 25, 50, 75, 95]
+  # Tier 3a/b/c/d diagnostic cadences. 0 disables the corresponding stream.
+  noisy_sigma_logging_interval: 2000   # matches categorical cadence
+  q_value_logging_interval: 250
+  q_value_histogram_interval: 2500     # 10x the scalar cadence (heavier)
+  grad_logging_interval: 250
+  target_net_logging_interval: 250
+  td_error_logging_interval: 100
   alpha: 0.6            # PER priority exponent
   beta_start: 0.4       # Increased from 0.3; less bias early on
   beta_frames: 200000   # Reduced from 400k; reach full IS correction sooner
@@ -67,6 +74,13 @@ agent:
   polyak_tau: 0.001     # Reduced from 0.005; more inertia in target network for stable bootstraps
   store_partial_n_step: true
   debug: false
+
+  # Tier 2.1: auxiliary return-prediction head (shares the Transformer encoder
+  # with the main distributional head). ``aux_target_feature_index`` is the
+  # column of the ``market_data`` window used as the regression target; in the
+  # current 12-feature schema column 6 is ``log_ret_1``.
+  aux_loss_weight: 0.1
+  aux_target_feature_index: 6
 
 environment:
   window_size: 60

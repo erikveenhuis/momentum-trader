@@ -26,7 +26,7 @@ from .account_registry import BrokerAccountRegistry
 from .broker import BrokerAccountManager, BrokerCredentials
 from .config import parse_symbols
 
-LOGGER = get_logger("momentum_live.reset_cli")
+LOGGER = get_logger(__name__)
 
 
 def _configure_logging(level: str) -> None:
@@ -42,22 +42,19 @@ def _configure_logging(level: str) -> None:
 def _file_lock(lock_path: Path):
     """Advisory exclusive lock so concurrent resets / live runs collide loudly."""
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fp = open(lock_path, "w")
-    try:
+    with open(lock_path, "w") as fp:
         try:
-            fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            if exc.errno in (errno.EAGAIN, errno.EACCES):
-                raise RuntimeError(
-                    f"Reset lock {lock_path} is held by another process. Stop the live runner / other reset before retrying."
-                ) from exc
-            raise
-        yield
-    finally:
-        try:
-            fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
+            try:
+                fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EACCES):
+                    raise RuntimeError(
+                        f"Reset lock {lock_path} is held by another process. Stop the live runner / other reset before retrying."
+                    ) from exc
+                raise
+            yield
         finally:
-            fp.close()
+            fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -128,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.error(str(exc))
         return 2
 
-    print(json.dumps(summaries, indent=2, default=str))
+    sys.stdout.write(json.dumps(summaries, indent=2, default=str) + "\n")
     return 0
 
 

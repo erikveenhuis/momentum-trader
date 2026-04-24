@@ -219,13 +219,12 @@ def run(args: argparse.Namespace) -> dict[str, dict]:
     run_config["skip_evaluation"] = True
 
     init_start = time.perf_counter()
-    agent = RainbowDQNAgent(config=agent_config, device=device, scaler=None)
+    agent = RainbowDQNAgent(config=agent_config, device=device)
     trainer = RainbowTrainerModule(
         agent=agent,
         device=device,
         data_manager=data_manager,
         config=config,
-        scaler=None,
         writer=None,
     )
     timings["agent_trainer_init"] = time.perf_counter() - init_start

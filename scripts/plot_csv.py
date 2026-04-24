@@ -16,7 +16,7 @@ except ImportError:  # pragma: no cover - fallback when runtime package missing
     logging.warning("Could not find momentum_core.logging, using basic config.")
     get_logger = logging.getLogger
 
-logger = get_logger("scripts.plot_csv")
+logger = get_logger(__name__)
 
 
 def configure_logging(log_level: str | None = None) -> None:
@@ -41,7 +41,7 @@ def find_file_in_dir(filename_to_find, search_dir):
     Searches for a file within the specified directory and its subdirectories.
     Returns the full path to the first match found, or None if not found.
     """
-    for root, dirs, files in os.walk(search_dir):
+    for root, _dirs, files in os.walk(search_dir):
         if filename_to_find in files:
             return os.path.join(root, filename_to_find)
     return None

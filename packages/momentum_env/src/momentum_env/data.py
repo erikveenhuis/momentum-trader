@@ -4,22 +4,12 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+from momentum_core.constants import FEATURE_NAMES as _CORE_FEATURE_NAMES
+from momentum_core.constants import N_RAW_FEATURES
 
-N_RAW_FEATURES = 6
-FEATURE_NAMES = [
-    "open",
-    "high",
-    "low",
-    "close",
-    "volume",
-    "transactions",
-    "log_return_1",
-    "log_return_5",
-    "log_return_10",
-    "realized_vol",
-    "volume_ratio",
-    "hl_range_ratio",
-]
+# Re-exported as a ``list`` to preserve the existing mutable-list contract
+# that downstream tests / slicers rely on.
+FEATURE_NAMES = list(_CORE_FEATURE_NAMES)
 
 
 @dataclass

@@ -6,16 +6,16 @@ episode boundaries and per-env data file assignment.
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 import gymnasium as gym
 import numpy as np
+from momentum_core.logging import get_logger
 from momentum_env import TradingEnv, TradingEnvConfig
 
 from .data import DataManager
 
-logger = logging.getLogger("Trainer")
+logger = get_logger(__name__)
 
 
 def _make_train_env(env_config: dict[str, Any], data_path: str) -> TradingEnv:

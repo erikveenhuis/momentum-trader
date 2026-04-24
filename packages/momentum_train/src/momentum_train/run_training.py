@@ -1,43 +1,43 @@
 #!/usr/bin/env python3
 # Main training script for transformer trader (Rainbow DQN version)
 
-import argparse  # Added for command-line arguments
+import argparse
 import json
 import logging
 import os
-import sys  # Added sys module
-import time  # Added for timestamping log directories
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
-import yaml  # Added for config loading
+import yaml
 from momentum_agent import RainbowDQNAgent
 from momentum_core.logging import get_logger, setup_package_logging
 from momentum_env import TradingEnv, TradingEnvConfig
-
-# AMP uses bfloat16 autocast (no GradScaler needed)
-# --- Add TensorBoard import ---
 from torch.utils.tensorboard import SummaryWriter
 
 from .data import DataManager
 from .trainer import RainbowTrainerModule
 from .utils.checkpoint_utils import find_latest_checkpoint, load_checkpoint
+from .utils.memory_utils import configure_glibc_arenas
 from .utils.utils import get_random_data_file, set_seeds
 
-project_root = Path(__file__).resolve().parent.parent.parent.parent.parent
-sys.path.insert(0, str(project_root))
+logger = get_logger(__name__)
 
-# Assume environment, agent (DDPG version), trainer (DDPG version), utils are correct
-# print("Imported TradingEnv") # <-- Removed print
 
-# Use the new unified logging setup function
-# from hyperparameters import parse_args # Import argument parser
+class ResumeFailedError(RuntimeError):
+    """Raised when ``--resume`` was requested but resume could not proceed safely.
 
-# Get logger instance
-logger = get_logger("momentum_train.Main")
+    Intentionally distinct from ``RuntimeError`` so callers / CI can match this
+    specific failure. The rule here is: if the operator asked to resume, we
+    must either resume from a real checkpoint or stop -- silently starting a
+    fresh run erases progress (network weights, PER buffer, TensorBoard run)
+    and will clobber ``rainbow_transformer_final_agent_state.pt`` on the next
+    finalize. The fix is not to recover automatically; it's to surface the
+    problem so the operator can inspect ``models/`` and decide.
+    """
 
 
 DEFAULT_LOG_LEVEL_OVERRIDES: dict[str, Any] = {
@@ -183,7 +183,7 @@ def _emit_trade_metrics(
                 np.asarray(trade_pnls, dtype=np.float32),
                 step,
             )
-        except Exception as exc:  # pragma: no cover - defensive
+        except (OSError, RuntimeError, ValueError) as exc:  # pragma: no cover - defensive
             logger.debug("Failed to emit %s/PnLDistribution histogram: %s", tag_prefix, exc)
 
 
@@ -299,7 +299,7 @@ def evaluate_on_test_data(
 
                 # Per-trade aggregates (Tier 2b) when the evaluation populated trade KPIs.
                 _emit_trade_metrics(writer, "Test/Trade", detailed_results, tb_step)
-            except Exception as exc:  # pragma: no cover - defensive
+            except (OSError, RuntimeError, ValueError, KeyError) as exc:  # pragma: no cover - defensive
                 logger.warning(f"Failed to mirror test results to TensorBoard: {exc}")
 
         # Persist detailed test results alongside validation outputs
@@ -343,11 +343,11 @@ def run_training(
     trainer_config = config["trainer"]
     run_config = config["run"]
 
-    # Get run parameters, using .get() only for genuinely optional/defaultable values
-    model_dir = run_config.get("model_dir", "models")  # Allow default
-    # resume_training = run_config.get('resume', False) # Resume status now comes from flag
-    num_episodes = run_config.get("episodes", 1000)  # Allow default
-    specific_file = run_config.get("specific_file", None)  # Allow default (None)
+    # Required run-level keys — see ``config_schema.RunConfig``. ``specific_file``
+    # is the one genuinely optional toggle (null = train on all files).
+    model_dir = run_config["model_dir"]
+    num_episodes = run_config["episodes"]
+    specific_file = run_config.get("specific_file")
 
     if benchmark_frac_override is not None:
         config.setdefault("run", {})["benchmark_frac_override"] = float(benchmark_frac_override)
@@ -372,7 +372,8 @@ def run_training(
         raise RuntimeError(error_msg)
     logger.info(f"Using {device} device")
 
-    scaler = None  # GradScaler removed; bfloat16 autocast handles mixed precision
+    # GradScaler was removed; bfloat16 autocast handles mixed precision natively
+    # so there's no ``scaler`` to thread through.
 
     # Agent class is fixed for this script
     AgentClass = RainbowDQNAgent
@@ -399,127 +400,213 @@ def run_training(
     # --- End Initialization ---
 
     # --- Load from Checkpoint if resuming ---
+    # Gating rule: when ``resume_training_flag`` is True we MUST either load a
+    # real checkpoint or raise ``ResumeFailedError``. Silent fall-through to
+    # "fresh training" used to overwrite prior artifacts
+    # (``rainbow_transformer_final_agent_state.pt``, the TensorBoard run) and
+    # discarded the ~8 GB PER buffer. If the user wants to start fresh they
+    # must re-run without ``--resume``.
     agent_loaded = False  # Flag to track if agent state was successfully loaded
     if resume_training_flag:
-        # --- MODIFIED: Use find_latest_checkpoint utility ---
         trainer_checkpoint_path = find_latest_checkpoint(model_dir, "checkpoint_trainer")
         if not trainer_checkpoint_path:
-            logger.warning(f"No suitable checkpoint found in {model_dir}. Starting training from scratch.")
-            agent_loaded = False
-        else:
-            logger.info(f"Resume flag is set. Attempting to load unified checkpoint from: {trainer_checkpoint_path}")
+            msg = (
+                f"--resume was requested but no usable checkpoint was found in {model_dir!r}. "
+                "Refusing to silently start from scratch (that would clobber "
+                "rainbow_transformer_final_agent_state.pt and any TensorBoard run on finalize). "
+                "Re-run without --resume if you really want a fresh run, or point --config at "
+                "the correct model_dir."
+            )
+            logger.error(msg)
+            raise ResumeFailedError(msg)
 
-            checkpoint_data = load_checkpoint(trainer_checkpoint_path)
+        logger.info(f"Resume flag is set. Attempting to load unified checkpoint from: {trainer_checkpoint_path}")
 
-            if checkpoint_data:
-                if reset_lr_on_resume:
-                    logger.info("Reset LR on resume requested. Removing optimizer/scheduler/scaler states from checkpoint.")
-                    removed_optimizer = checkpoint_data.pop("optimizer_state_dict", None)
-                    removed_scheduler = checkpoint_data.pop("scheduler_state_dict", None)
-                    removed_scaler = checkpoint_data.pop("scaler_state_dict", None)
-                    if removed_optimizer is not None:
-                        logger.info("  - Optimizer state removed. New optimizer will use config lr=%s.", agent_config.get("lr"))
-                    else:
-                        logger.warning("  - No optimizer state found to remove from checkpoint.")
-                    if removed_scheduler is not None:
-                        logger.info("  - LR scheduler state removed. Scheduler will restart fresh.")
-                    if removed_scaler is not None:
-                        logger.info("  - GradScaler state removed to avoid stale statistics.")
-                logger.info("Unified checkpoint loaded successfully.")
-                # Extract trainer state
-                start_episode = checkpoint_data.get("episode", 0)
-                initial_best_score = checkpoint_data.get("best_validation_metric", -np.inf)
-                initial_early_stopping_counter = checkpoint_data.get("early_stopping_counter", 0)
-                if reset_lr_on_resume and initial_early_stopping_counter:
-                    logger.info(
-                        "Reset LR on resume: resetting early stopping counter from %d to 0.",
-                        initial_early_stopping_counter,
-                    )
-                    initial_early_stopping_counter = 0
-                # Temporary store trainer steps for comparison, agent steps are definitive
-                trainer_steps_from_checkpoint = checkpoint_data.get("total_train_steps", 0)
-                logger.info(
-                    f"Extracted trainer state: Ep={start_episode}, BestScore={initial_best_score:.4f}, EarlyStopCounter={initial_early_stopping_counter}, TrainerSteps={trainer_steps_from_checkpoint}"
-                )
+        checkpoint_data = load_checkpoint(trainer_checkpoint_path)
 
-                # Instantiate the agent *before* loading its state
-                try:
-                    # Validate loaded config if necessary (agent init might do this)
-                    loaded_agent_config = checkpoint_data.get("agent_config")
-                    if loaded_agent_config != agent_config:
-                        logger.warning("Agent config in checkpoint differs from current config file. Using current config.")
-                        # Decide if this should be an error or just a warning
-                        # agent_config = loaded_agent_config # Optionally force use of loaded config
+        if not checkpoint_data:
+            msg = (
+                f"--resume was requested and picked {trainer_checkpoint_path!r}, but the file "
+                "could not be loaded (see preceding CheckpointUtils error). Refusing to "
+                "silently start from scratch. Inspect the file (corrupt? truncated? missing "
+                "required keys?) and either remove / replace it, or re-run without --resume."
+            )
+            logger.error(msg)
+            raise ResumeFailedError(msg)
 
-                    # Pass scaler to Agent constructor
-                    agent = AgentClass(config=agent_config, device=device, scaler=scaler)
-                    logger.info("Agent instantiated. Attempting to load agent state from checkpoint...")
-                    agent_loaded = agent.load_state(checkpoint_data)  # Pass the whole dict
-
-                    if agent_loaded:
-                        buf_state = checkpoint_data.get("buffer_state")
-                        if buf_state and hasattr(agent.buffer, "load_state_dict"):
-                            try:
-                                agent.buffer.load_state_dict(buf_state)
-                                logger.info(f"Replay buffer restored ({len(agent.buffer)} transitions).")
-                            except Exception as e:
-                                logger.warning(f"Could not restore replay buffer: {e}")
-
-                        start_total_steps = trainer_steps_from_checkpoint
-                        if agent.total_steps != trainer_steps_from_checkpoint:
-                            logger.warning(
-                                "Agent total_steps (%s) differ from trainer checkpoint steps (%s). Synchronizing to trainer steps.",
-                                agent.total_steps,
-                                trainer_steps_from_checkpoint,
-                            )
-                            agent.total_steps = trainer_steps_from_checkpoint
-                        logger.info(f"Agent state loaded successfully. Resuming from Trainer Step: {start_total_steps}")
-
-                        if reset_noisy_on_resume:
-                            try:
-                                reset_count = agent.reset_noisy_sigma(std_init=noisy_sigma_init)
-                                logger.info(
-                                    "Reset NoisyNet sigma on resume: %d online + %d target layer(s) refilled (std_init=%s).",
-                                    reset_count,
-                                    reset_count,
-                                    "per-layer" if noisy_sigma_init is None else f"{float(noisy_sigma_init):.4f}",
-                                )
-                            except Exception as exc:
-                                logger.error("Failed to reset NoisyNet sigma on resume: %s", exc, exc_info=True)
-                    else:
-                        # Agent state loading failed, reset trainer progress
-                        logger.error(
-                            "Failed to load agent state from the checkpoint dictionary, even though checkpoint file was loaded. Starting training from scratch."
-                        )
-                        start_episode = 0
-                        start_total_steps = 0
-                        initial_best_score = -np.inf
-                        initial_early_stopping_counter = 0
-                        # Agent instance exists but is fresh
-                        checkpoint_data = None
-                except Exception as e:
-                    logger.error(
-                        f"Error occurred while instantiating agent or loading state from checkpoint: {e}. Starting training from scratch.",
-                        exc_info=True,
-                    )
-                    start_episode = 0
-                    start_total_steps = 0
-                    initial_best_score = -np.inf
-                    initial_early_stopping_counter = 0
-                    agent_loaded = False  # Ensure agent is re-instantiated below
-                    checkpoint_data = None
-
+        if reset_lr_on_resume:
+            logger.info("Reset LR on resume requested. Removing optimizer/scheduler/scaler states from checkpoint.")
+            removed_optimizer = checkpoint_data.pop("optimizer_state_dict", None)
+            removed_scheduler = checkpoint_data.pop("scheduler_state_dict", None)
+            removed_scaler = checkpoint_data.pop("scaler_state_dict", None)
+            if removed_optimizer is not None:
+                logger.info("  - Optimizer state removed. New optimizer will use config lr=%s.", agent_config.get("lr"))
             else:
-                # Checkpoint file not found or failed basic loading/validation
-                logger.warning(f"Failed to load or validate checkpoint file at {trainer_checkpoint_path}. Starting training from scratch.")
-                agent_loaded = False
-        # --- END MODIFIED ---
+                logger.warning("  - No optimizer state found to remove from checkpoint.")
+            if removed_scheduler is not None:
+                logger.info("  - LR scheduler state removed. Scheduler will restart fresh.")
+            if removed_scaler is not None:
+                logger.info("  - GradScaler state removed to avoid stale statistics.")
+        logger.info("Unified checkpoint loaded successfully.")
+        # Extract trainer state
+        start_episode = checkpoint_data.get("episode", 0)
+        initial_best_score = checkpoint_data.get("best_validation_metric", -np.inf)
+        initial_early_stopping_counter = checkpoint_data.get("early_stopping_counter", 0)
+        if reset_lr_on_resume and initial_early_stopping_counter:
+            logger.info(
+                "Reset LR on resume: resetting early stopping counter from %d to 0.",
+                initial_early_stopping_counter,
+            )
+            initial_early_stopping_counter = 0
+        # Temporary store trainer steps for comparison, agent steps are definitive
+        trainer_steps_from_checkpoint = checkpoint_data.get("total_train_steps", 0)
+        logger.info(
+            f"Extracted trainer state: Ep={start_episode}, BestScore={initial_best_score:.4f}, EarlyStopCounter={initial_early_stopping_counter}, TrainerSteps={trainer_steps_from_checkpoint}"
+        )
+
+        # Instantiate the agent *before* loading its state. Any failure here
+        # is terminal under --resume: we don't want to quietly initialize a
+        # fresh network and have `_finalize_training` clobber the existing
+        # `rainbow_transformer_final_agent_state.pt` with untrained weights.
+        try:
+            loaded_agent_config = checkpoint_data.get("agent_config")
+            if loaded_agent_config != agent_config:
+                logger.warning("Agent config in checkpoint differs from current config file. Using current config.")
+
+            agent = AgentClass(config=agent_config, device=device)
+            logger.info("Agent instantiated. Attempting to load agent state from checkpoint...")
+            agent_loaded = agent.load_state(checkpoint_data)
+        except ResumeFailedError:
+            raise
+        except Exception as exc:
+            msg = (
+                f"--resume: instantiating the agent or calling agent.load_state on "
+                f"{trainer_checkpoint_path!r} raised {type(exc).__name__}: {exc}. Refusing "
+                "to fall back to a fresh agent (that path silently discards trained weights "
+                "and later clobbers rainbow_transformer_final_agent_state.pt). Fix the "
+                "checkpoint / config mismatch, or re-run without --resume."
+            )
+            logger.error(msg, exc_info=True)
+            raise ResumeFailedError(msg) from exc
+
+        if not agent_loaded:
+            msg = (
+                f"--resume: agent.load_state returned False for {trainer_checkpoint_path!r} "
+                "even though the checkpoint file was readable. This usually means a required "
+                "key was missing or a tensor-shape mismatch. Refusing to start training from "
+                "scratch silently. Re-run without --resume if a fresh run is really intended."
+            )
+            logger.error(msg)
+            raise ResumeFailedError(msg)
+
+        # --- Restore the replay buffer ---
+        #
+        # Preference order:
+        #   1. Side-car directory next to the .pt (new format, written by
+        #      ``PrioritizedReplayBuffer.save_to_path``). This is the only
+        #      format produced after the memmap migration; it avoids the
+        #      ~10 GiB transient pickle spike that repeatedly OOM-killed
+        #      training during torch.save.
+        #   2. Legacy in-checkpoint ``buffer_state`` dict (pickled deque
+        #      + SumTree arrays). Still honoured so checkpoints written
+        #      before this change can be resumed.
+        #   3. Nothing -- loudly fail, because --resume with no restored
+        #      buffer means training would silently refill 1M transitions
+        #      from warmup, which wastes many hours and is never what the
+        #      user wanted.
+        sidecar_relpath = checkpoint_data.get("buffer_sidecar_relpath")
+        legacy_buf_state = checkpoint_data.get("buffer_state")
+        buffer_restored = False
+        ckpt_dir = Path(trainer_checkpoint_path).parent
+        if sidecar_relpath and hasattr(agent.buffer, "load_from_path"):
+            sidecar_dir = ckpt_dir / sidecar_relpath
+            try:
+                agent.buffer.load_from_path(sidecar_dir)
+                logger.info(
+                    "Replay buffer restored from side-car %s (%d transitions).",
+                    sidecar_dir,
+                    len(agent.buffer),
+                )
+                buffer_restored = True
+            except Exception as exc:
+                msg = (
+                    f"--resume: checkpoint {trainer_checkpoint_path!r} pointed at buffer side-car "
+                    f"{sidecar_dir} but loading it raised {type(exc).__name__}: {exc}. Refusing to "
+                    "silently continue with an empty buffer (which would re-warmup for hours and "
+                    'overwrite the "latest" checkpoint with effectively-fresh weights). If the '
+                    "side-car is known-bad, delete it along with the .pt and re-run --resume to "
+                    "pick the previous checkpoint pair; otherwise re-run without --resume."
+                )
+                logger.error(msg, exc_info=True)
+                raise ResumeFailedError(msg) from exc
+        elif legacy_buf_state and hasattr(agent.buffer, "load_state_dict"):
+            try:
+                agent.buffer.load_state_dict(legacy_buf_state)
+                logger.info(
+                    "Replay buffer restored from legacy in-checkpoint buffer_state (%d transitions). "
+                    "This format is deprecated; the next checkpoint save will emit a side-car instead.",
+                    len(agent.buffer),
+                )
+                buffer_restored = True
+            except Exception as exc:
+                msg = (
+                    f"--resume: legacy buffer_state in {trainer_checkpoint_path!r} could not be "
+                    f"restored ({type(exc).__name__}: {exc}). Refusing to continue with an empty buffer."
+                )
+                logger.error(msg, exc_info=True)
+                raise ResumeFailedError(msg) from exc
+        if not buffer_restored:
+            msg = (
+                f"--resume: {trainer_checkpoint_path!r} has neither a buffer side-car "
+                f"(buffer_sidecar_relpath) nor a legacy buffer_state; there is no replay buffer "
+                "to restore. Refusing to silently continue."
+            )
+            logger.error(msg)
+            raise ResumeFailedError(msg)
+
+        # IMPORTANT: agent.total_steps and trainer.total_train_steps live on
+        # *different axes* and must not be collapsed into one another:
+        #   - trainer.total_train_steps counts *environment steps* taken across
+        #     the vectorized rollout loop. It is the X-axis for trainer-side
+        #     scalars (episode rewards, portfolio value, env-step throughput).
+        #   - agent.total_steps counts *learner calls* (one per agent.learn()
+        #     invocation). It is the X-axis for agent-side scalars
+        #     (Train/Loss, Train/CategoricalTarget/Mean, PER beta, NoisyNet
+        #     sigma, Q-value histograms, etc.).
+        # There is no fixed ratio between them (train_frequency,
+        # gradient_updates_per_step, warmup, and num_vector_envs all skew it),
+        # so overwriting one with the other corrupts the axis that was
+        # clobbered. A previous resume path did exactly that -- it set
+        # `agent.total_steps = trainer_steps_from_checkpoint` -- which on
+        # every resume produced a huge forward jump in the agent-indexed
+        # TensorBoard tags (e.g. Train/CategoricalTarget/Mean skipping from
+        # ~86k to ~866k), leaving long gaps that looked like "missing data".
+        # Keep them independent: the trainer resumes from its env-step
+        # checkpoint value, and agent.total_steps was already restored inside
+        # agent.load_state() from the per-agent counter in the checkpoint.
+        start_total_steps = trainer_steps_from_checkpoint
+        logger.info(
+            "Agent state loaded successfully. Resuming from trainer env step: %d (agent learn step: %d).",
+            start_total_steps,
+            int(agent.total_steps),
+        )
+
+        if reset_noisy_on_resume:
+            try:
+                reset_count = agent.reset_noisy_sigma(std_init=noisy_sigma_init)
+                logger.info(
+                    "Reset NoisyNet sigma on resume: %d online + %d target layer(s) refilled (std_init=%s).",
+                    reset_count,
+                    reset_count,
+                    "per-layer" if noisy_sigma_init is None else f"{float(noisy_sigma_init):.4f}",
+                )
+            except Exception as exc:
+                logger.error("Failed to reset NoisyNet sigma on resume: %s", exc, exc_info=True)
 
     # --- Ensure agent is instantiated if not loaded during resume attempt ---
     if not agent_loaded:
         logger.info("Instantiating fresh agent.")
-        # Pass scaler to Agent constructor
-        agent = AgentClass(config=agent_config, device=device, scaler=scaler)
+        agent = AgentClass(config=agent_config, device=device)
 
     assert isinstance(agent, RainbowDQNAgent), "Agent not instantiated correctly"
     logger.info(f"Agent instantiated with {sum(p.numel() for p in agent.network.parameters()):,} parameters.")
@@ -565,12 +652,8 @@ def run_training(
         agent=agent,
         device=device,
         data_manager=data_manager,
-        config=config,  # Pass the full config to the trainer
-        scaler=scaler,  # Pass scaler to Trainer constructor
-        writer=writer,  # Pass the TensorBoard writer
-        # Remove handler passing, as root logger handles it now
-        # train_log_handler=train_log_handler,
-        # validation_log_handler=validation_log_handler
+        config=config,
+        writer=writer,
     )
     assert isinstance(trainer, RainbowTrainerModule), "Failed to instantiate RainbowTrainerModule"
     logger.info("RAINBOW Trainer initialized.")
@@ -708,6 +791,16 @@ def main():  # Remove default config_path
     eval_stochastic_flag = args.eval_stochastic
     configure_logging(args.log_level)
 
+    # Cap glibc per-thread arenas before any large allocations happen. On the
+    # current 59 GiB host we observed ~54 GiB anon-rss OOM kills every 8-13 h;
+    # the dominant driver is ptmalloc2 fragmentation across ~8 per-thread
+    # arenas that never get trimmed back to the OS. M_ARENA_MAX=2 typically
+    # cuts steady-state RSS by 20-40% on numpy/torch workloads. This is a
+    # mitigation, not a fix -- the torch.save-time pickle spike is still the
+    # root cause; release_memory_to_os() is called after each save in
+    # _save_checkpoint to actually reclaim the spike.
+    configure_glibc_arenas(2)
+
     logger.info("Starting Rainbow DQN training script...")
     logger.info("CUDA available: %s", torch.cuda.is_available())
     if torch.cuda.is_available():
@@ -794,7 +887,7 @@ def main():  # Remove default config_path
             try:
                 train_writer.close()
                 logger.info("TensorBoard writer closed.")
-            except Exception:  # pragma: no cover - defensive
+            except (OSError, RuntimeError):  # pragma: no cover - defensive
                 logger.debug("Failed to close TensorBoard writer", exc_info=True)
 
     elif mode == "eval":
@@ -817,8 +910,7 @@ def main():  # Remove default config_path
             agent_config["seed"] = config["trainer"]["seed"]
             logger.info(f"Added seed {agent_config['seed']} to agent config for evaluation.")
 
-        # Pass scaler=None during evaluation as AMP is typically for training
-        eval_agent = RainbowDQNAgent(config=agent_config, device=device, scaler=None)
+        eval_agent = RainbowDQNAgent(config=agent_config, device=device)
         assert isinstance(eval_agent, RainbowDQNAgent), "Failed to instantiate agent for evaluation"
 
         # Load model weights
@@ -831,8 +923,7 @@ def main():  # Remove default config_path
         eval_agent.set_training_mode(False)
 
         # Pass full config to trainer for evaluation setup (if needed)
-        # Pass scaler=None to trainer during evaluation
-        eval_trainer = RainbowTrainerModule(agent=eval_agent, device=device, data_manager=data_manager, config=config, scaler=None)
+        eval_trainer = RainbowTrainerModule(agent=eval_agent, device=device, data_manager=data_manager, config=config)
 
         # Run evaluation - internal asserts will check inputs
         evaluate_on_test_data(

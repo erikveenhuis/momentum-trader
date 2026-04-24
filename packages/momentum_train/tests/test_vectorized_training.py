@@ -212,7 +212,7 @@ def test_vectorized_speedup_benchmark(vec_training_setup, capsys):
         gpu_samples: list[tuple[int, int]] = []
         stop_event = threading.Event()
 
-        def _sample_gpu():
+        def _sample_gpu(stop_event=stop_event, gpu_samples=gpu_samples):
             if not has_pynvml:
                 return
             handle = pynvml.nvmlDeviceGetHandleByIndex(0)
@@ -313,6 +313,21 @@ def test_agent_per_env_nstep_isolation():
         "dim_feedforward": 64,
         "transformer_dropout": 0.0,
         "store_partial_n_step": True,
+        "polyak_tau": 0.005,
+        "debug": False,
+        "categorical_logging_interval": 2000,
+        "categorical_logging_percentiles": [5, 25, 50, 75, 95],
+        "noisy_sigma_logging_interval": 0,
+        "q_value_logging_interval": 0,
+        "q_value_histogram_interval": 0,
+        "grad_logging_interval": 0,
+        "target_net_logging_interval": 0,
+        "td_error_logging_interval": 0,
+        "lr_scheduler_enabled": False,
+        "lr_scheduler_type": "StepLR",
+        "lr_scheduler_params": {},
+        "aux_loss_weight": 0.1,
+        "aux_target_feature_index": 6,
     }
 
     agent = RainbowDQNAgent(config=config, device="cpu", inference_only=True)

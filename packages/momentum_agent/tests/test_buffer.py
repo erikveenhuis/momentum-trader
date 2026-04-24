@@ -258,3 +258,181 @@ def test_buffer_beta_never_exceeds_one(per_buffer):
     for steps in [0, BETA_FRAMES, BETA_FRAMES * 10, 999999999]:
         per_buffer.update_beta(total_steps=steps)
         assert per_buffer.beta <= 1.0
+
+
+# --- Start: side-car persistence tests ---
+#
+# These guard the memmap-based save_to_path / load_from_path pair that
+# replaced the in-checkpoint buffer_state pickle. That pickle produced a
+# 10+ GiB transient allocation during torch.save and was the direct
+# cause of repeated OOM kills -- the roundtrip invariants here are what
+# prevents a future refactor from silently re-introducing it.
+
+
+@pytest.mark.unit
+def test_buffer_save_to_path_creates_complete_sidecar(per_buffer, tmp_path):
+    """save_to_path must materialise the expected files AND the _COMPLETE marker.
+
+    The marker is what the resume path keys off of to distinguish a
+    fully-flushed side-car from a partial write left behind by an
+    interrupted save -- it MUST be written last.
+    """
+    for i in range(BUFFER_CAPACITY):
+        per_buffer.store(*create_dummy_experience(i))
+
+    sidecar = tmp_path / "ckpt.buffer"
+    result = per_buffer.save_to_path(sidecar)
+
+    assert result == sidecar
+    assert sidecar.is_dir()
+    for name in (
+        "market_data.npy",
+        "account_state.npy",
+        "next_market_data.npy",
+        "next_account_state.npy",
+        "actions.npy",
+        "rewards.npy",
+        "dones.npy",
+        "sumtree.npz",
+        "meta.json",
+        "_COMPLETE",
+    ):
+        assert (sidecar / name).exists(), f"missing side-car file: {name}"
+    assert PrioritizedReplayBuffer.sidecar_is_complete(sidecar)
+
+
+@pytest.mark.unit
+def test_buffer_sidecar_roundtrip_preserves_contents(per_buffer, tmp_path):
+    """Full roundtrip: save → fresh buffer → load → deque and SumTree match exactly.
+
+    This is the core correctness check. If a future refactor breaks the
+    per-field layout or dtype casts in save_to_path, sample() on the
+    restored buffer would silently return mis-shaped or mis-typed
+    arrays, and the Rainbow learner would see corrupted transitions.
+    """
+    for i in range(BUFFER_CAPACITY):
+        per_buffer.store(*create_dummy_experience(i))
+    # Exercise the SumTree with a non-trivial priority distribution so
+    # the roundtrip actually has interesting state to preserve.
+    _, tree_indices, _ = per_buffer.sample(BATCH_SIZE)
+    per_buffer.update_priorities(tree_indices, torch.abs(torch.randn(BATCH_SIZE)))
+
+    sidecar = tmp_path / "ckpt.buffer"
+    per_buffer.save_to_path(sidecar)
+
+    restored = PrioritizedReplayBuffer(
+        capacity=BUFFER_CAPACITY,
+        alpha=ALPHA,
+        beta_start=BETA_START,
+        beta_frames=BETA_FRAMES,
+    )
+    restored.beta = per_buffer.beta  # load_from_path will overwrite anyway
+    restored.load_from_path(sidecar)
+
+    assert len(restored) == len(per_buffer)
+    assert restored.buffer_write_idx == per_buffer.buffer_write_idx
+    assert restored.max_priority == pytest.approx(per_buffer.max_priority)
+    assert restored.alpha == pytest.approx(per_buffer.alpha)
+    assert restored.beta == pytest.approx(per_buffer.beta)
+    assert restored.beta_start == pytest.approx(per_buffer.beta_start)
+    assert restored.beta_frames == per_buffer.beta_frames
+    assert restored.epsilon == pytest.approx(per_buffer.epsilon)
+    assert restored.capacity == per_buffer.capacity
+
+    # SumTree arrays must be bit-exact -- any drift corrupts sampling.
+    np.testing.assert_array_equal(restored.tree.tree, per_buffer.tree.tree)
+    np.testing.assert_array_equal(restored.tree.data_indices, per_buffer.tree.data_indices)
+    assert restored.tree.write == per_buffer.tree.write
+    assert restored.tree.size == per_buffer.tree.size
+
+    # Every Experience field must come back equal. ``action`` round-trips
+    # through int64 and ``done`` through uint8 (booleans -> {0,1}), so
+    # we normalise the originals the same way before comparing.
+    for orig, loaded in zip(per_buffer.buffer, restored.buffer, strict=False):
+        np.testing.assert_array_equal(orig.market_data, loaded.market_data)
+        np.testing.assert_array_equal(orig.account_state, loaded.account_state)
+        np.testing.assert_array_equal(orig.next_market_data, loaded.next_market_data)
+        np.testing.assert_array_equal(orig.next_account_state, loaded.next_account_state)
+        assert int(orig.action) == loaded.action
+        assert float(orig.reward) == pytest.approx(loaded.reward)
+        assert int(bool(orig.done)) == loaded.done
+
+
+@pytest.mark.unit
+def test_buffer_sidecar_roundtrip_empty_buffer(tmp_path):
+    """An empty buffer must still produce a valid (if sparse) side-car.
+
+    Regression guard: the save path uses ``self.buffer[0]`` to infer
+    shapes, so the empty branch must be taken explicitly rather than
+    blowing up with IndexError.
+    """
+    buf = PrioritizedReplayBuffer(BUFFER_CAPACITY, ALPHA, BETA_START, BETA_FRAMES)
+    sidecar = tmp_path / "empty.buffer"
+    buf.save_to_path(sidecar)
+    assert PrioritizedReplayBuffer.sidecar_is_complete(sidecar)
+
+    restored = PrioritizedReplayBuffer(BUFFER_CAPACITY, ALPHA, BETA_START, BETA_FRAMES)
+    restored.load_from_path(sidecar)
+    assert len(restored) == 0
+    assert restored.tree.size == 0
+
+
+@pytest.mark.unit
+def test_buffer_sidecar_load_rejects_incomplete(per_buffer, tmp_path):
+    """Loading a side-car without the _COMPLETE marker must raise.
+
+    This is the analogue of ``_probe_checkpoint_usable``'s zip-truncation
+    detection: if the training process was OOM-killed mid-save, the
+    marker is absent and the directory is by definition untrustworthy.
+    Silently loading a partial buffer would resume training on a
+    subset of the intended transitions and corrupt the SumTree.
+    """
+    for i in range(20):
+        per_buffer.store(*create_dummy_experience(i))
+    sidecar = tmp_path / "ckpt.buffer"
+    per_buffer.save_to_path(sidecar)
+    (sidecar / "_COMPLETE").unlink()
+
+    restored = PrioritizedReplayBuffer(BUFFER_CAPACITY, ALPHA, BETA_START, BETA_FRAMES)
+    with pytest.raises(ValueError, match="_COMPLETE"):
+        restored.load_from_path(sidecar)
+
+
+@pytest.mark.unit
+def test_buffer_sidecar_load_rejects_capacity_mismatch(per_buffer, tmp_path):
+    """Capacity mismatches between the side-car and the live buffer must fail loudly."""
+    for i in range(20):
+        per_buffer.store(*create_dummy_experience(i))
+    sidecar = tmp_path / "ckpt.buffer"
+    per_buffer.save_to_path(sidecar)
+
+    # A buffer created with a different capacity cannot host this side-car.
+    wrong = PrioritizedReplayBuffer(BUFFER_CAPACITY * 2, ALPHA, BETA_START, BETA_FRAMES)
+    with pytest.raises(ValueError, match="Capacity mismatch"):
+        wrong.load_from_path(sidecar)
+
+
+@pytest.mark.unit
+def test_buffer_sidecar_save_overwrites_stale_directory(per_buffer, tmp_path):
+    """A second save_to_path to the same directory must leave only the new contents.
+
+    Guards against a stale ``_COMPLETE`` from a previous save
+    shadowing a freshly-interrupted one (would make the resume path
+    happily load ancient / mismatched data).
+    """
+    for i in range(20):
+        per_buffer.store(*create_dummy_experience(i))
+    sidecar = tmp_path / "ckpt.buffer"
+    per_buffer.save_to_path(sidecar)
+    (sidecar / "stale_marker").write_text("this file should disappear on re-save")
+
+    # Add more transitions and re-save.
+    for i in range(20, 40):
+        per_buffer.store(*create_dummy_experience(i))
+    per_buffer.save_to_path(sidecar)
+
+    assert not (sidecar / "stale_marker").exists(), "stale files must be purged on re-save"
+    assert PrioritizedReplayBuffer.sidecar_is_complete(sidecar)
+
+
+# --- End: side-car persistence tests ---

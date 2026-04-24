@@ -1,12 +1,15 @@
+import json
 import random
+import shutil
 from collections import deque, namedtuple
+from pathlib import Path
 
 import numpy as np
 import torch
 from momentum_core.logging import get_logger
 
 # Get logger instance
-logger = get_logger("Buffer")
+logger = get_logger(__name__)
 
 # Define Experience namedtuple at module level for pickling (Copied from agent.py)
 Experience = namedtuple(
@@ -182,7 +185,7 @@ class PrioritizedReplayBuffer:
             next_market_data,
             next_account_state,
             dones,
-        ) = zip(*samples)
+        ) = zip(*samples, strict=False)
 
         # --- Start: Add assertions for sampled data types and basic structure ---
         if self.debug:
@@ -238,7 +241,7 @@ class PrioritizedReplayBuffer:
             raise ValueError(f"New priority calculated is non-positive: min={new_priorities.min()}")
 
         # Update priorities in the deque
-        for tree_idx, priority in zip(tree_indices, new_priorities):
+        for tree_idx, priority in zip(tree_indices, new_priorities, strict=False):
             if priority <= 0:
                 if self.debug:
                     raise ValueError("Encountered non-positive priority during update")
@@ -323,6 +326,225 @@ class PrioritizedReplayBuffer:
     def __len__(self):
         # Return the current fill size of the buffer/tree
         return self.tree.size
+
+    # --- Start: Side-car persistence (memmap-based, O(1) peak RAM) ---
+    #
+    # Motivation: embedding this buffer inside a ``torch.save(...)`` dict
+    # pickles the deque, which (for capacity=1M, ~6 GiB of live arrays)
+    # produces a 10+ GiB transient in-memory pickle stream on top of the
+    # live buffer. Three separate OOM kills were directly traced to that
+    # save-time peak exceeding the system memory ceiling. Writing each
+    # field to its own ``.npy`` file via ``np.lib.format.open_memmap``
+    # makes the per-field peak bounded by a single Experience row
+    # (a few KiB), not by the cumulative buffer size.
+    #
+    # Layout under ``buffer_dir``:
+    #   market_data.npy, next_market_data.npy        (N, W, F) float32
+    #   account_state.npy, next_account_state.npy    (N, A)    float32
+    #   actions.npy                                  (N,)      int64
+    #   rewards.npy                                  (N,)      float32
+    #   dones.npy                                    (N,)      uint8
+    #   sumtree.npz                                  tree + data_indices + write + size
+    #   meta.json                                    small scalar metadata
+    #   _COMPLETE                                    zero-byte marker, written last
+    #
+    # The ``_COMPLETE`` marker is the side-car equivalent of a ZIP central
+    # directory -- a resume that finds the directory without this marker
+    # treats the side-car as truncated (mirror of
+    # ``_probe_checkpoint_usable`` for torch.save files).
+    _SIDECAR_FORMAT_VERSION = 1
+
+    def save_to_path(self, buffer_dir: Path | str) -> Path:
+        """Persist the replay buffer to ``buffer_dir`` as per-field ``.npy`` memmaps.
+
+        Peak additional RSS during this call is ~O(one Experience row), not
+        O(buffer size), because each field is written row-by-row into an
+        on-disk memmap. Returns the ``Path`` written to.
+        """
+        buffer_dir = Path(buffer_dir)
+        if buffer_dir.exists():
+            # Atomic-ish replace: remove any stale side-car first so a
+            # partially-written one can never shadow a previous good copy.
+            shutil.rmtree(buffer_dir)
+        buffer_dir.mkdir(parents=True, exist_ok=False)
+
+        n = len(self.buffer)
+        if n > 0:
+            first = self.buffer[0]
+            md_shape = np.asarray(first.market_data).shape
+            as_shape = np.asarray(first.account_state).shape
+            nmd_shape = np.asarray(first.next_market_data).shape
+            nas_shape = np.asarray(first.next_account_state).shape
+
+            md_mm = np.lib.format.open_memmap(
+                buffer_dir / "market_data.npy",
+                mode="w+",
+                dtype=np.float32,
+                shape=(n, *md_shape),
+            )
+            as_mm = np.lib.format.open_memmap(
+                buffer_dir / "account_state.npy",
+                mode="w+",
+                dtype=np.float32,
+                shape=(n, *as_shape),
+            )
+            nmd_mm = np.lib.format.open_memmap(
+                buffer_dir / "next_market_data.npy",
+                mode="w+",
+                dtype=np.float32,
+                shape=(n, *nmd_shape),
+            )
+            nas_mm = np.lib.format.open_memmap(
+                buffer_dir / "next_account_state.npy",
+                mode="w+",
+                dtype=np.float32,
+                shape=(n, *nas_shape),
+            )
+            actions_mm = np.lib.format.open_memmap(
+                buffer_dir / "actions.npy",
+                mode="w+",
+                dtype=np.int64,
+                shape=(n,),
+            )
+            rewards_mm = np.lib.format.open_memmap(
+                buffer_dir / "rewards.npy",
+                mode="w+",
+                dtype=np.float32,
+                shape=(n,),
+            )
+            dones_mm = np.lib.format.open_memmap(
+                buffer_dir / "dones.npy",
+                mode="w+",
+                dtype=np.uint8,
+                shape=(n,),
+            )
+
+            try:
+                # deque supports indexed access; iterating is O(N) either way
+                # but avoids materialising an intermediate list.
+                for i, exp in enumerate(self.buffer):
+                    md_mm[i] = exp.market_data
+                    as_mm[i] = exp.account_state
+                    nmd_mm[i] = exp.next_market_data
+                    nas_mm[i] = exp.next_account_state
+                    actions_mm[i] = int(exp.action)
+                    rewards_mm[i] = float(exp.reward)
+                    dones_mm[i] = int(bool(exp.done))
+            finally:
+                for mm in (md_mm, as_mm, nmd_mm, nas_mm, actions_mm, rewards_mm, dones_mm):
+                    try:
+                        mm.flush()
+                    except Exception:  # noqa: BLE001 -- defensive; bubble only via marker absence
+                        pass
+                # Drop memmap refs so the backing pages can be reclaimed.
+                del md_mm, as_mm, nmd_mm, nas_mm, actions_mm, rewards_mm, dones_mm
+
+        np.savez(
+            buffer_dir / "sumtree.npz",
+            tree=self.tree.tree,
+            data_indices=self.tree.data_indices,
+            write=np.int64(self.tree.write),
+            size=np.int64(self.tree.size),
+        )
+
+        meta = {
+            "format_version": self._SIDECAR_FORMAT_VERSION,
+            "size": int(n),
+            "buffer_write_idx": int(self.buffer_write_idx),
+            "max_priority": float(self.max_priority),
+            "alpha": float(self.alpha),
+            "beta": float(self.beta),
+            "beta_start": float(self.beta_start),
+            "beta_frames": int(self.beta_frames),
+            "epsilon": float(self.epsilon),
+            "capacity": int(self.capacity),
+        }
+        (buffer_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+
+        # Completion marker MUST be written last. Its presence is the
+        # atomic signal to the resume path that this side-car is intact.
+        (buffer_dir / "_COMPLETE").write_bytes(b"")
+        return buffer_dir
+
+    @classmethod
+    def sidecar_is_complete(cls, buffer_dir: Path | str) -> bool:
+        """Return True if ``buffer_dir`` looks like a fully-written side-car."""
+        buffer_dir = Path(buffer_dir)
+        return buffer_dir.is_dir() and (buffer_dir / "_COMPLETE").is_file()
+
+    def load_from_path(self, buffer_dir: Path | str) -> None:
+        """Restore buffer contents from a side-car directory previously written by :meth:`save_to_path`.
+
+        Raises ``FileNotFoundError`` if the directory is missing and
+        ``ValueError`` if the side-car is incomplete or the capacity doesn't
+        match the live buffer's capacity.
+        """
+        buffer_dir = Path(buffer_dir)
+        if not buffer_dir.is_dir():
+            raise FileNotFoundError(f"Buffer side-car directory not found: {buffer_dir}")
+        if not (buffer_dir / "_COMPLETE").is_file():
+            raise ValueError(
+                f"Buffer side-car at {buffer_dir} is missing the _COMPLETE marker -- "
+                "the previous save was interrupted and this buffer cannot be safely loaded."
+            )
+
+        meta = json.loads((buffer_dir / "meta.json").read_text())
+        if int(meta["capacity"]) != self.capacity:
+            raise ValueError(
+                f"Capacity mismatch loading buffer side-car: file has {meta['capacity']}, buffer was constructed with {self.capacity}"
+            )
+
+        n = int(meta["size"])
+        new_deque: deque = deque(maxlen=self.capacity)
+        if n > 0:
+            md = np.load(buffer_dir / "market_data.npy", mmap_mode="r")
+            ac = np.load(buffer_dir / "account_state.npy", mmap_mode="r")
+            nmd = np.load(buffer_dir / "next_market_data.npy", mmap_mode="r")
+            nas = np.load(buffer_dir / "next_account_state.npy", mmap_mode="r")
+            actions = np.load(buffer_dir / "actions.npy", mmap_mode="r")
+            rewards = np.load(buffer_dir / "rewards.npy", mmap_mode="r")
+            dones = np.load(buffer_dir / "dones.npy", mmap_mode="r")
+
+            # Copy each row out of the memmap into private (anonymous)
+            # memory so subsequent sample() calls don't trigger per-row
+            # major page faults during training. ``np.array(x)`` is the
+            # standard idiom for materialising a memmap slice.
+            for i in range(n):
+                new_deque.append(
+                    Experience(
+                        market_data=np.array(md[i], dtype=np.float32),
+                        account_state=np.array(ac[i], dtype=np.float32),
+                        action=int(actions[i]),
+                        reward=float(rewards[i]),
+                        next_market_data=np.array(nmd[i], dtype=np.float32),
+                        next_account_state=np.array(nas[i], dtype=np.float32),
+                        done=int(dones[i]),
+                    )
+                )
+            # Drop memmap references so the page cache can be reclaimed.
+            del md, ac, nmd, nas, actions, rewards, dones
+        self.buffer = new_deque
+
+        with np.load(buffer_dir / "sumtree.npz") as tree_state:
+            # ``.copy()`` detaches from the npz's lazy loader so it can be
+            # closed; SumTree expects owning arrays.
+            self.tree.tree = np.array(tree_state["tree"])
+            self.tree.data_indices = np.array(tree_state["data_indices"])
+            self.tree.write = int(tree_state["write"])
+            self.tree.size = int(tree_state["size"])
+
+        self.buffer_write_idx = int(meta["buffer_write_idx"])
+        self.max_priority = float(meta["max_priority"])
+        self.alpha = float(meta["alpha"])
+        self.beta = float(meta["beta"])
+        self.beta_start = float(meta["beta_start"])
+        self.beta_frames = int(meta["beta_frames"])
+        self.epsilon = float(meta["epsilon"])
+
+        if self.debug and len(self.buffer) != self.tree.size:
+            raise ValueError("Buffer deque length doesn't match SumTree size after side-car load")
+
+    # --- End: Side-car persistence ---
 
 
 # --- End: Prioritized Replay Buffer ---

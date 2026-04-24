@@ -23,11 +23,13 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
+import requests
+from alpaca.common.exceptions import APIError
 from momentum_core.logging import get_logger
 
 from .account_registry import BrokerAccountRegistry, SubAccountEntry
 
-LOGGER = get_logger("momentum_live.broker")
+LOGGER = get_logger(__name__)
 
 
 @dataclass(slots=True)
@@ -230,7 +232,7 @@ class BrokerAccountManager:
 
         try:
             resp = session.get(url, auth=auth, timeout=10)
-        except Exception as exc:  # pragma: no cover - network
+        except requests.RequestException as exc:  # pragma: no cover - network
             LOGGER.warning("ensure_crypto_enabled: GET %s failed: %s", url, exc)
             return False
         if resp.status_code != 200:
@@ -271,7 +273,7 @@ class BrokerAccountManager:
                 json={"enabled_assets": ["us_equity", "crypto"]},
                 timeout=10,
             )
-        except Exception as exc:  # pragma: no cover - network
+        except requests.RequestException as exc:  # pragma: no cover - network
             LOGGER.warning("ensure_crypto_enabled: PATCH %s failed: %s", url, exc)
             return False
         if patch_resp.status_code >= 400:
@@ -354,7 +356,7 @@ class BrokerAccountManager:
         )
         try:
             journal = self._client.create_journal(request)
-        except Exception as exc:
+        except (APIError, requests.RequestException) as exc:
             LOGGER.error(
                 "create_journal failed (amount=%.2f, direction=%s): %s. "
                 "If amount > sandbox JNLC Transaction Limit, raise it in the Broker UI.",
@@ -394,12 +396,12 @@ class BrokerAccountManager:
 
         try:
             self._client.cancel_orders_for_account(account_id)
-        except Exception as exc:
+        except (APIError, requests.RequestException) as exc:
             LOGGER.warning("cancel_orders_for_account failed for %s: %s", account_id, exc)
 
         try:
             self._client.close_all_positions_for_account(account_id, cancel_orders=True)
-        except Exception as exc:
+        except (APIError, requests.RequestException) as exc:
             LOGGER.warning("close_all_positions_for_account failed for %s: %s", account_id, exc)
 
         self._wait_for_positions_empty(account_id, timeout=timeout, interval=interval)
@@ -442,7 +444,7 @@ class BrokerAccountManager:
         while time.monotonic() < deadline:
             try:
                 positions = self._client.get_all_positions_for_account(account_id)
-            except Exception as exc:
+            except (APIError, requests.RequestException) as exc:
                 LOGGER.warning("get_all_positions_for_account failed for %s: %s", account_id, exc)
                 return
             count = len(list(positions or []))
@@ -460,7 +462,7 @@ class BrokerAccountManager:
         while time.monotonic() < deadline:
             try:
                 journal = self._client.get_journal_by_id(journal_id)
-            except Exception as exc:
+            except (APIError, requests.RequestException) as exc:
                 LOGGER.warning("get_journal_by_id(%s) failed: %s", journal_id, exc)
                 return
             status_raw = getattr(journal, "status", None)

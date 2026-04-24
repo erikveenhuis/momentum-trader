@@ -40,7 +40,7 @@ def _make_buffer_state(rewards, actions, priorities):
     tree = np.zeros(2 * capacity - 1, dtype=np.float64)
     for i, p in enumerate(priorities):
         tree[i + capacity - 1] = float(p)
-    experiences = [SimpleNamespace(reward=float(r), action=int(a)) for r, a in zip(rewards, actions)]
+    experiences = [SimpleNamespace(reward=float(r), action=int(a)) for r, a in zip(rewards, actions, strict=False)]
     return {
         "buffer": experiences,
         "tree_state": {"tree": tree, "data_indices": np.arange(capacity), "write": n % capacity, "size": n},

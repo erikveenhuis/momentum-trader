@@ -1,12 +1,60 @@
 import glob
 import logging
 import os
+import zipfile
 from typing import Any
 
 import numpy as np
 import torch
 
 logger = logging.getLogger("CheckpointUtils")
+
+
+def _probe_checkpoint_usable(file_path: str) -> tuple[bool, str]:
+    """Cheaply determine whether ``file_path`` is plausibly a loadable torch checkpoint.
+
+    Returns ``(usable, reason)``. ``usable=False`` means ``torch.load`` will
+    almost certainly fail on the file; we should skip it and try the
+    next-oldest candidate instead of surfacing a ``ResumeFailedError``.
+
+    The probe covers the two interrupted-save failure modes we've hit in
+    production:
+
+    * **Zero-byte stub** — the rotation code wrote the new filename before
+      ``torch.save`` flushed any bytes to it (seen April 22 2026, OOM-kill).
+    * **Truncated mid-write** — e.g. a ~479 MB fragment of an expected
+      ~8.3 GB file where ``torch.save`` died part-way through flushing the
+      pickled tensors (seen April 23 2026, same root cause). The file has
+      bytes but the ZIP central directory record at the tail is missing,
+      which ``torch.load`` reports as
+      ``PytorchStreamReader failed reading zip archive: failed finding
+      central directory``.
+
+    The probe intentionally does NOT call ``torch.load`` — that would cost
+    multiple GB of RAM for an 8 GB checkpoint and defeat the purpose of a
+    cheap triage step. ``zipfile.is_zipfile`` just seeks to the end of the
+    file looking for the EOCD signature, so it's O(1) in checkpoint size.
+
+    PyTorch's ``torch.save`` (since 1.6) writes a standard ZIP archive that
+    ``zipfile.is_zipfile`` recognises; if this codebase ever regresses to
+    legacy tar-pickle checkpoints, tighten the probe rather than loosen the
+    caller.
+    """
+    try:
+        size = os.path.getsize(file_path)
+    except OSError as exc:
+        return False, f"stat failed: {exc}"
+    if size == 0:
+        return False, "zero-byte file (likely partial write from an interrupted torch.save)"
+    try:
+        if not zipfile.is_zipfile(file_path):
+            return False, (
+                "not a valid ZIP archive (central directory missing); torch.save was likely "
+                "truncated mid-write -- torch.load would raise PytorchStreamReader error"
+            )
+    except OSError as exc:
+        return False, f"read failed while probing ZIP structure: {exc}"
+    return True, ""
 
 
 def find_latest_checkpoint(model_dir: str = "models", model_prefix: str = "checkpoint_trainer") -> str | None:
@@ -42,22 +90,50 @@ def find_latest_checkpoint(model_dir: str = "models", model_prefix: str = "check
                 episode_files.append((episode_num, file_path))
 
         if episode_files:
-            # Sort by episode number (highest first)
+            # Sort by episode number (highest first) and walk down until we find
+            # a candidate that passes the usability probe. Interrupted saves
+            # (zero-byte stubs OR truncated ZIPs missing the central directory)
+            # would otherwise get returned here, then blow up in torch.load and
+            # -- via the new ResumeFailedError gate in run_training.py -- abort
+            # the run. Falling back to the next-oldest complete file keeps
+            # ``--resume`` working unattended across OOM-during-save events.
             episode_files.sort(key=lambda x: x[0], reverse=True)
-            latest_episode, latest_path = episode_files[0]
-            logger.info(f"Found latest checkpoint (episode {latest_episode}): {latest_path}")
-            return latest_path
+            for episode_num, file_path in episode_files:
+                usable, reason = _probe_checkpoint_usable(file_path)
+                if not usable:
+                    logger.warning(
+                        "Skipping checkpoint %s (ep%d): %s. Trying next-oldest.",
+                        file_path,
+                        episode_num,
+                        reason,
+                    )
+                    continue
+                logger.info(f"Found latest checkpoint (episode {episode_num}): {file_path}")
+                return file_path
+            logger.warning(
+                "All %d candidate checkpoints under %s/%s_latest_*_ep*_reward*.pt failed the "
+                "usability probe (empty, truncated, or unreadable).",
+                len(episode_files),
+                model_dir,
+                model_prefix,
+            )
 
     # Fallback to old naming pattern
     latest_path = os.path.join(model_dir, f"{model_prefix}_latest.pt")
     if os.path.exists(latest_path):
-        logger.info(f"Found latest checkpoint with old naming pattern: {latest_path}")
-        return latest_path
+        usable, reason = _probe_checkpoint_usable(latest_path)
+        if usable:
+            logger.info(f"Found latest checkpoint with old naming pattern: {latest_path}")
+            return latest_path
+        logger.warning("Skipping legacy checkpoint %s: %s.", latest_path, reason)
 
     best_path = os.path.join(model_dir, f"{model_prefix}_best.pt")
     if os.path.exists(best_path):
-        logger.warning(f"Latest checkpoint not found, using best checkpoint: {best_path}")
-        return best_path
+        usable, reason = _probe_checkpoint_usable(best_path)
+        if usable:
+            logger.warning(f"Latest checkpoint not found, using best checkpoint: {best_path}")
+            return best_path
+        logger.warning("Skipping best-checkpoint fallback %s: %s.", best_path, reason)
 
     logger.warning("No suitable checkpoint file found.")
     return None

@@ -33,7 +33,7 @@ except ImportError:
     sys.exit(1)
 
 # Get logger instance
-logger = get_logger("data_processing.split_data")
+logger = get_logger(__name__)
 
 
 def configure_logging(log_level: str | None = None) -> None:

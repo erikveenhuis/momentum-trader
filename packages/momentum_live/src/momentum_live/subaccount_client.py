@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from momentum_core.logging import get_logger
 
-LOGGER = get_logger("momentum_live.subaccount_client")
+LOGGER = get_logger(__name__)
 
 
 class BrokerSubAccountClient:

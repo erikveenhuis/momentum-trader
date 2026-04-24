@@ -353,7 +353,7 @@ def reset_noisy_in_checkpoint(checkpoint: dict, std_init: float | None) -> int:
     # eager (plain keys), so we re-add `_orig_mod.` when the source had it.
     def _format_like(src: dict | None, fresh_state: dict) -> dict:
         fresh_cpu = {k: v.detach().cpu() for k, v in fresh_state.items()}
-        if isinstance(src, dict) and src and all(isinstance(k, str) and k.startswith("_orig_mod.") for k in src.keys()):
+        if isinstance(src, dict) and src and all(isinstance(k, str) and k.startswith("_orig_mod.") for k in src):
             return {f"_orig_mod.{k}": v for k, v in fresh_cpu.items()}
         return fresh_cpu
 

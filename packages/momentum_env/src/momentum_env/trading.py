@@ -155,48 +155,6 @@ class TradingLogic:
             total_transaction_cost=new_total_cost,
         )
 
-    def apply_trade(
-        self,
-        portfolio_state: PortfolioState,
-        current_price: float,
-        action: int,
-        action_value: float,
-    ) -> tuple[PortfolioState, bool]:
-        """Apply a trading action.
-
-        Args:
-            portfolio_state: Current portfolio state
-            current_price: Current asset price
-            action: Action type (0=Hold, 1=Buy, 2=Sell)
-            action_value: Action value (0 to 1)
-
-        Returns:
-            Tuple of (New portfolio state, is_valid flag)
-        """
-        is_valid: bool = True
-        new_state: PortfolioState = portfolio_state
-
-        if action == 0:  # Hold
-            # Hold is always valid, state doesn't change
-            new_state = portfolio_state
-            is_valid = True
-
-        elif action == 1:  # Buy
-            is_valid, temp_state = self.handle_buy(portfolio_state, current_price, action_value)
-            # Only update state if the action was valid
-            new_state = temp_state if is_valid else portfolio_state
-
-        elif action == 2:  # Sell
-            is_valid, temp_state = self.handle_sell(portfolio_state, current_price, action_value)
-            # Only update state if the action was valid
-            new_state = temp_state if is_valid else portfolio_state
-
-        else:  # Unknown action
-            is_valid = False  # Treat unknown actions as invalid
-            new_state = portfolio_state  # State does not change
-
-        return new_state, is_valid  # Return the state and validity
-
     def reset_peak(self, initial_value: float) -> None:
         """Reset peak portfolio value and drawdown tracking (call on env reset)."""
         self.peak_portfolio_value = initial_value

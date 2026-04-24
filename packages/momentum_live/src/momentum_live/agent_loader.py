@@ -10,7 +10,7 @@ import torch
 from momentum_agent import RainbowDQNAgent
 from momentum_core.logging import get_logger
 
-LOGGER = get_logger("momentum_live.agent_loader")
+LOGGER = get_logger(__name__)
 
 _SCORE_PATTERN = re.compile(r"_score_(?P<score>-?\d+(?:\.\d+)?)")
 
@@ -96,7 +96,6 @@ def load_agent_from_checkpoint(
     agent = RainbowDQNAgent(
         config=agent_config,
         device=resolved_device,
-        scaler=None,
         inference_only=inference_only,
     )
 
