@@ -109,7 +109,13 @@ def test_pick_checkpoint_auto_pick_uses_validation_results(tmp_path, recover_mod
     return the most recent latest checkpoint whose mtime is <= the most
     recent good validation_result."""
     paths_ep = {}
-    for ep, date in [(2000, "20260416"), (2400, "20260416"), (2800, "20260417"), (3200, "20260418"), (3499, "20260418")]:
+    for ep, date in [
+        (2000, "20260416"),
+        (2400, "20260416"),
+        (2800, "20260417"),
+        (3200, "20260418"),
+        (3499, "20260418"),
+    ]:
         paths_ep[ep] = _write_dummy_latest(tmp_path, date=date, episode=ep)
         # Stagger mtimes so newer episodes look newer on disk.
         time.sleep(0.01)

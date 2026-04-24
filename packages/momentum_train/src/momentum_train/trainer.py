@@ -73,9 +73,13 @@ class RainbowTrainerModule(CheckpointMixin, ValidationMixin, DiagnosticsMixin, L
         # Adjust path prefix for Rainbow models
         self.best_model_base_prefix = str(Path(self.run_config.get("model_dir", "models")) / "rainbow_transformer_best")
         # Add checkpoint paths
-        self.latest_trainer_checkpoint_path = str(Path(self.run_config.get("model_dir", "models")) / "checkpoint_trainer_latest.pt")
+        self.latest_trainer_checkpoint_path = str(
+            Path(self.run_config.get("model_dir", "models")) / "checkpoint_trainer_latest.pt"
+        )
         # Store the BASE prefix for the best checkpoint.
-        self.best_trainer_checkpoint_base_path = str(Path(self.run_config.get("model_dir", "models")) / "checkpoint_trainer_best")
+        self.best_trainer_checkpoint_base_path = str(
+            Path(self.run_config.get("model_dir", "models")) / "checkpoint_trainer_best"
+        )
         self.validation_metrics = []
         self.performance_tracker = PerformanceTracker()
         # Guard for ``_finalize_training``: we only overwrite
@@ -168,7 +172,9 @@ class RainbowTrainerModule(CheckpointMixin, ValidationMixin, DiagnosticsMixin, L
         if raw_reward_clip is not None:
             reward_clip_float = float(raw_reward_clip)
             if reward_clip_float <= 0:
-                raise ValueError(f"reward_clip must be positive when set (received {reward_clip_float}); use null in YAML to disable.")
+                raise ValueError(
+                    f"reward_clip must be positive when set (received {reward_clip_float}); use null in YAML to disable."
+                )
             self.reward_clip_value = reward_clip_float
             logger.info("Reward clipping enabled with ±%.4f bound.", self.reward_clip_value)
         self.gradient_updates_per_step = max(1, int(self._cfg.gradient_updates_per_step))
@@ -313,7 +319,12 @@ class RainbowTrainerModule(CheckpointMixin, ValidationMixin, DiagnosticsMixin, L
                 f"run.episodes (or remove all validation files to opt out explicitly)."
             )
 
-        if has_val_files and validation_freq_int > 0 and num_episodes_int >= 5 and validation_freq_int > max(1, num_episodes_int // 5):
+        if (
+            has_val_files
+            and validation_freq_int > 0
+            and num_episodes_int >= 5
+            and validation_freq_int > max(1, num_episodes_int // 5)
+        ):
             expected_runs = num_episodes_int // validation_freq_int
             logger.warning(
                 "validation_freq=%d will only run validation ~%d time(s) across %d episodes "

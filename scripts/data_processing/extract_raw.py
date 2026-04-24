@@ -162,7 +162,9 @@ def extract_gz_and_split_by_ticker(
                         skipped_reasons[idx] = "Excluded ticker"
                         skipped_excluded_ticker_count += 1
             if excluded_ticker_indices:
-                logger.debug(f"[{input_gz_path.name}] Marked {len(excluded_ticker_indices)} combos as explicitly excluded.")
+                logger.debug(
+                    f"[{input_gz_path.name}] Marked {len(excluded_ticker_indices)} combos as explicitly excluded."
+                )
 
         skipped_indices = all_day_ticker_indices - indices_to_keep
         if skipped_indices:
@@ -219,7 +221,9 @@ def extract_gz_and_split_by_ticker(
                 save_error_skips += 1
 
         total_skipped_in_file = len(skipped_indices) + save_error_skips
-        logger.debug(f"[{input_gz_path.name}] GZ summary - Saved: {saved_count}, Total Skipped: {total_skipped_in_file}")
+        logger.debug(
+            f"[{input_gz_path.name}] GZ summary - Saved: {saved_count}, Total Skipped: {total_skipped_in_file}"
+        )
 
         return (
             saved_count,
@@ -343,7 +347,9 @@ def run_extraction(
                                 f"Incomplete: {total_skipped_incomplete}, NonUSD: {total_skipped_non_usd}, "
                                 f"SaveErr: {total_save_errors}, Excluded Ticker: {total_skipped_excluded}"
                             )
-                            logger.info(f"Processed GZ {processed_files_count}/{len(files_to_process)} ({gz_file.name}) -> {skip_summary}")
+                            logger.info(
+                                f"Processed GZ {processed_files_count}/{len(files_to_process)} ({gz_file.name}) -> {skip_summary}"
+                            )
 
                     except DiskWriteError as exc:
                         logger.error(

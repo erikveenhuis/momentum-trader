@@ -150,7 +150,9 @@ def _validate_agent_config(cfg: AgentConfig) -> None:
     if cfg.lr <= 0:
         raise ValueError(f"lr must be positive, got {cfg.lr}")
     if not (0.0 <= cfg.epsilon_end <= cfg.epsilon_start <= 1.0):
-        raise ValueError(f"epsilon schedule invalid: start={cfg.epsilon_start}, end={cfg.epsilon_end} (require 0 <= end <= start <= 1)")
+        raise ValueError(
+            f"epsilon schedule invalid: start={cfg.epsilon_start}, end={cfg.epsilon_end} (require 0 <= end <= start <= 1)"
+        )
     if cfg.epsilon_decay_steps < 0:
         raise ValueError(f"epsilon_decay_steps must be >= 0, got {cfg.epsilon_decay_steps}")
     if cfg.aux_loss_weight < 0:

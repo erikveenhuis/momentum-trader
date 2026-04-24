@@ -216,7 +216,9 @@ class CheckpointMixin:
             "agent_env_steps": self.agent.env_steps,
             "total_steps": self.agent.total_steps,
             "network_state_dict": self.agent.network.state_dict() if self.agent.network is not None else None,
-            "target_network_state_dict": (self.agent.target_network.state_dict() if self.agent.target_network is not None else None),
+            "target_network_state_dict": (
+                self.agent.target_network.state_dict() if self.agent.target_network is not None else None
+            ),
             "optimizer_state_dict": (self.agent.optimizer.state_dict() if self.agent.optimizer else None),
             "scaler_state_dict": None,
             # --- ADDED Scheduler State ---
@@ -238,7 +240,9 @@ class CheckpointMixin:
         # Basic check on checkpoint contents
         # assert isinstance(checkpoint['network_state_dict'], dict), "Invalid network state dict in checkpoint"
         # assert isinstance(checkpoint['optimizer_state_dict'], dict), "Invalid optimizer state dict in checkpoint"
-        assert isinstance(checkpoint["best_validation_metric"], float), "Invalid best validation metric type in checkpoint"
+        assert isinstance(checkpoint["best_validation_metric"], float), (
+            "Invalid best validation metric type in checkpoint"
+        )
 
         # Reverted: Removed checks for mock objects here
         if not self.agent.optimizer:
@@ -299,9 +303,7 @@ class CheckpointMixin:
         if is_best:
             # Construct the filename with date, episode and score
             if validation_score is not None:
-                best_checkpoint_path = (
-                    f"{self.best_trainer_checkpoint_base_path}_{current_date}_ep{episode}_score_{validation_score:.4f}.pt"
-                )
+                best_checkpoint_path = f"{self.best_trainer_checkpoint_base_path}_{current_date}_ep{episode}_score_{validation_score:.4f}.pt"
             else:
                 # Fallback if score isn't passed (shouldn't happen for best)
                 best_checkpoint_path = f"{self.best_trainer_checkpoint_base_path}_{current_date}_ep{episode}.pt"
@@ -329,7 +331,9 @@ class CheckpointMixin:
                     # self.agent.save_model(best_model_save_prefix) # REMOVED - Agent state is in checkpoint
                     # --- END MODIFICATION ---
                     logger.info(f"  Score: {validation_score:.4f}")
-                    logger.info(f"  Best checkpoint with agent state saved to: {best_checkpoint_path}")  # Modified log message
+                    logger.info(
+                        f"  Best checkpoint with agent state saved to: {best_checkpoint_path}"
+                    )  # Modified log message
                 else:
                     logger.info("  No improvement over previous best model")
             except Exception as e:

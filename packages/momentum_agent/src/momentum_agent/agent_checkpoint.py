@@ -161,7 +161,9 @@ class AgentCheckpointMixin:
                         exc_info=True,
                     )
             elif self.scheduler and self.lr_scheduler_enabled and "scheduler_state_dict" not in checkpoint:
-                logger.warning("LR Scheduler is enabled but its state was not found in the checkpoint. Scheduler will start fresh.")
+                logger.warning(
+                    "LR Scheduler is enabled but its state was not found in the checkpoint. Scheduler will start fresh."
+                )
 
             if "config" in checkpoint:
                 logger.info("Agent config found in checkpoint. Consider validating compatibility.")
@@ -223,7 +225,9 @@ class AgentCheckpointMixin:
             except Exception as e:
                 logger.error(f"Error loading target_network state_dict from dictionary: {e}", exc_info=True)
         else:
-            logger.warning("Target network state_dict not found in provided dictionary or agent.target_network is None.")
+            logger.warning(
+                "Target network state_dict not found in provided dictionary or agent.target_network is None."
+            )
 
         if "optimizer_state_dict" in agent_state_dict and self.optimizer is not None:
             try:
@@ -263,7 +267,9 @@ class AgentCheckpointMixin:
             and self.lr_scheduler_enabled
             and ("scheduler_state_dict" not in agent_state_dict or agent_state_dict.get("scheduler_state_dict") is None)
         ):
-            logger.warning("LR Scheduler is enabled but its state was not found in the dictionary. Scheduler will start fresh.")
+            logger.warning(
+                "LR Scheduler is enabled but its state was not found in the dictionary. Scheduler will start fresh."
+            )
 
         if successful_load:
             logger.info("Agent state loaded successfully from dictionary.")

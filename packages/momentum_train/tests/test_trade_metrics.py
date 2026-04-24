@@ -10,7 +10,9 @@ from momentum_train.trade_metrics import (
 )
 
 
-def _step(idx: int, pv: float, pos: float, price: float, action: int, *, greedy: bool | None = None, cost: float = 0.0) -> StepRecord:
+def _step(
+    idx: int, pv: float, pos: float, price: float, action: int, *, greedy: bool | None = None, cost: float = 0.0
+) -> StepRecord:
     return StepRecord(
         step_index=idx,
         portfolio_value=pv,

@@ -29,7 +29,9 @@ try:
 
     clear_directory = data_utils.clear_directory
 except ImportError:
-    logging.error("Could not import utility functions from data_utils. Ensure data_utils.py exists in the same directory.")
+    logging.error(
+        "Could not import utility functions from data_utils. Ensure data_utils.py exists in the same directory."
+    )
     sys.exit(1)
 
 # Get logger instance
@@ -115,7 +117,9 @@ def perform_train_val_test_split(
 
     invalid_date_files = [f for f, d in files_with_dates if d == datetime.min]
     if invalid_date_files:
-        logger.warning(f"Found {len(invalid_date_files)} files with unparseable dates; assigning them to the training set.")
+        logger.warning(
+            f"Found {len(invalid_date_files)} files with unparseable dates; assigning them to the training set."
+        )
 
     valid_entries = [(f, d) for f, d in files_with_dates if d != datetime.min]
     if not valid_entries:
@@ -171,7 +175,9 @@ def perform_train_val_test_split(
     n_train = len(train_files)
 
     if n_test == 0:
-        logger.error(f"Resolved test window (last {test_months} months) produced zero files. Check data coverage or adjust configuration.")
+        logger.error(
+            f"Resolved test window (last {test_months} months) produced zero files. Check data coverage or adjust configuration."
+        )
         return
     if n_val == 0:
         logger.error(f"Resolved validation window ({validation_months} months before test window) produced zero files.")
@@ -183,7 +189,9 @@ def perform_train_val_test_split(
     logger.info(
         f"Contiguous split across {total_months} distinct months -> Train: {len(train_month_keys)} months, Validation: {len(validation_month_keys)} months, Test: {len(test_month_keys)} months."
     )
-    logger.info(f"Validation window: preceding {validation_months} months (seed {seed} recorded for reproducibility notes).")
+    logger.info(
+        f"Validation window: preceding {validation_months} months (seed {seed} recorded for reproducibility notes)."
+    )
     logger.info(f"Final split sizes: Train={n_train}, Validation={n_val}, Test={n_test}")
     if n_train + n_val + n_test != n_total:
         logger.warning(

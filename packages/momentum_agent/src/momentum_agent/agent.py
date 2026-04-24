@@ -109,7 +109,9 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
                     "Please specify device='cuda' or ensure CUDA is available."
                 )
         elif self.device.type == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError(f"CUDA device requested for inference_only agent but CUDA is not available (got device={self.device}).")
+            raise RuntimeError(
+                f"CUDA device requested for inference_only agent but CUDA is not available (got device={self.device})."
+            )
 
         # All tunables now sourced from the validated dataclass — no more
         # silent-default fallbacks. Keys that fail range-validation in
@@ -142,7 +144,9 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
         self.store_partial_n_step = c.store_partial_n_step
         self.categorical_logging_interval = int(c.categorical_logging_interval)
         if self.categorical_logging_interval <= 0:
-            raise ValueError(f"categorical_logging_interval must be a positive integer, got {self.categorical_logging_interval}")
+            raise ValueError(
+                f"categorical_logging_interval must be a positive integer, got {self.categorical_logging_interval}"
+            )
         # Tier 3a/3b/3c/3d diagnostic cadences. Set to 0 in YAML to disable.
         self.noisy_sigma_logging_interval = max(0, int(c.noisy_sigma_logging_interval))
         self.q_value_logging_interval = max(0, int(c.q_value_logging_interval))
@@ -183,7 +187,9 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
             elif hasattr(torch.backends.cuda, "matmul") and hasattr(torch.backends.cuda.matmul, "fp32_precision"):
                 torch.backends.cuda.matmul.fp32_precision = "tf32"
             else:
-                logger.warning("torch.set_float32_matmul_precision is unavailable; TF32 settings fall back to torch defaults.")
+                logger.warning(
+                    "torch.set_float32_matmul_precision is unavailable; TF32 settings fall back to torch defaults."
+                )
             if (
                 hasattr(torch.backends, "cudnn")
                 and hasattr(torch.backends.cudnn, "conv")
@@ -286,7 +292,9 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
                         threshold=threshold,
                         min_lr=min_lr,
                     )
-                    logger.info(f"Initialized ReduceLROnPlateau with mode='{mode}', factor={factor}, patience={patience}")
+                    logger.info(
+                        f"Initialized ReduceLROnPlateau with mode='{mode}', factor={factor}, patience={patience}"
+                    )
                     self._scheduler_requires_metric = True
                 else:
                     logger.warning(f"Unsupported scheduler type: {scheduler_type}. No scheduler will be used.")
@@ -324,7 +332,9 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
         self._network_mode_training: bool | None = None
         self._apply_network_mode(self.training_mode)
         self._non_blocking_copy = self.device.type == "cuda" and torch.cuda.is_available()
-        self._market_tensor = torch.zeros((1, self.window_size, self.n_features), device=self.device, dtype=torch.float32)
+        self._market_tensor = torch.zeros(
+            (1, self.window_size, self.n_features), device=self.device, dtype=torch.float32
+        )
         self._account_tensor = torch.zeros((1, ACCOUNT_STATE_DIM), device=self.device, dtype=torch.float32)
         self._initialize_batch_tensors()
         self.total_steps = 0  # Track total steps for target network updates and beta annealing
@@ -409,7 +419,9 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
             assert obs["market_data"].shape == (
                 self.window_size,
                 self.n_features,
-            ), f"Input market_data shape mismatch. Expected {(self.window_size, self.n_features)}, got {obs['market_data'].shape}"
+            ), (
+                f"Input market_data shape mismatch. Expected {(self.window_size, self.n_features)}, got {obs['market_data'].shape}"
+            )
             assert obs["account_state"].shape == (ACCOUNT_STATE_DIM,), (
                 f"Input account_state shape mismatch. Expected ({ACCOUNT_STATE_DIM},), got {obs['account_state'].shape}"
             )
@@ -455,7 +467,9 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
             action = q_values.argmax().item()
             if self.debug_mode:
                 assert isinstance(action, int), f"Selected action is not an integer: {action}"
-                assert 0 <= action < self.num_actions, f"Selected action ({action}) is out of bounds [0, {self.num_actions})"
+                assert 0 <= action < self.num_actions, (
+                    f"Selected action ({action}) is out of bounds [0, {self.num_actions})"
+                )
             # Tier 2.2: only the live trader consumes ``_last_select_q_values``.
             # In training_mode, no consumer reads it and the D->H sync every
             # action is pure overhead. Skip the copy unless we're evaluating
@@ -749,7 +763,9 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
             self._n_step_needs_reset_flags[env_id] = False
 
         if self.debug_mode:
-            assert isinstance(obs, dict) and "market_data" in obs and "account_state" in obs, "Invalid current observation format"
+            assert isinstance(obs, dict) and "market_data" in obs and "account_state" in obs, (
+                "Invalid current observation format"
+            )
             assert isinstance(next_obs, dict) and "market_data" in next_obs and "account_state" in next_obs, (
                 "Invalid next observation format"
             )
@@ -757,16 +773,16 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
                 self.window_size,
                 self.n_features,
             ), f"Invalid obs market data shape {obs['market_data'].shape}"
-            assert isinstance(obs["account_state"], np.ndarray) and obs["account_state"].shape == (ACCOUNT_STATE_DIM,), (
-                f"Invalid obs account state shape {obs['account_state'].shape}"
-            )
+            assert isinstance(obs["account_state"], np.ndarray) and obs["account_state"].shape == (
+                ACCOUNT_STATE_DIM,
+            ), f"Invalid obs account state shape {obs['account_state'].shape}"
             assert isinstance(next_obs["market_data"], np.ndarray) and next_obs["market_data"].shape == (
                 self.window_size,
                 self.n_features,
             ), f"Invalid next_obs market data shape {next_obs['market_data'].shape}"
-            assert isinstance(next_obs["account_state"], np.ndarray) and next_obs["account_state"].shape == (ACCOUNT_STATE_DIM,), (
-                f"Invalid next_obs account state shape {next_obs['account_state'].shape}"
-            )
+            assert isinstance(next_obs["account_state"], np.ndarray) and next_obs["account_state"].shape == (
+                ACCOUNT_STATE_DIM,
+            ), f"Invalid next_obs account state shape {next_obs['account_state'].shape}"
             assert isinstance(action, (int, np.integer)), "Action must be an integer"
             assert isinstance(reward, (float, np.float32, np.float64)), "Reward must be a float"
             assert isinstance(done, (bool, np.bool_)), "Done flag must be boolean"
@@ -830,7 +846,9 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
                 assert next_actions.shape == (self.batch_size,), "Next actions shape mismatch"
 
             # Get next state's distribution Z(s_{t+n}, a*) from target network for selected actions a*
-            next_log_dist = self.target_network(next_market_data_batch, next_account_state_batch)  # [B, num_actions, num_atoms]
+            next_log_dist = self.target_network(
+                next_market_data_batch, next_account_state_batch
+            )  # [B, num_actions, num_atoms]
             if self.debug_mode:
                 assert next_log_dist.shape == (
                     self.batch_size,
@@ -905,7 +923,9 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
             if self.debug_mode:
                 sums = m.sum(dim=1)
                 if not torch.allclose(sums, torch.ones_like(sums), atol=1e-4):
-                    logger.warning(f"Target distribution M does not sum to 1. Sums: {sums}. Min sum: {sums.min()}, Max sum: {sums.max()}")
+                    logger.warning(
+                        f"Target distribution M does not sum to 1. Sums: {sums}. Min sum: {sums.min()}, Max sum: {sums.max()}"
+                    )
                     # It might not sum *exactly* to 1 due to floating point, clamping, and edge cases.
                     # A small tolerance is usually acceptable.
 
@@ -1141,7 +1161,9 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
             # --- Action entropy regularization --- #
             if self.entropy_coeff > 0:
                 all_q = (torch.exp(log_ps) * self.support.unsqueeze(0).unsqueeze(0)).sum(dim=2)  # [B, num_actions]
-                q_range = (all_q.max(dim=1, keepdim=True).values - all_q.min(dim=1, keepdim=True).values).clamp(min=1e-6)
+                q_range = (all_q.max(dim=1, keepdim=True).values - all_q.min(dim=1, keepdim=True).values).clamp(
+                    min=1e-6
+                )
                 q_normalized = (all_q - all_q.mean(dim=1, keepdim=True)) / q_range
                 policy = torch.softmax(q_normalized, dim=1)
                 log_policy = torch.log(policy + 1e-8)

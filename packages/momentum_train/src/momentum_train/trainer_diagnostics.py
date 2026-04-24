@@ -301,7 +301,11 @@ class DiagnosticsMixin:
         total_train_steps: int,
     ) -> bool:
         """Apply a one-time LR decay near the end of training if configured."""
-        if self.final_phase_lr_start_frac is None or self.final_phase_lr_multiplier is None or self._final_phase_lr_applied:
+        if (
+            self.final_phase_lr_start_frac is None
+            or self.final_phase_lr_multiplier is None
+            or self._final_phase_lr_applied
+        ):
             return False
 
         try:
@@ -477,7 +481,9 @@ class DiagnosticsMixin:
         steps_safe = max(steps_in_episode, 1)
         invalid_action_rate = invalid_action_count / steps_safe
         self.invalid_action_rate_window.append(invalid_action_rate)
-        rolling_invalid_rate = float(np.mean(self.invalid_action_rate_window)) if self.invalid_action_rate_window else 0.0
+        rolling_invalid_rate = (
+            float(np.mean(self.invalid_action_rate_window)) if self.invalid_action_rate_window else 0.0
+        )
         logger.info(
             "  Invalid Actions: %s (%.2f%% of steps, Rolling %.2f%% over last %s episodes)",
             invalid_action_count,
@@ -490,11 +496,21 @@ class DiagnosticsMixin:
         # tracker.log_summary(logger, episode + 1) # Original line causing error
         # --- Log tracker metrics --- #
         metrics = tracker.get_metrics()
-        logger.info(f"  Metrics - Total Return: {metrics.get('total_return', np.nan):.2f}%" if metrics else "Metrics: N/A")
-        logger.info(f"  Metrics - Sharpe Ratio: {metrics.get('sharpe_ratio', np.nan):.4f}" if metrics else "Metrics: N/A")
-        logger.info(f"  Metrics - Max Drawdown: {metrics.get('max_drawdown', np.nan) * 100:.2f}%" if metrics else "Metrics: N/A")
+        logger.info(
+            f"  Metrics - Total Return: {metrics.get('total_return', np.nan):.2f}%" if metrics else "Metrics: N/A"
+        )
+        logger.info(
+            f"  Metrics - Sharpe Ratio: {metrics.get('sharpe_ratio', np.nan):.4f}" if metrics else "Metrics: N/A"
+        )
+        logger.info(
+            f"  Metrics - Max Drawdown: {metrics.get('max_drawdown', np.nan) * 100:.2f}%" if metrics else "Metrics: N/A"
+        )
         logger.info(f"  Metrics - Action Counts: {metrics.get('action_counts', {})}" if metrics else "Metrics: N/A")
-        logger.info(f"  Metrics - Transaction Costs: ${metrics.get('transaction_costs', np.nan):.2f}" if metrics else "Metrics: N/A")
+        logger.info(
+            f"  Metrics - Transaction Costs: ${metrics.get('transaction_costs', np.nan):.2f}"
+            if metrics
+            else "Metrics: N/A"
+        )
         if metrics:
             logger.info(f"  Metrics - Avg Exposure: {metrics.get('avg_exposure_pct', np.nan):.2f}%")
             logger.info(f"  Metrics - Max Exposure: {metrics.get('max_exposure_pct', np.nan):.2f}%")
@@ -547,7 +563,9 @@ class DiagnosticsMixin:
                 if "avg_balance" in metrics:
                     self.writer.add_scalar("Train/Avg Balance", metrics.get("avg_balance", np.nan), episode)
                 if "avg_position_value" in metrics:
-                    self.writer.add_scalar("Train/Avg Position Value", metrics.get("avg_position_value", np.nan), episode)
+                    self.writer.add_scalar(
+                        "Train/Avg Position Value", metrics.get("avg_position_value", np.nan), episode
+                    )
                 action_counts = metrics.get("action_counts", {})
                 if action_counts:
                     for action_idx, count in action_counts.items():
@@ -574,7 +592,13 @@ class DiagnosticsMixin:
                 # Tier 2c: per-episode Train/Trade/* (HitRate/Expectancy/PctGreedy/...)
                 try:
                     train_trade_metrics = self._trade_metrics_from_tracker(tracker)
-                except (ValueError, KeyError, AttributeError, TypeError, IndexError):  # pragma: no cover - defensive, never block training
+                except (
+                    ValueError,
+                    KeyError,
+                    AttributeError,
+                    TypeError,
+                    IndexError,
+                ):  # pragma: no cover - defensive, never block training
                     logger.debug("Failed to compute Train/Trade metrics from tracker", exc_info=True)
                     train_trade_metrics = {}
                 for key, value in train_trade_metrics.items():
@@ -598,7 +622,9 @@ class DiagnosticsMixin:
                     self.writer.add_scalar("Train/Episode/RewardMin", outlier_stats["reward_min"], episode)
                     self.writer.add_scalar("Train/Episode/RewardMax", outlier_stats["reward_max"], episode)
                     self.writer.add_scalar("Train/Episode/RewardP99Abs", outlier_stats["reward_p99_abs"], episode)
-                    self.writer.add_scalar("Train/Episode/RewardOutlierFlag", outlier_stats["reward_outlier_flag"], episode)
+                    self.writer.add_scalar(
+                        "Train/Episode/RewardOutlierFlag", outlier_stats["reward_outlier_flag"], episode
+                    )
                 # Tier 4c: per-action reward mean/std. Action 0 (hold)
                 # dominates avg_reward by count, so this is the only place we
                 # can read off "is action 5 actually pulling its weight?".

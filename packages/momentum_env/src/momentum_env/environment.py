@@ -127,7 +127,9 @@ class TradingEnv(gym.Env):
         pre_trade_portfolio_value = old_portfolio_state.portfolio_value(current_price)
 
         target_frac = TARGET_ALLOCATIONS[action]
-        self.portfolio_state, is_valid = self._execute_target_allocation(target_frac, current_price, pre_trade_portfolio_value)
+        self.portfolio_state, is_valid = self._execute_target_allocation(
+            target_frac, current_price, pre_trade_portfolio_value
+        )
 
         post_trade_portfolio_value = self.portfolio_state.portfolio_value(current_price)
 
@@ -157,7 +159,9 @@ class TradingEnv(gym.Env):
         info["action"] = action
         info["target_allocation"] = target_frac
         info["invalid_action"] = not is_valid
-        info["step_transaction_cost"] = self.portfolio_state.total_transaction_cost - old_portfolio_state.total_transaction_cost
+        info["step_transaction_cost"] = (
+            self.portfolio_state.total_transaction_cost - old_portfolio_state.total_transaction_cost
+        )
 
         if next_step >= self.market_data.data_length:
             self.state["current_step"] = self.market_data.data_length
@@ -173,7 +177,9 @@ class TradingEnv(gym.Env):
 
         return observation, reward, terminated, truncated, info
 
-    def _execute_target_allocation(self, target_frac: float, current_price: float, portfolio_value: float) -> tuple[PortfolioState, bool]:
+    def _execute_target_allocation(
+        self, target_frac: float, current_price: float, portfolio_value: float
+    ) -> tuple[PortfolioState, bool]:
         """Adjust position to reach the target allocation fraction.
 
         Returns (new_portfolio_state, is_valid). All targets are always valid;

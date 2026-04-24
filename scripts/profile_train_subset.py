@@ -29,7 +29,9 @@ LOGGER_NAME = "momentum_train.ProfileTrain"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run a focused training session on a small random subset of training files for profiling.")
+    parser = argparse.ArgumentParser(
+        description="Run a focused training session on a small random subset of training files for profiling."
+    )
     parser.add_argument(
         "--config-path",
         type=str,

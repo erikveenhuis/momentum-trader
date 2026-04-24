@@ -163,7 +163,9 @@ def test_all_actions_valid(trading_env):
     for action in range(NUM_ACTIONS):
         trading_env.reset()
         obs, reward, term, trunc, info = trading_env.step(action)
-        assert not info.get("invalid_action", False), f"Action {action} ({TARGET_ALLOCATIONS[action] * 100}%) was invalid"
+        assert not info.get("invalid_action", False), (
+            f"Action {action} ({TARGET_ALLOCATIONS[action] * 100}%) was invalid"
+        )
 
 
 def test_hold_target_no_trade(trading_env):

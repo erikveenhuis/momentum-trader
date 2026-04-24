@@ -35,7 +35,9 @@ class AgentDiagnosticsMixin:
             return
 
         if not np.isfinite(batch_mass).all():
-            logger.warning("Non-finite values encountered while accumulating categorical target stats; skipping update.")
+            logger.warning(
+                "Non-finite values encountered while accumulating categorical target stats; skipping update."
+            )
             return
 
         self._categorical_target_accumulator["mass"] += batch_mass
@@ -52,7 +54,9 @@ class AgentDiagnosticsMixin:
         mass = accumulator["mass"]
         total_mass = mass.sum()
         if not np.isfinite(total_mass) or total_mass <= 0:
-            logger.warning("Invalid total mass encountered while logging categorical target stats; resetting accumulator.")
+            logger.warning(
+                "Invalid total mass encountered while logging categorical target stats; resetting accumulator."
+            )
             accumulator["mass"].fill(0.0)
             accumulator["samples"] = 0
             return

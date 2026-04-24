@@ -133,9 +133,9 @@ def test_find_latest_checkpoint_skips_truncated_zip_and_falls_back(tmp_path, cap
     assert result is not None, "Expected fallback to ep3652, got None."
     assert "ep3652" in result, f"Expected to pick ep3652 after skipping the truncated ep3700, got {result}"
     assert str(good) == result
-    assert any("central directory" in rec.message.lower() or "not a valid zip" in rec.message.lower() for rec in caplog.records), (
-        "Expected a WARNING log explaining the truncated-ZIP skip."
-    )
+    assert any(
+        "central directory" in rec.message.lower() or "not a valid zip" in rec.message.lower() for rec in caplog.records
+    ), "Expected a WARNING log explaining the truncated-ZIP skip."
 
 
 @pytest.mark.unit

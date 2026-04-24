@@ -60,7 +60,9 @@ class NoisyLinear(nn.Module):
         if self.debug and x.ndim < 2:
             raise ValueError(f"Input to NoisyLinear must have at least 2 dims (Batch, Features), got shape {x.shape}")
         if self.debug and x.shape[-1] != self.in_features:
-            raise ValueError(f"Input feature dim ({x.shape[-1]}) does not match NoisyLinear in_features ({self.in_features})")
+            raise ValueError(
+                f"Input feature dim ({x.shape[-1]}) does not match NoisyLinear in_features ({self.in_features})"
+            )
 
         if self.training:
             if self.debug:
@@ -77,7 +79,9 @@ class NoisyLinear(nn.Module):
         output = F.linear(x, weight, bias)
         expected_shape = list(x.shape[:-1]) + [self.out_features]
         if self.debug and output.shape != torch.Size(expected_shape):
-            raise ValueError(f"Output shape mismatch from NoisyLinear. Expected {torch.Size(expected_shape)}, got {output.shape}")
+            raise ValueError(
+                f"Output shape mismatch from NoisyLinear. Expected {torch.Size(expected_shape)}, got {output.shape}"
+            )
         return output
 
 
@@ -110,9 +114,13 @@ class PositionalEncoding(nn.Module):
         if self.debug and x.ndim != 3:
             raise ValueError(f"Input to PositionalEncoding must be 3D (Batch, Seq, Emb), got shape {x.shape}")
         if self.debug and x.shape[2] != self.d_model:
-            raise ValueError(f"Input embedding dim ({x.shape[2]}) does not match PositionalEncoding d_model ({self.d_model})")
+            raise ValueError(
+                f"Input embedding dim ({x.shape[2]}) does not match PositionalEncoding d_model ({self.d_model})"
+            )
         if self.debug and x.shape[1] > self.pe.shape[0]:
-            raise ValueError(f"Input sequence length ({x.shape[1]}) exceeds max_len ({self.pe.shape[0]}) of PositionalEncoding")
+            raise ValueError(
+                f"Input sequence length ({x.shape[1]}) exceeds max_len ({self.pe.shape[0]}) of PositionalEncoding"
+            )
 
         # Positional encoding expects shape [seq_len, batch_size, embedding_dim]
         x = x.permute(1, 0, 2)  # [seq_len, batch_size, embedding_dim]
@@ -254,13 +262,21 @@ class RainbowNetwork(nn.Module):
             if market_data.ndim != 3:
                 raise ValueError(f"Input market_data must be 3D (Batch, Seq, Feat), got shape {market_data.shape}")
             if market_data.shape[1] != self.window_size:
-                raise ValueError(f"Input market_data seq len ({market_data.shape[1]}) != window_size ({self.window_size})")
+                raise ValueError(
+                    f"Input market_data seq len ({market_data.shape[1]}) != window_size ({self.window_size})"
+                )
             if market_data.shape[2] != self.n_features:
-                raise ValueError(f"Input market_data feat dim ({market_data.shape[2]}) != n_features ({self.n_features})")
+                raise ValueError(
+                    f"Input market_data feat dim ({market_data.shape[2]}) != n_features ({self.n_features})"
+                )
             if account_state.ndim != 2:
-                raise ValueError(f"Input account_state must be 2D (Batch, Feat={ACCOUNT_STATE_DIM}), got shape {account_state.shape}")
+                raise ValueError(
+                    f"Input account_state must be 2D (Batch, Feat={ACCOUNT_STATE_DIM}), got shape {account_state.shape}"
+                )
             if account_state.shape[1] != ACCOUNT_STATE_DIM:
-                raise ValueError(f"Input account_state must have {ACCOUNT_STATE_DIM} features, got {account_state.shape[1]}")
+                raise ValueError(
+                    f"Input account_state must have {ACCOUNT_STATE_DIM} features, got {account_state.shape[1]}"
+                )
             if market_data.shape[0] != account_state.shape[0]:
                 raise ValueError("Batch size mismatch between market_data and account_state")
 
@@ -275,7 +291,9 @@ class RainbowNetwork(nn.Module):
 
         return log_probs
 
-    def forward_with_cls(self, market_data: torch.Tensor, account_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward_with_cls(
+        self, market_data: torch.Tensor, account_state: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (log_probs, cls_out) with a single encoder pass.
 
         Used by the training loss so the auxiliary return-prediction head can

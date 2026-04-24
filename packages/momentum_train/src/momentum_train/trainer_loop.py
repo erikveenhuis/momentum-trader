@@ -30,7 +30,9 @@ class LoopMixin:
         try:
             curriculum_frac = min(1.0, 0.3 + 0.7 * (episode / max(num_episodes, 1)))
             episode_file_path = (
-                Path(specific_file) if specific_file else self.data_manager.get_random_training_file(curriculum_frac=curriculum_frac)
+                Path(specific_file)
+                if specific_file
+                else self.data_manager.get_random_training_file(curriculum_frac=curriculum_frac)
             )
             logger.info(
                 f"--- Starting Episode {episode + 1}/{num_episodes} using file: {episode_file_path.name} (curriculum={curriculum_frac:.2f}) ---"
@@ -50,7 +52,9 @@ class LoopMixin:
             obs, info = env.reset()
             applied_frac = self._apply_benchmark_frac_to_env(env, episode)
             self._maybe_emit_benchmark_frac(episode, applied_frac)
-            assert isinstance(info["portfolio_value"], (float, np.float32, np.float64)), "Reset info missing valid portfolio_value"
+            assert isinstance(info["portfolio_value"], (float, np.float32, np.float64)), (
+                "Reset info missing valid portfolio_value"
+            )
             # Basic observation checks
             assert isinstance(obs, dict), "Observation must be a dict"
             assert "market_data" in obs and "account_state" in obs, "Observation missing keys"
@@ -198,8 +202,12 @@ class LoopMixin:
                         )
                         td_stats = getattr(self.agent, "last_td_error_stats", None)
                         if td_stats:
-                            self.writer.add_scalar("Train/TD_Error_Mean", td_stats.get("mean", float("nan")), total_train_steps)
-                            self.writer.add_scalar("Train/TD_Error_Std", td_stats.get("std", float("nan")), total_train_steps)
+                            self.writer.add_scalar(
+                                "Train/TD_Error_Mean", td_stats.get("mean", float("nan")), total_train_steps
+                            )
+                            self.writer.add_scalar(
+                                "Train/TD_Error_Std", td_stats.get("std", float("nan")), total_train_steps
+                            )
                         last_entropy = getattr(self.agent, "last_entropy", None)
                         if last_entropy is not None:
                             self.writer.add_scalar("Train/Action_Entropy", last_entropy, total_train_steps)
@@ -407,7 +415,11 @@ class LoopMixin:
                 per_env_episode_reward[i] += reward_i
                 per_env_steps[i] += 1
 
-                info_i = {k: (v[i] if hasattr(v, "__getitem__") else v) for k, v in infos.items()} if isinstance(infos, dict) else {}
+                info_i = (
+                    {k: (v[i] if hasattr(v, "__getitem__") else v) for k, v in infos.items()}
+                    if isinstance(infos, dict)
+                    else {}
+                )
                 per_env_trackers[i].update(
                     portfolio_value=info_i.get("portfolio_value", 0.0),
                     action=int(actions[i]),
@@ -472,7 +484,8 @@ class LoopMixin:
                             )
                             window_total = window_counts.sum()
                             act_pct = " ".join(
-                                f"{ai}:{window_counts[ai] * 100 / window_total:.0f}%" for ai in range(self.agent.num_actions)
+                                f"{ai}:{window_counts[ai] * 100 / window_total:.0f}%"
+                                for ai in range(self.agent.num_actions)
                             )
                         else:
                             act_pct = "n/a"
@@ -517,10 +530,18 @@ class LoopMixin:
                         )
                         self.writer.add_scalar("Train/Steps Per Episode", ep_steps, completed_episodes)
                         if ep_metrics:
-                            self.writer.add_scalar("Train/Total Return Pct", ep_metrics.get("total_return", 0), completed_episodes)
-                            self.writer.add_scalar("Train/Sharpe Ratio", ep_metrics.get("sharpe_ratio", 0), completed_episodes)
-                            self.writer.add_scalar("Train/Max Drawdown Pct", ep_metrics.get("max_drawdown", 0) * 100, completed_episodes)
-                            self.writer.add_scalar("Train/Transaction Costs", ep_metrics.get("transaction_costs", 0), completed_episodes)
+                            self.writer.add_scalar(
+                                "Train/Total Return Pct", ep_metrics.get("total_return", 0), completed_episodes
+                            )
+                            self.writer.add_scalar(
+                                "Train/Sharpe Ratio", ep_metrics.get("sharpe_ratio", 0), completed_episodes
+                            )
+                            self.writer.add_scalar(
+                                "Train/Max Drawdown Pct", ep_metrics.get("max_drawdown", 0) * 100, completed_episodes
+                            )
+                            self.writer.add_scalar(
+                                "Train/Transaction Costs", ep_metrics.get("transaction_costs", 0), completed_episodes
+                            )
                             for action_idx, count in ep_action_counts.items():
                                 rate = count / max(ep_steps, 1)
                                 self.writer.add_scalar(f"Train/Action Rate/{action_idx}", rate, completed_episodes)
@@ -533,8 +554,12 @@ class LoopMixin:
                                 for action_idx in range(int(getattr(self.agent, "num_actions", 6))):
                                     gr = float(ep_greedy.get(action_idx, 0) or 0) / steps_safe
                                     er = float(ep_eps.get(action_idx, 0) or 0) / steps_safe
-                                    self.writer.add_scalar(f"Train/Action Rate/Greedy/{action_idx}", gr, completed_episodes)
-                                    self.writer.add_scalar(f"Train/Action Rate/Eps/{action_idx}", er, completed_episodes)
+                                    self.writer.add_scalar(
+                                        f"Train/Action Rate/Greedy/{action_idx}", gr, completed_episodes
+                                    )
+                                    self.writer.add_scalar(
+                                        f"Train/Action Rate/Eps/{action_idx}", er, completed_episodes
+                                    )
                             self.writer.add_scalar(
                                 "Train/EpsilonForcedTradeFraction",
                                 float(ep_metrics.get("epsilon_forced_trade_fraction", 0.0) or 0.0),
@@ -543,7 +568,13 @@ class LoopMixin:
                             # Tier 2c: per-episode Train/Trade/* (HitRate/Expectancy/PctGreedy/...)
                             try:
                                 vec_trade_metrics = self._trade_metrics_from_tracker(per_env_trackers[i])
-                            except (ValueError, KeyError, AttributeError, TypeError, IndexError):  # pragma: no cover - defensive
+                            except (
+                                ValueError,
+                                KeyError,
+                                AttributeError,
+                                TypeError,
+                                IndexError,
+                            ):  # pragma: no cover - defensive
                                 logger.debug("Failed to compute Train/Trade metrics for env %d", i, exc_info=True)
                                 vec_trade_metrics = {}
                             for key, value in vec_trade_metrics.items():
@@ -558,11 +589,17 @@ class LoopMixin:
                             try:
                                 vec_outlier_stats = per_env_trackers[i].get_reward_outlier_stats(self.reward_clip_value)
                             except (ValueError, KeyError, AttributeError, TypeError):  # pragma: no cover - defensive
-                                logger.debug("Failed to compute Tier 4b reward outlier stats for env %d", i, exc_info=True)
+                                logger.debug(
+                                    "Failed to compute Tier 4b reward outlier stats for env %d", i, exc_info=True
+                                )
                                 vec_outlier_stats = {}
                             if vec_outlier_stats:
-                                self.writer.add_scalar("Train/Episode/RewardMin", vec_outlier_stats["reward_min"], completed_episodes)
-                                self.writer.add_scalar("Train/Episode/RewardMax", vec_outlier_stats["reward_max"], completed_episodes)
+                                self.writer.add_scalar(
+                                    "Train/Episode/RewardMin", vec_outlier_stats["reward_min"], completed_episodes
+                                )
+                                self.writer.add_scalar(
+                                    "Train/Episode/RewardMax", vec_outlier_stats["reward_max"], completed_episodes
+                                )
                                 self.writer.add_scalar(
                                     "Train/Episode/RewardP99Abs",
                                     vec_outlier_stats["reward_p99_abs"],
@@ -585,10 +622,16 @@ class LoopMixin:
                                 vec_by_action = {}
                             for k in range(int(getattr(self.agent, "num_actions", 6))):
                                 bucket = vec_by_action.get(k, {"mean": 0.0, "std": 0.0})
-                                self.writer.add_scalar(f"Train/Reward/MeanByAction/{k}", float(bucket["mean"]), completed_episodes)
-                                self.writer.add_scalar(f"Train/Reward/StdByAction/{k}", float(bucket["std"]), completed_episodes)
+                                self.writer.add_scalar(
+                                    f"Train/Reward/MeanByAction/{k}", float(bucket["mean"]), completed_episodes
+                                )
+                                self.writer.add_scalar(
+                                    f"Train/Reward/StdByAction/{k}", float(bucket["std"]), completed_episodes
+                                )
                         self.writer.add_scalar("Train/Epsilon", self.agent.current_epsilon, completed_episodes)
-                        self.writer.add_scalar("Train/Final Portfolio Value", ep_metrics.get("portfolio_value", 0), completed_episodes)
+                        self.writer.add_scalar(
+                            "Train/Final Portfolio Value", ep_metrics.get("portfolio_value", 0), completed_episodes
+                        )
 
                     # Vectorized episodes are long; flush after each one so the
                     # gap-on-freeze window is bounded by a single env-episode.
@@ -615,7 +658,11 @@ class LoopMixin:
                 # One-time visibility scalar: would the legacy ``% == 0`` check
                 # have skipped this boundary? Useful while operators get used to
                 # the new behaviour.
-                if crossed_validation_boundary and (completed_episodes % validation_freq_safe != 0) and self.writer is not None:
+                if (
+                    crossed_validation_boundary
+                    and (completed_episodes % validation_freq_safe != 0)
+                    and self.writer is not None
+                ):
                     try:
                         self.writer.add_scalar(
                             "Train/Diagnostics/ValidationSkippedDueToVectorJump",
@@ -759,7 +806,9 @@ class LoopMixin:
                         self.writer.add_scalar("Train/Learning_Rate", current_lr, total_train_steps)
 
                 # 1. Initialize episode environment and tracker
-                episode_env, initial_obs, initial_info, tracker = self._initialize_episode(specific_file, episode, num_episodes)
+                episode_env, initial_obs, initial_info, tracker = self._initialize_episode(
+                    specific_file, episode, num_episodes
+                )
                 if episode_env is None or tracker is None:
                     logger.error(f"Failed to initialize episode {episode + 1}. Skipping.")
                     continue

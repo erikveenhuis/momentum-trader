@@ -231,7 +231,9 @@ def aggregate_trade_metrics(trades: Iterable[TradeRecord]) -> dict[str, float]:
     wins = pnl_pct[pnl_pct > 0]
     losses = pnl_pct[pnl_pct < 0]
     pf_denominator = float(np.abs(losses).sum())
-    profit_factor = float(wins.sum() / pf_denominator) if pf_denominator > 0 else (float("inf") if wins.size > 0 else float("nan"))
+    profit_factor = (
+        float(wins.sum() / pf_denominator) if pf_denominator > 0 else (float("inf") if wins.size > 0 else float("nan"))
+    )
 
     std = _safe_std(pnl_pct)
     per_trade_sharpe = float(pnl_pct.mean() / std) if std > 1e-12 else float("nan")

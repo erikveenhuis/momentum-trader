@@ -56,11 +56,15 @@ def test_finalize_skips_save_when_no_checkpoints_saved_this_run(tmp_path, caplog
     with caplog.at_level("WARNING", logger="Trainer"):
         trainer._finalize_training(total_train_steps=0, num_episodes=1, val_files=[])
 
-    assert trainer.agent.save_model_calls == [], "agent.save_model must not be called when _checkpoints_saved_this_run == 0"
+    assert trainer.agent.save_model_calls == [], (
+        "agent.save_model must not be called when _checkpoints_saved_this_run == 0"
+    )
     assert preexisting.read_bytes() == original_bytes, (
         "Pre-existing rainbow_transformer_final_agent_state.pt was clobbered despite the guard"
     )
-    assert any("Skipping save" in rec.message for rec in caplog.records), "Expected a WARNING log explaining why _final was not written"
+    assert any("Skipping save" in rec.message for rec in caplog.records), (
+        "Expected a WARNING log explaining why _final was not written"
+    )
 
 
 @pytest.mark.unit

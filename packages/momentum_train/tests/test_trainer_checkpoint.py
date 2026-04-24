@@ -151,7 +151,9 @@ def test_save_checkpoint_invokes_release_memory_to_os(tmp_path, monkeypatch):
     trainer = _make_trainer_with_minimal_save_state(tmp_path)
     # Non-best save (one torch.save invocation).
     trainer._save_checkpoint(episode=1, total_steps=100, is_best=False)
-    assert calls["release"] == 1, f"Expected exactly one release_memory_to_os call on a non-best save, got {calls['release']}"
+    assert calls["release"] == 1, (
+        f"Expected exactly one release_memory_to_os call on a non-best save, got {calls['release']}"
+    )
     # current_rss_gb is called twice: once before save, once after trim.
     assert calls["rss"] >= 2
 
@@ -173,4 +175,6 @@ def test_save_checkpoint_still_releases_on_is_best(tmp_path, monkeypatch):
 
     trainer = _make_trainer_with_minimal_save_state(tmp_path)
     trainer._save_checkpoint(episode=1, total_steps=100, is_best=True, validation_score=0.5)
-    assert calls["release"] == 1, f"Expected one release_memory_to_os call even when both latest + best saves fire, got {calls['release']}"
+    assert calls["release"] == 1, (
+        f"Expected one release_memory_to_os call even when both latest + best saves fire, got {calls['release']}"
+    )

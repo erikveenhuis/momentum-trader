@@ -358,7 +358,9 @@ class TestSubAccountCryptoRoundtrip:
 
         filled_buy = _wait_for_order(broker_manager.client, adopted_entry.account_id, buy_order.id)
         filled_status = getattr(filled_buy, "status", None)
-        filled_status_str = (filled_status.value if hasattr(filled_status, "value") else str(filled_status) or "").lower()
+        filled_status_str = (
+            filled_status.value if hasattr(filled_status, "value") else str(filled_status) or ""
+        ).lower()
         assert filled_status_str == "filled", f"Buy did not fill (status={filled_status_str!r})"
         assert float(getattr(filled_buy, "filled_qty", 0.0) or 0.0) > 0.0
 
@@ -440,7 +442,9 @@ class TestAgentSmokeLoop:
         )
 
         bars = _fetch_btc_minute_bars(lookback_minutes=max(config.window_size * 3, 180))
-        assert len(bars) >= config.window_size, f"Need at least {config.window_size} 1-minute bars from Alpaca, got {len(bars)}"
+        assert len(bars) >= config.window_size, (
+            f"Need at least {config.window_size} 1-minute bars from Alpaca, got {len(bars)}"
+        )
 
         warmup = bars[: config.window_size - 1]
         latest = bars[config.window_size - 1]

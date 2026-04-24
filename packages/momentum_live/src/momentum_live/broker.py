@@ -70,7 +70,9 @@ class BrokerCredentials:
             if not value
         ]
         if missing:
-            raise OSError(f"Missing Broker API env vars: {', '.join(missing)}. Run `source scripts/env-paper.sh` after populating .env.")
+            raise OSError(
+                f"Missing Broker API env vars: {', '.join(missing)}. Run `source scripts/env-paper.sh` after populating .env."
+            )
 
         return cls(
             api_key=api_key,  # type: ignore[arg-type]
@@ -475,7 +477,9 @@ class BrokerAccountManager:
                     raise RuntimeError(f"Journal {journal_id} ended in non-executed status: {status}")
                 return
             time.sleep(self.DEFAULT_JOURNAL_WAIT_INTERVAL)
-        LOGGER.warning("Journal %s did not reach terminal status within %.1fs", journal_id, self.DEFAULT_JOURNAL_WAIT_TIMEOUT)
+        LOGGER.warning(
+            "Journal %s did not reach terminal status within %.1fs", journal_id, self.DEFAULT_JOURNAL_WAIT_TIMEOUT
+        )
 
     def _create_sandbox_account(self, label: str) -> str:
         """Create a sandbox sub-account with deterministic dummy KYC."""

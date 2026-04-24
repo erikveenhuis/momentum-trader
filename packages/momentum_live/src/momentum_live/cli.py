@@ -24,7 +24,9 @@ def _parse_adopt_spec(spec: str) -> tuple[str, str]:
     a UUID, so we split on the *last* ``:`` to be unambiguous.
     """
     if ":" not in spec:
-        raise ValueError(f"--adopt value {spec!r} must be in the form PAIR:ACCOUNT_ID, e.g. BTC/USD:a7880383-9924-446b-8be7-3d8b3bcdf68f")
+        raise ValueError(
+            f"--adopt value {spec!r} must be in the form PAIR:ACCOUNT_ID, e.g. BTC/USD:a7880383-9924-446b-8be7-3d8b3bcdf68f"
+        )
     pair, account_id = spec.rsplit(":", 1)
     pair = pair.strip()
     account_id = account_id.strip()
@@ -79,7 +81,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--min-rebalance-pct", type=float, required=True, help="Min allocation delta to trigger trade")
     parser.add_argument("--min-trade-value", type=float, required=True, help="Min trade notional in USD")
-    parser.add_argument("--location", default=None, help="Alpaca crypto data feed location (default: ALPACA_CRYPTO_FEED or 'us')")
+    parser.add_argument(
+        "--location", default=None, help="Alpaca crypto data feed location (default: ALPACA_CRYPTO_FEED or 'us')"
+    )
     parser.add_argument(
         "--reset-mode",
         choices=("none", "soft", "hard"),

@@ -116,7 +116,9 @@ class BrokerAccountRegistry:
 
     def _flush_locked(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {pair: {k: v for k, v in asdict(entry).items() if k != "pair"} for pair, entry in self._entries.items()}
+        payload = {
+            pair: {k: v for k, v in asdict(entry).items() if k != "pair"} for pair, entry in self._entries.items()
+        }
         tmp_path = self._path.with_suffix(self._path.suffix + ".tmp")
         tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
         os.replace(tmp_path, self._path)

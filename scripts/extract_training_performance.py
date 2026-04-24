@@ -126,7 +126,9 @@ def extract_training_performance() -> None:
                     continue
 
                 # Extract additional metrics for the current episode being processed
-                if performance_data and performance_data[-1]["episode"] == str(episode_num if "episode_num" in locals() else 0):
+                if performance_data and performance_data[-1]["episode"] == str(
+                    episode_num if "episode_num" in locals() else 0
+                ):
                     if "Steps:" in normalized_message:
                         steps_match = STEPS_RE.search(normalized_message)
                         if steps_match:

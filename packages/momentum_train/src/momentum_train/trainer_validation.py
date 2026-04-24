@@ -80,7 +80,8 @@ class ValidationMixin:
             # During min_episodes_before_early_stopping, validate() does not update best; force is_best False so we do not save misleading "best" checkpoints.
             completed_episodes = episode + 1
             eligible_for_best = (
-                self.min_episodes_before_early_stopping <= 0 or completed_episodes >= self.min_episodes_before_early_stopping
+                self.min_episodes_before_early_stopping <= 0
+                or completed_episodes >= self.min_episodes_before_early_stopping
             )
             if eligible_for_best and validation_score > old_best_validation_metric + self.min_validation_threshold:
                 is_best = True
@@ -154,10 +155,14 @@ class ValidationMixin:
                     final_pv = avg_val_metrics.get("final_portfolio_value")
                     if final_pv is None:
                         final_pv = avg_val_metrics.get("portfolio_value")
-                    if final_pv is not None and not (isinstance(final_pv, float) and (math.isnan(final_pv) or math.isinf(final_pv))):
+                    if final_pv is not None and not (
+                        isinstance(final_pv, float) and (math.isnan(final_pv) or math.isinf(final_pv))
+                    ):
                         self.writer.add_scalar("Validation/Final Portfolio Value", float(final_pv), episode)
                     txn_costs = avg_val_metrics.get("transaction_costs")
-                    if txn_costs is not None and not (isinstance(txn_costs, float) and (math.isnan(txn_costs) or math.isinf(txn_costs))):
+                    if txn_costs is not None and not (
+                        isinstance(txn_costs, float) and (math.isnan(txn_costs) or math.isinf(txn_costs))
+                    ):
                         self.writer.add_scalar("Validation/Transaction Costs", float(txn_costs), episode)
                     # Tier 1b: per-action rate parity with Train/Action Rate/{0..5}.
                     action_rates = avg_val_metrics.get("action_rates", {}) or {}
@@ -203,7 +208,9 @@ class ValidationMixin:
             # ---------------------------------------------------- #
 
             # --- Step LR Scheduler if it's ReduceLROnPlateau --- #
-            if self.agent.lr_scheduler_enabled and isinstance(self.agent.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            if self.agent.lr_scheduler_enabled and isinstance(
+                self.agent.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau
+            ):
                 if validation_score != -np.inf:  # Only step if validation score is valid
                     current_lr = self.agent.optimizer.param_groups[0]["lr"]
                     logger.info(f"[LR Scheduler] Before step: LR={current_lr:.8f}, metric={validation_score:.6f}")
@@ -219,13 +226,17 @@ class ValidationMixin:
                         self.early_stopping_counter = 0
                     # Log current learning rate to TensorBoard after potential step
                     if self.writer:
-                        self.writer.add_scalar("Train/Learning_Rate", new_lr, total_train_steps)  # Use total_train_steps or episode
+                        self.writer.add_scalar(
+                            "Train/Learning_Rate", new_lr, total_train_steps
+                        )  # Use total_train_steps or episode
                 else:
                     logger.warning("Skipping ReduceLROnPlateau step due to invalid validation score (-np.inf).")
             # ---------------------------------------------------- #
 
             if should_stop_training and self.early_stopping_counter < self.early_stopping_patience:
-                logger.info("[EarlyStopping] Counter reset after scheduler step; deferring stop to observe reduced learning rate.")
+                logger.info(
+                    "[EarlyStopping] Counter reset after scheduler step; deferring stop to observe reduced learning rate."
+                )
                 should_stop_training = False
 
             # Save checkpoint AFTER validation
@@ -302,7 +313,9 @@ class ValidationMixin:
             # --- Assert info structure --- #
             assert isinstance(info, dict), "Validation: Info from env.step() must be a dict"
             assert "portfolio_value" in info, "Validation: Info missing portfolio_value"
-            assert isinstance(info["portfolio_value"], (float, np.float32, np.float64)), "Validation: portfolio_value is not a float"
+            assert isinstance(info["portfolio_value"], (float, np.float32, np.float64)), (
+                "Validation: portfolio_value is not a float"
+            )
             # --- End Assert --- #
 
             return (
@@ -478,7 +491,11 @@ class ValidationMixin:
 
     # --- Validation Helper Methods ---
     def _validate_single_file(
-        self, val_file: Path, validation_episode: int = 0, total_validation_episodes: int = 1, context: str = "validation"
+        self,
+        val_file: Path,
+        validation_episode: int = 0,
+        total_validation_episodes: int = 1,
+        context: str = "validation",
     ) -> dict | None:
         """Runs validation on a single file and returns collected metrics/results."""
         logger.info(
@@ -599,7 +616,9 @@ class ValidationMixin:
                 # Tier 2b: surface per-trade economics so run_training._emit_trade_metrics
                 # and the validation TB block can mirror them. ``trades`` is also kept
                 # so the JSONL sidecar / offline analyzer (Tier 5c) can consume them.
-                "trade_metrics": dict(file_metrics.get("trade_metrics", {})) if file_metrics.get("trade_metrics") else {},
+                "trade_metrics": dict(file_metrics.get("trade_metrics", {}))
+                if file_metrics.get("trade_metrics")
+                else {},
                 "trades": list(file_metrics.get("trades", [])),
                 "total_steps": int(file_metrics.get("total_steps", 0) or 0),
                 "action_counts": dict(file_metrics.get("action_counts", {}) or {}),
@@ -704,7 +723,9 @@ class ValidationMixin:
         # so files with zero trades don't poison the aggregate). Also flatten the
         # per-trade PnL list for histogram emission.
         trade_payloads = [
-            m.get("trade_metrics", {}) for m in all_file_metrics if isinstance(m.get("trade_metrics"), dict) and m.get("trade_metrics")
+            m.get("trade_metrics", {})
+            for m in all_file_metrics
+            if isinstance(m.get("trade_metrics"), dict) and m.get("trade_metrics")
         ]
         avg_trade_metrics: dict[str, float] = {}
         if trade_payloads:
@@ -788,7 +809,9 @@ class ValidationMixin:
                 f"Early stopping counter: {self.early_stopping_counter}/{self.early_stopping_patience}"
             )
             if self.early_stopping_counter >= self.early_stopping_patience:
-                logger.info(f"Early stopping triggered after {self.early_stopping_counter} episodes without improvement.")
+                logger.info(
+                    f"Early stopping triggered after {self.early_stopping_counter} episodes without improvement."
+                )
                 should_stop = True
             else:
                 should_stop = False
@@ -802,7 +825,9 @@ class ValidationMixin:
 
         # Handle empty validation file list
         if not val_files:
-            logger.warning("validate() called with empty val_files list. Returning default score -inf and empty metrics.")
+            logger.warning(
+                "validate() called with empty val_files list. Returning default score -inf and empty metrics."
+            )
             return False, -np.inf, {}  # MODIFIED: Return empty dict for avg_metrics
 
         all_file_metrics = []
@@ -832,7 +857,9 @@ class ValidationMixin:
                 logger.warning("No valid episode scores collected during validation. Defaulting score to -inf.")
                 validation_score = -np.inf
             elif -np.inf in episode_scores:
-                logger.warning("At least one validation episode failed (score=-inf). Overall validation score set to -inf.")
+                logger.warning(
+                    "At least one validation episode failed (score=-inf). Overall validation score set to -inf."
+                )
                 validation_score = -np.inf
             else:  # All episodes succeeded (returned finite scores)
                 # Calculate average of episode scores

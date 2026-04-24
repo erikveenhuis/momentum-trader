@@ -35,7 +35,7 @@ momentum_train = { workspace = true }
 momentum_live = { workspace = true }
 
 [tool.ruff]
-line-length = 140
+line-length = 120
 target-version = "py313"
 
 [tool.ruff.lint]

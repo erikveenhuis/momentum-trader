@@ -88,7 +88,9 @@ def main(argv: list[str] | None = None) -> int:
 
     credentials = BrokerCredentials.from_environment()
     if not credentials.has_firm_account:
-        LOGGER.error("momentum-live-reset requires ALPACA_BROKER_ACCOUNT_ID (JNLC funding account). Set it in .env and re-run.")
+        LOGGER.error(
+            "momentum-live-reset requires ALPACA_BROKER_ACCOUNT_ID (JNLC funding account). Set it in .env and re-run."
+        )
         return 1
 
     registry = BrokerAccountRegistry(args.registry)

@@ -217,11 +217,16 @@ def auto_pick_checkpoint(model_dir: Path) -> tuple[Path, str]:
     val_results = _validation_results(model_dir)
     latest_files = _list_latest_checkpoints(model_dir)
     if not latest_files:
-        raise FileNotFoundError(f"No checkpoint_trainer_latest_*_ep*_reward*.pt files found in {model_dir}; nothing to recover from.")
+        raise FileNotFoundError(
+            f"No checkpoint_trainer_latest_*_ep*_reward*.pt files found in {model_dir}; nothing to recover from."
+        )
 
     if not val_results:
         episode, path = latest_files[-1]
-        return path, f"no validation_results_*.json found; falling back to most recent latest checkpoint (ep {episode})."
+        return (
+            path,
+            f"no validation_results_*.json found; falling back to most recent latest checkpoint (ep {episode}).",
+        )
 
     scores = [s for _, s, _ in val_results]
     scores_sorted = sorted(scores)
@@ -360,7 +365,9 @@ def reset_noisy_in_checkpoint(checkpoint: dict, std_init: float | None) -> int:
     inner_online = getattr(agent.network, "_orig_mod", agent.network)
     inner_target = getattr(agent.target_network, "_orig_mod", agent.target_network)
     checkpoint["network_state_dict"] = _format_like(checkpoint.get("network_state_dict"), inner_online.state_dict())
-    checkpoint["target_network_state_dict"] = _format_like(checkpoint.get("target_network_state_dict"), inner_target.state_dict())
+    checkpoint["target_network_state_dict"] = _format_like(
+        checkpoint.get("target_network_state_dict"), inner_target.state_dict()
+    )
     return count
 
 
@@ -515,7 +522,9 @@ def main(argv: list[str] | None = None) -> int:
                 logger.error("Failed to reset NoisyLinear sigma: %s", exc, exc_info=True)
                 return 4
             label = "per-layer" if args.noisy_sigma_init is None else f"{float(args.noisy_sigma_init):.4f}"
-            mutations.append(f"reset-noisy: refilled {count} online + {count} target NoisyLinear layer(s) (std_init={label})")
+            mutations.append(
+                f"reset-noisy: refilled {count} online + {count} target NoisyLinear layer(s) (std_init={label})"
+            )
 
     if args.reset_best_validation:
         changed = reset_best_validation_state(checkpoint)
@@ -523,7 +532,9 @@ def main(argv: list[str] | None = None) -> int:
             details = ", ".join(f"{key}: {old!r} -> {new!r}" for key, (old, new) in changed.items())
             mutations.append(f"reset-best-validation: {details}")
         else:
-            mutations.append("reset-best-validation: nothing to reset (best_validation_metric / early_stopping_counter both absent)")
+            mutations.append(
+                "reset-best-validation: nothing to reset (best_validation_metric / early_stopping_counter both absent)"
+            )
 
     if args.dry_run:
         logger.info("Dry run: no checkpoint written.")

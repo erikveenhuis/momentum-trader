@@ -146,7 +146,9 @@ def _emit_trade_metrics(
     if not detailed_results:
         return
     trade_payloads = [
-        item.get("trade_metrics") for item in detailed_results if isinstance(item, dict) and isinstance(item.get("trade_metrics"), dict)
+        item.get("trade_metrics")
+        for item in detailed_results
+        if isinstance(item, dict) and isinstance(item.get("trade_metrics"), dict)
     ]
     if not trade_payloads:
         return
@@ -155,7 +157,9 @@ def _emit_trade_metrics(
         keys.update(payload.keys())
     for key in sorted(keys):
         values = [
-            float(payload[key]) for payload in trade_payloads if key in payload and payload[key] is not None and np.isfinite(payload[key])
+            float(payload[key])
+            for payload in trade_payloads
+            if key in payload and payload[key] is not None and np.isfinite(payload[key])
         ]
         if not values:
             continue
@@ -757,13 +761,17 @@ def main():  # Remove default config_path
         "--noisy-sigma-init",
         type=float,
         default=None,
-        help=("Override the std_init scalar used by --reset-noisy-on-resume. Defaults to each layer's constructor value (typically 0.5)."),
+        help=(
+            "Override the std_init scalar used by --reset-noisy-on-resume. Defaults to each layer's constructor value (typically 0.5)."
+        ),
     )
     parser.add_argument(
         "--benchmark-frac-override",
         type=float,
         default=None,
-        help=("Pin benchmark_allocation_frac to this constant for the entire run, ignoring any scheduled anneal in trainer config."),
+        help=(
+            "Pin benchmark_allocation_frac to this constant for the entire run, ignoring any scheduled anneal in trainer config."
+        ),
     )
     parser.add_argument(
         "--log-level",
@@ -838,7 +846,9 @@ def main():  # Remove default config_path
     model_dir = run_config.get("model_dir", "models")  # Default model dir is reasonable
     # REMOVE reliance on config for resume, use flag instead
     # resume_training = run_config.get('resume', False)
-    eval_model_prefix = run_config.get("eval_model_prefix", f"{model_dir}/rainbow_transformer_best")  # Default prefix is reasonable
+    eval_model_prefix = run_config.get(
+        "eval_model_prefix", f"{model_dir}/rainbow_transformer_best"
+    )  # Default prefix is reasonable
     skip_evaluation = run_config.get("skip_evaluation", False)  # Default to False is reasonable
     data_base_dir = run_config.get("data_base_dir", "data")  # Default base dir is reasonable
 
@@ -933,7 +943,9 @@ def main():  # Remove default config_path
         )
 
     else:
-        logger.error(f"Invalid mode specified in config run section: {mode}. Use 'train' or 'eval'.")  # Or raise ValueError
+        logger.error(
+            f"Invalid mode specified in config run section: {mode}. Use 'train' or 'eval'."
+        )  # Or raise ValueError
 
     logger.info(f"Script finished ({mode} mode, agent: rainbow).")
 

@@ -547,7 +547,9 @@ def test_handle_validation_skips_silently_when_vec_env_jump_and_not_forced(tmp_p
     because ``(2001 + 1) % 200 != 0`` and ``(2001 + 1) % 50 != 0``. Without the
     ``force_*`` overrides this path produced the silent April 2026 outage.
     """
-    trainer, validate_calls, save_calls, tracker = _capture_handler_setup(tmp_path, validation_freq=200, checkpoint_save_freq=50)
+    trainer, validate_calls, save_calls, tracker = _capture_handler_setup(
+        tmp_path, validation_freq=200, checkpoint_save_freq=50
+    )
 
     should_stop = trainer._handle_validation_and_checkpointing(
         episode=2001,
@@ -568,7 +570,9 @@ def test_handle_validation_fires_on_vec_env_jump_when_forced(tmp_path):
     checkpoint at the jumped-past boundary even though ``episode`` is 2001,
     not 1999 (the exact ``validation_freq`` multiple we overshot).
     """
-    trainer, validate_calls, save_calls, tracker = _capture_handler_setup(tmp_path, validation_freq=200, checkpoint_save_freq=50)
+    trainer, validate_calls, save_calls, tracker = _capture_handler_setup(
+        tmp_path, validation_freq=200, checkpoint_save_freq=50
+    )
 
     should_stop = trainer._handle_validation_and_checkpointing(
         episode=2001,
@@ -595,7 +599,9 @@ def test_handle_validation_still_fires_on_exact_boundary_without_force(tmp_path)
     when the episode counter *does* land exactly on a validation/checkpoint
     boundary — i.e. we did not break the legacy single-env loop.
     """
-    trainer, validate_calls, save_calls, tracker = _capture_handler_setup(tmp_path, validation_freq=200, checkpoint_save_freq=50)
+    trainer, validate_calls, save_calls, tracker = _capture_handler_setup(
+        tmp_path, validation_freq=200, checkpoint_save_freq=50
+    )
 
     trainer._handle_validation_and_checkpointing(
         episode=1999,
@@ -812,9 +818,15 @@ def test_trade_metrics_from_tracker_recovers_pct_greedy(tmp_path):
     tracker.add_initial_value(1000.0)
 
     # Open at price=100, hold one bar at 110, close at 120 → +20% gross.
-    tracker.update(portfolio_value=1100.0, action=5, reward=0.0, position=1.0, balance=0.0, price=100.0, was_greedy=True)
-    tracker.update(portfolio_value=1200.0, action=5, reward=0.0, position=1.0, balance=0.0, price=110.0, was_greedy=True)
-    tracker.update(portfolio_value=1300.0, action=0, reward=0.0, position=0.0, balance=1300.0, price=120.0, was_greedy=False)
+    tracker.update(
+        portfolio_value=1100.0, action=5, reward=0.0, position=1.0, balance=0.0, price=100.0, was_greedy=True
+    )
+    tracker.update(
+        portfolio_value=1200.0, action=5, reward=0.0, position=1.0, balance=0.0, price=110.0, was_greedy=True
+    )
+    tracker.update(
+        portfolio_value=1300.0, action=0, reward=0.0, position=0.0, balance=1300.0, price=120.0, was_greedy=False
+    )
 
     trade_metrics = trainer._trade_metrics_from_tracker(tracker)
 
@@ -1050,7 +1062,11 @@ def test_validate_cadence_silent_for_healthy_config(tmp_path, caplog):
     trainer.min_episodes_before_early_stopping = 100
     with caplog.at_level("WARNING"):
         trainer._validate_validation_cadence_config(num_episodes=1000, has_val_files=True)
-    bad_records = [rec for rec in caplog.records if "validation_freq" in rec.message or "min_episodes_before_early_stopping" in rec.message]
+    bad_records = [
+        rec
+        for rec in caplog.records
+        if "validation_freq" in rec.message or "min_episodes_before_early_stopping" in rec.message
+    ]
     assert bad_records == []
 
 

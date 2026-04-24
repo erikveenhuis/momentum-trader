@@ -8,8 +8,12 @@ logger = get_logger(__name__)
 def calculate_sharpe_ratio(returns: list[float], risk_free_rate: float = 0.02) -> float:
     """Calculate the Sharpe ratio of returns."""
     assert isinstance(returns, list), "Input returns must be a list"
-    assert all(isinstance(r, (float, np.float32, np.float64)) for r in returns), "All elements in returns must be floats"
-    assert isinstance(risk_free_rate, float) and 0.0 <= risk_free_rate < 1.0, "Risk-free rate must be a float between 0 and 1"
+    assert all(isinstance(r, (float, np.float32, np.float64)) for r in returns), (
+        "All elements in returns must be floats"
+    )
+    assert isinstance(risk_free_rate, float) and 0.0 <= risk_free_rate < 1.0, (
+        "Risk-free rate must be a float between 0 and 1"
+    )
     if not returns:
         return 0.0
 
@@ -34,7 +38,9 @@ def calculate_sharpe_ratio(returns: list[float], risk_free_rate: float = 0.02) -
 def calculate_max_drawdown(portfolio_values: list[float]) -> float:
     """Calculate the maximum drawdown from portfolio values."""
     assert isinstance(portfolio_values, list), "Input portfolio_values must be a list"
-    assert all(isinstance(v, (float, np.float32, np.float64)) for v in portfolio_values), "All elements in portfolio_values must be floats"
+    assert all(isinstance(v, (float, np.float32, np.float64)) for v in portfolio_values), (
+        "All elements in portfolio_values must be floats"
+    )
     if not portfolio_values:
         return 0.0
 
@@ -51,12 +57,16 @@ def calculate_max_drawdown(portfolio_values: list[float]) -> float:
 def calculate_avg_trade_return(returns: list[float]) -> float:
     """Calculate the average return per trade."""
     assert isinstance(returns, list), "Input returns must be a list"
-    assert all(isinstance(r, (float, np.float32, np.float64)) for r in returns), "All elements in returns must be floats"
+    assert all(isinstance(r, (float, np.float32, np.float64)) for r in returns), (
+        "All elements in returns must be floats"
+    )
     if not returns:
         return 0.0
 
     avg_return = np.mean(returns)
-    assert not np.isnan(avg_return) and not np.isinf(avg_return), f"Avg trade return calculation resulted in NaN/Inf: {avg_return}"
+    assert not np.isnan(avg_return) and not np.isinf(avg_return), (
+        f"Avg trade return calculation resulted in NaN/Inf: {avg_return}"
+    )
     return avg_return
 
 
@@ -136,7 +146,9 @@ class PerformanceTracker:
 
     def add_initial_value(self, initial_value: float):
         """Adds the initial portfolio value before the first step."""
-        assert isinstance(initial_value, (float, np.float32, np.float64)) and initial_value >= 0, "Invalid initial portfolio value"
+        assert isinstance(initial_value, (float, np.float32, np.float64)) and initial_value >= 0, (
+            "Invalid initial portfolio value"
+        )
         if not self.portfolio_values:  # Only add if list is empty
             self.portfolio_values.append(initial_value)
         else:
@@ -172,10 +184,14 @@ class PerformanceTracker:
         was_greedy: bool | None = None,
     ):
         """Update tracker with new values."""
-        assert isinstance(portfolio_value, (float, np.float32, np.float64)) and portfolio_value >= 0, "Invalid portfolio value"
+        assert isinstance(portfolio_value, (float, np.float32, np.float64)) and portfolio_value >= 0, (
+            "Invalid portfolio value"
+        )
         assert isinstance(action, (int, float, np.integer, np.float32, np.float64)), "Invalid action type"
         assert isinstance(reward, (float, np.float32, np.float64)), "Invalid reward type"
-        assert isinstance(transaction_cost, (float, np.float32, np.float64)) and transaction_cost >= 0, "Invalid transaction cost"
+        assert isinstance(transaction_cost, (float, np.float32, np.float64)) and transaction_cost >= 0, (
+            "Invalid transaction cost"
+        )
         assert not np.isnan(reward) and not np.isinf(reward), "Reward is NaN or Inf"
 
         self.portfolio_values.append(portfolio_value)
@@ -226,7 +242,9 @@ class PerformanceTracker:
         eps = {i: 0 for i in range(num_actions)}
         unknown = {i: 0 for i in range(num_actions)}
         if len(self.was_greedy) != len(self.actions):
-            logger.warning("Provenance length mismatch: actions=%d was_greedy=%d", len(self.actions), len(self.was_greedy))
+            logger.warning(
+                "Provenance length mismatch: actions=%d was_greedy=%d", len(self.actions), len(self.was_greedy)
+            )
         for action, flag in zip(self.actions, self.was_greedy, strict=False):
             a = int(action)
             if not (0 <= a < num_actions):
@@ -383,9 +401,13 @@ class PerformanceTracker:
             recent_exposures = self.exposures[-(effective_window - 1) :]
             metrics["avg_exposure_pct"] = float(np.mean(recent_exposures) * 100.0)
             metrics["max_exposure_pct"] = float(np.max(recent_exposures) * 100.0)
-        assert all(isinstance(v, (float, np.float32, np.float64)) for v in metrics.values()), "Not all calculated recent metrics are floats"
+        assert all(isinstance(v, (float, np.float32, np.float64)) for v in metrics.values()), (
+            "Not all calculated recent metrics are floats"
+        )
         assert 0.0 <= metrics["max_drawdown"] <= 1.0, "Recent max drawdown out of range [0, 1]"
-        assert not any(np.isnan(v) or np.isinf(v) for v in metrics.values()), "NaN or Inf found in calculated recent metrics"
+        assert not any(np.isnan(v) or np.isinf(v) for v in metrics.values()), (
+            "NaN or Inf found in calculated recent metrics"
+        )
         return metrics
 
     def get_improvement_rate(self) -> float:
@@ -409,7 +431,9 @@ class PerformanceTracker:
             return 0.0
 
         improvement_rate = slope / initial_val
-        assert not np.isnan(improvement_rate) and not np.isinf(improvement_rate), "Improvement rate calculation resulted in NaN/Inf"
+        assert not np.isnan(improvement_rate) and not np.isinf(improvement_rate), (
+            "Improvement rate calculation resulted in NaN/Inf"
+        )
         return improvement_rate
 
     def get_stability(self) -> float:

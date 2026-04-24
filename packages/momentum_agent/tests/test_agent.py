@@ -334,11 +334,15 @@ def test_learn_step(agent, default_config):
 
     # 2. Mock the buffer's sample method to return controlled data
     # Generate a dummy batch matching the expected output structure of buffer.sample
-    mock_market = np.random.rand(batch_size, default_config["window_size"], default_config["n_features"]).astype(np.float32)
+    mock_market = np.random.rand(batch_size, default_config["window_size"], default_config["n_features"]).astype(
+        np.float32
+    )
     mock_account = np.random.rand(batch_size, ACCOUNT_STATE_DIM).astype(np.float32)
     mock_action = np.random.randint(0, default_config["num_actions"], size=batch_size).astype(np.int64)
     mock_reward = np.random.rand(batch_size).astype(np.float32)
-    mock_next_market = np.random.rand(batch_size, default_config["window_size"], default_config["n_features"]).astype(np.float32)
+    mock_next_market = np.random.rand(batch_size, default_config["window_size"], default_config["n_features"]).astype(
+        np.float32
+    )
     mock_next_account = np.random.rand(batch_size, ACCOUNT_STATE_DIM).astype(np.float32)
     mock_done = np.zeros(batch_size, dtype=np.bool_)  # Assume not done for simplicity
     # Mock batch data retained above for reference; mocking removed
@@ -492,7 +496,9 @@ def test_save_load_model(agent, default_config, tmp_path):
         loaded_tensor = loaded_target_state_dict[key]
         if original_tensor.device != loaded_tensor.device:
             loaded_tensor = loaded_tensor.to(original_tensor.device)
-        assert torch.allclose(original_tensor, loaded_tensor, atol=1e-3, rtol=1e-3), f"Target network parameter mismatch for key: {key}"
+        assert torch.allclose(original_tensor, loaded_tensor, atol=1e-3, rtol=1e-3), (
+            f"Target network parameter mismatch for key: {key}"
+        )
 
     # Compare optimizer state (tricky due to internal structure)
     loaded_optimizer_dict = new_agent.optimizer.state_dict()
@@ -1087,7 +1093,9 @@ def test_reset_noisy_sigma_also_resets_target_network(agent):
 
     agent.reset_noisy_sigma()
     for layer in target_layers:
-        assert layer.weight_sigma.data.max().item() < 99.0, "target network sigma should have been refilled away from the sentinel"
+        assert layer.weight_sigma.data.max().item() < 99.0, (
+            "target network sigma should have been refilled away from the sentinel"
+        )
 
 
 @pytest.mark.unit
