@@ -582,7 +582,7 @@ ALPACA_BROKER_ACCOUNT_ID=<your-firm/funding-account-uuid>
 **once per shell**:
 
 ```bash
-source venv/bin/activate
+source .venv/bin/activate
 source scripts/env-paper.sh
 ```
 

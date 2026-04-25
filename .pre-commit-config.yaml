@@ -11,15 +11,22 @@ repos:
 
   - repo: local
     hooks:
+      # Invoke ruff via the absolute workspace-venv path rather than relying
+      # on PATH. Cursor's git GUI (and most IDE commit subprocesses) do not
+      # inherit the shell's activated venv, so a bare ``ruff`` entry fails
+      # with "ruff not found" on commit-from-GUI even though it works from
+      # the terminal. Pre-commit always runs hooks from the repo root, so
+      # the relative ``.venv/bin/ruff`` path is stable and uses the exact
+      # version pinned by ``uv.lock`` (no version drift vs the CLI).
       - id: ruff
         name: ruff (workspace venv)
-        entry: ruff check --fix --exit-non-zero-on-fix
+        entry: .venv/bin/ruff check --fix --exit-non-zero-on-fix
         language: system
         types_or: [python, pyi]
         require_serial: true
       - id: ruff-format
         name: ruff-format (workspace venv)
-        entry: ruff format
+        entry: .venv/bin/ruff format
         language: system
         types_or: [python, pyi]
         require_serial: true
