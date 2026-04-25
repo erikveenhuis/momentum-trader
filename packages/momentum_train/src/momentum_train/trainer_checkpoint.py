@@ -16,8 +16,6 @@ import numpy as np
 import torch
 from momentum_core.logging import get_logger
 
-from .utils.memory_utils import current_rss_gb, release_memory_to_os
-
 logger = get_logger(__name__)
 
 
@@ -198,7 +196,10 @@ class CheckpointMixin:
         # which was the direct cause of repeated OOM kills (~49 GiB
         # anon-rss) during scheduled saves. The buffer is now persisted
         # as a side-car directory (``<checkpoint>.buffer/`` containing
-        # per-field ``.npy`` memmaps), see ``_save_buffer_sidecar``. The
+        # per-field ``.npy`` memmaps written row-by-row, see
+        # ``_save_buffer_sidecar`` / ``buffer.save_to_path``). Peak extra
+        # RSS at save time is now O(one Experience row), so the post-save
+        # glibc-trim mitigation is no longer needed. The
         # ``buffer_sidecar_relpath`` field below is the resume path's hint
         # for where to find that side-car; ``buffer_state`` remains as a
         # ``None`` sentinel so older resume code paths fail loudly rather
@@ -251,11 +252,6 @@ class CheckpointMixin:
         if self.agent.network is None or self.agent.target_network is None:
             logger.warning("Agent networks not initialized, cannot save checkpoint.")
             return
-
-        # Snapshot RSS before save so the post-trim log shows whether
-        # release_memory_to_os actually reclaimed anything from the transient
-        # torch.save pickle spike.
-        rss_before_save = current_rss_gb()
 
         # Save the latest checkpoint with date, episode and reward in filename.
         #
@@ -344,25 +340,6 @@ class CheckpointMixin:
         # leave TB scalars stuck ~2 minutes behind the checkpoint's
         # ``total_train_steps``, producing the visible step-axis gap on resume.
         self._flush_writer()
-
-        # Reclaim the pickle-buffer pages that torch.save just freed back
-        # inside glibc's arenas. Without this, each save ratchets steady-state
-        # RSS up by several GiB even though the bytes are no longer in use,
-        # which was the direct cause of the Apr 22 / Apr 23 OOM kills at
-        # ~54 GiB anon-rss. Drop the local reference first so gc.collect
-        # has nothing holding the large state_dict values alive.
-        del checkpoint
-        rss_before_trim = current_rss_gb()
-        released = release_memory_to_os()
-        rss_after_trim = current_rss_gb()
-        if rss_before_save is not None and rss_after_trim is not None:
-            logger.info(
-                "RSS after checkpoint save: %.2f GiB (pre-save %.2f GiB, pre-trim %.2f GiB); malloc_trim released pages: %s.",
-                rss_after_trim,
-                rss_before_save,
-                rss_before_trim if rss_before_trim is not None else float("nan"),
-                released,
-            )
 
     def _finalize_training(self, total_train_steps: int, num_episodes: int, val_files: list[Path]):
         """Saves final model and logs overall training summary."""

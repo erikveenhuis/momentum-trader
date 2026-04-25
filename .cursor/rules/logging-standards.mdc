@@ -16,7 +16,7 @@ logger = get_logger(__name__)
 
 ## Never print() in package code
 
-`print()` is acceptable only in standalone scripts under `scripts/` and repo-root utilities (e.g. `check_gpu.py`). All code under `packages/` must use the logger.
+`print()` is acceptable only in standalone scripts under `scripts/`. All code under `packages/` must use the logger.
 
 ## One logger per module
 

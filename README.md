@@ -476,10 +476,24 @@ When in doubt, Option A is always correct.
 
 ### Disk hygiene — checkpoint rotation
 
-Each `checkpoint_trainer_latest_*.pt` is ~9 GB because it bundles the
-full PER buffer state, so an unbounded run at the default
-`checkpoint_save_freq: 50` over 50k episodes would need ~9 TB. The
-trainer rotates the periodic-checkpoint stream after each save:
+Each periodic checkpoint is a pair on disk:
+
+- `checkpoint_trainer_latest_<DATE>_ep<N>_reward<...>.pt` — small
+  (~tens of MB; network + optimizer + scheduler state).
+- `checkpoint_trainer_latest_<DATE>_ep<N>_reward<...>.buffer/` —
+  side-car directory with the full PER buffer as per-field `.npy`
+  memmaps (~9 GB at the default 1M capacity, dominates the pair).
+
+The buffer was previously bundled into the `.pt` itself, but pickling
+~6 GB of arrays inside `torch.save` produced 10+ GB transient pickle
+streams that OOM-killed the trainer; the side-car layout writes each
+field row-by-row into an on-disk memmap so peak extra RSS at save
+time is O(one `Experience` row) rather than O(buffer size). See
+`buffer.save_to_path` and `_save_buffer_sidecar`.
+
+An unbounded run at the default `checkpoint_save_freq: 50` over 50k
+episodes would still need ~9 TB if every pair were kept. The trainer
+rotates the periodic-checkpoint stream after each save:
 
 ```yaml
 # config/training_config.yaml → trainer:
@@ -493,11 +507,16 @@ checkpoint).
 
 Rules of the rotation:
 
-- **Most recent N survive**, sorted by the `_ep<N>_` number embedded in
-  the filename (not mtime — episode ordering is the ground truth).
+- **Most recent N pairs survive**, sorted by the `_ep<N>_` number
+  embedded in the filename (not mtime — episode ordering is the ground
+  truth). Each `.pt` deletion also removes its sibling `.buffer/`
+  directory so the pair stays in lockstep on disk.
 - **`best_*.pt` checkpoints are never auto-rotated.** They're the
   curated "model I want to keep" snapshots and the recovery script and
-  paper-trader may read them.
+  paper-trader may read them. `best_*.pt` files are written **without**
+  a buffer side-car (it would explode disk usage during early
+  training); to resume from one, copy the nearest `latest_*.buffer/`
+  by hand.
 - **Recover-script outputs** (`*_rewardrecover.pt`) are part of the
   `latest_*` stream and participate in rotation; they're written with
   bumped episode numbers so a single-keep window naturally preserves

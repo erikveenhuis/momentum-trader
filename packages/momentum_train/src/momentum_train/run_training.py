@@ -21,7 +21,6 @@ from torch.utils.tensorboard import SummaryWriter
 from .data import DataManager
 from .trainer import RainbowTrainerModule
 from .utils.checkpoint_utils import find_latest_checkpoint, load_checkpoint
-from .utils.memory_utils import configure_glibc_arenas
 from .utils.utils import get_random_data_file, set_seeds
 
 logger = get_logger(__name__)
@@ -798,16 +797,6 @@ def main():  # Remove default config_path
     benchmark_frac_override = args.benchmark_frac_override
     eval_stochastic_flag = args.eval_stochastic
     configure_logging(args.log_level)
-
-    # Cap glibc per-thread arenas before any large allocations happen. On the
-    # current 59 GiB host we observed ~54 GiB anon-rss OOM kills every 8-13 h;
-    # the dominant driver is ptmalloc2 fragmentation across ~8 per-thread
-    # arenas that never get trimmed back to the OS. M_ARENA_MAX=2 typically
-    # cuts steady-state RSS by 20-40% on numpy/torch workloads. This is a
-    # mitigation, not a fix -- the torch.save-time pickle spike is still the
-    # root cause; release_memory_to_os() is called after each save in
-    # _save_checkpoint to actually reclaim the spike.
-    configure_glibc_arenas(2)
 
     logger.info("Starting Rainbow DQN training script...")
     logger.info("CUDA available: %s", torch.cuda.is_available())
