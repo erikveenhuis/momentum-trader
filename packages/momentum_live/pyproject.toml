@@ -11,7 +11,7 @@ authors = [
 ]
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.13"
+requires-python = ">=3.14"
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
@@ -20,19 +20,19 @@ dependencies = [
     "momentum_agent==0.2.0",
     "momentum_env==0.2.0",
     "momentum-core==0.1.0",
-    "alpaca-py==0.43.2",
+    "alpaca-py==0.43.3",
     "numpy==2.4.4",
     "pandas==3.0.2",
-    "requests==2.32.3",
+    "requests==2.33.1",
     # alpaca-py 0.43.2 imports pytz from alpaca.data.requests but doesn't
     # declare it as a dependency. Pin it here so warmup-time imports of the
     # historical bar API don't crash with ModuleNotFoundError.
     "pytz==2026.1.post1",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
-    "pytest==9.0.0",
+    "pytest==9.0.3",
     "ruff",
 ]
 

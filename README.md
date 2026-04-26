@@ -51,12 +51,24 @@ packages under `packages/` are the workspace members. Install them all with:
    curl -LsSf https://astral.sh/uv/install.sh | sh
    ```
 
-2. From the repo root, create the virtualenv and sync every workspace
-   member (plus dev extras) in one shot:
+2. From the repo root, create the virtualenv and install every workspace
+   member plus the `dev` group in one shot:
    ```bash
-   uv sync --all-packages --all-extras
+   uv sync
    source .venv/bin/activate
    ```
+
+   Plain `uv sync` is what you want here: the root project lists all five
+   workspace packages as dependencies, so they get installed transitively,
+   and the root's default `dev` group (`pytest`, `pytest-cov`, `ruff`,
+   `build`, `twine`, `pre-commit` — defined under PEP 735
+   `[dependency-groups]`) is activated automatically. Pass `--no-dev` for
+   a production-style install.
+
+   Note: do **not** pass `--all-packages`. That flag switches uv into a
+   per-member sync mode that activates each workspace member's own dev
+   group but does *not* include the workspace root's dev group, which
+   would silently drop repo-level tools like `pre-commit`.
 
    `uv sync` is idempotent: re-run it any time a `pyproject.toml` changes
    to pick up new dependencies.

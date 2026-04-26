@@ -11,7 +11,7 @@ authors = [
 ]
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.13"
+requires-python = ">=3.14"
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
@@ -23,15 +23,20 @@ dependencies = [
     "momentum_agent==0.2.0",
     "momentum_env==0.2.0",
     "momentum-core==0.1.0",
+    # Required at runtime: torch.utils.tensorboard imports the standalone
+    # `tensorboard` package at module load (see torch/utils/tensorboard/__init__.py),
+    # so even though we only use SummaryWriter we must install it here.
+    # (The .tb-venv from scripts/tensorboard.sh is a *separate* install used
+    # only to launch the web UI.)
     "tensorboard==2.20.0",
     # TensorBoard 2.20 imports pkg_resources, which was removed in setuptools>=82.
     "setuptools<82",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
-    "pytest==9.0.0",
-    "pytest-cov==7.0.0",
+    "pytest==9.0.3",
+    "pytest-cov==7.1.0",
     "ruff",
 ]
 
