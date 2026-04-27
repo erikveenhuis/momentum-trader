@@ -118,6 +118,18 @@ class RainbowTrainerModule(CheckpointMixin, ValidationMixin, DiagnosticsMixin, L
                 "`checkpoint_trainer_latest_*_ep*_reward*.pt` file(s) after each save.",
                 self.latest_checkpoint_keep_last_n,
             )
+        # Top-K best-validation ring. 0 (default) leaves the legacy
+        # threshold-gated ``best_*`` save as the only safety net; >0 pins the
+        # K highest-scoring validations on disk in a separate
+        # ``checkpoint_trainer_topk_*`` stream that ignores
+        # ``min_validation_threshold``. See ``CheckpointMixin._maybe_save_topk_checkpoint``.
+        self.top_k_best_checkpoints = max(0, int(self._cfg.top_k_best_checkpoints))
+        if self.top_k_best_checkpoints > 0:
+            logger.info(
+                "Top-K best-validation ring enabled: pinning up to %d highest-scoring "
+                "`checkpoint_trainer_topk_*` file(s) (independent of min_validation_threshold).",
+                self.top_k_best_checkpoints,
+            )
 
         # ------------------------------------------------------------------
         # Benchmark allocation fraction schedule (anneal start -> end over N
@@ -140,7 +152,7 @@ class RainbowTrainerModule(CheckpointMixin, ValidationMixin, DiagnosticsMixin, L
         raw_override = self.run_config.get("benchmark_frac_override")
         try:
             self.benchmark_frac_override: float | None = float(raw_override) if raw_override is not None else None
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             logger.warning(
                 "Invalid run.benchmark_frac_override=%r; ignoring override.",
                 raw_override,
@@ -282,7 +294,7 @@ class RainbowTrainerModule(CheckpointMixin, ValidationMixin, DiagnosticsMixin, L
             return
         try:
             self.writer.add_scalar("Train/Hyper/BenchmarkFrac", float(value), int(episode))
-        except (OSError, RuntimeError, ValueError):  # pragma: no cover - defensive
+        except OSError, RuntimeError, ValueError:  # pragma: no cover - defensive
             logger.debug("Failed to emit Train/Hyper/BenchmarkFrac", exc_info=True)
 
     def _validate_validation_cadence_config(self, num_episodes: int, has_val_files: bool) -> None:
@@ -303,7 +315,7 @@ class RainbowTrainerModule(CheckpointMixin, ValidationMixin, DiagnosticsMixin, L
         try:
             num_episodes_int = int(num_episodes)
             validation_freq_int = int(self.validation_freq)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             logger.warning(
                 "Skipping validation-cadence guard: non-integer num_episodes=%r or validation_freq=%r.",
                 num_episodes,
@@ -354,5 +366,5 @@ class RainbowTrainerModule(CheckpointMixin, ValidationMixin, DiagnosticsMixin, L
         try:
             with open(self._progress_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, default=str) + "\n")
-        except (OSError, TypeError, ValueError):
+        except OSError, TypeError, ValueError:
             logger.debug("Failed to append progress record", exc_info=True)

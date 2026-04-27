@@ -34,9 +34,17 @@ def default_config():
         "batch_size": 4,
         "target_update_freq": 5,
         "polyak_tau": 0.005,
-        "num_atoms": 51,
-        "v_min": -1,
-        "v_max": 1,
+        # IQN distributional head config (replaces C51's num_atoms/v_min/v_max).
+        "n_quantiles_online": 16,
+        "n_quantiles_target": 16,
+        "n_quantiles_policy": 8,
+        "quantile_embedding_dim": 16,
+        "huber_kappa": 1.0,
+        # Munchausen + Spectral Norm flags (Stages 2 & 3).
+        "munchausen_alpha": 0.9,
+        "munchausen_entropy_tau": 0.03,
+        "munchausen_log_pi_clip": -1.0,
+        "spectral_norm_enabled": False,
         "alpha": 0.6,
         "beta_start": 0.4,
         "beta_frames": 100,
@@ -44,7 +52,7 @@ def default_config():
         "window_size": 10,
         "n_features": 12,
         "hidden_dim": 64,
-        "num_actions": 3,
+        "num_actions": 6,
         "debug": True,
         "store_partial_n_step": False,
         "grad_clip_norm": 10.0,
@@ -57,8 +65,8 @@ def default_config():
         "dim_feedforward": 256,
         "transformer_dropout": 0.1,
         # Diagnostic logging cadences (0 disables).
-        "categorical_logging_interval": 2000,
-        "categorical_logging_percentiles": [5, 25, 50, 75, 95],
+        "quantile_logging_interval": 2000,
+        "quantile_logging_percentiles": [5, 25, 50, 75, 95],
         "noisy_sigma_logging_interval": 0,
         "q_value_logging_interval": 0,
         "q_value_histogram_interval": 0,
@@ -661,7 +669,7 @@ def test_load_state_dict_path(agent, default_config, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Tier 1c: categorical-target stats mirrored to TensorBoard
+# Tier 1c: IQN target-quantile stats mirrored to TensorBoard
 # ---------------------------------------------------------------------------
 
 
@@ -688,15 +696,13 @@ class _CapturingWriter:
         return matches[-1]
 
 
-def _make_categorical_stub_agent(num_atoms: int = 11):
-    """Construct a partial agent suitable for exercising _log_categorical_target_stats only."""
+def _make_quantile_stub_agent():
+    """Partial agent for exercising _log_quantile_target_stats only."""
     stub = RainbowDQNAgent.__new__(RainbowDQNAgent)
-    stub.num_atoms = num_atoms
-    stub.support_cpu = np.linspace(-1.0, 1.0, num_atoms, dtype=np.float64)
-    stub.categorical_logging_interval = 1
-    stub.categorical_logging_percentiles = (5.0, 25.0, 50.0, 75.0, 95.0)
-    stub._categorical_target_accumulator = {
-        "mass": np.zeros(num_atoms, dtype=np.float64),
+    stub.quantile_logging_interval = 1
+    stub.quantile_logging_percentiles = (5.0, 25.0, 50.0, 75.0, 95.0)
+    stub._quantile_target_accumulator = {
+        "values": [],
         "samples": 0,
     }
     stub.total_steps = 1234
@@ -705,60 +711,84 @@ def _make_categorical_stub_agent(num_atoms: int = 11):
 
 
 @pytest.mark.unit
-def test_log_categorical_target_stats_mirrors_to_tensorboard():
-    stub = _make_categorical_stub_agent(num_atoms=11)
+def test_log_quantile_target_stats_mirrors_to_tensorboard():
+    stub = _make_quantile_stub_agent()
     stub.tb_writer = _CapturingWriter()
 
-    # Concentrate the accumulated mass on the centre atom so the resulting probs
-    # peak at index 5 (support value 0.0); edge atoms hold a tiny share.
-    stub._categorical_target_accumulator["mass"][5] = 80.0
-    stub._categorical_target_accumulator["mass"][0] = 1.0
-    stub._categorical_target_accumulator["mass"][-1] = 1.0
-    stub._categorical_target_accumulator["mass"][3] = 9.0
-    stub._categorical_target_accumulator["mass"][7] = 9.0
-    stub._categorical_target_accumulator["samples"] = 100
+    # Inject two batches of [B, K'] quantile targets with a known distribution.
+    rng = np.random.default_rng(0)
+    batch_a = rng.normal(loc=0.0, scale=1.0, size=(50, 16)).astype(np.float32)
+    batch_b = rng.normal(loc=0.0, scale=1.0, size=(50, 16)).astype(np.float32)
+    stub._quantile_target_accumulator["values"].extend([batch_a, batch_b])
+    stub._quantile_target_accumulator["samples"] = 100
 
-    RainbowDQNAgent._log_categorical_target_stats(stub)
+    RainbowDQNAgent._log_quantile_target_stats(stub)
 
     writer = stub.tb_writer
     tags = set(writer.tags())
-    assert "Train/CategoricalTarget/Mean" in tags
-    assert "Train/CategoricalTarget/Edge_Mass_Min" in tags
-    assert "Train/CategoricalTarget/Edge_Mass_Max" in tags
-    assert "Train/CategoricalTarget/Samples" in tags
+    assert "Train/Quantile/Mean" in tags
+    assert "Train/Quantile/Std" in tags
+    assert "Train/Quantile/Min" in tags
+    assert "Train/Quantile/Max" in tags
+    assert "Train/Quantile/Samples" in tags
     for percentile in (5, 25, 50, 75, 95):
-        assert f"Train/CategoricalTarget/P{percentile}" in tags
+        assert f"Train/Quantile/P{percentile}" in tags
 
-    expected_total = 80.0 + 1.0 + 1.0 + 9.0 + 9.0
-    expected_edge = 1.0 / expected_total
-    assert writer.value_for("Train/CategoricalTarget/Edge_Mass_Min") == pytest.approx(expected_edge)
-    assert writer.value_for("Train/CategoricalTarget/Edge_Mass_Max") == pytest.approx(expected_edge)
-    assert writer.value_for("Train/CategoricalTarget/Samples") == pytest.approx(100.0)
-    # Mass is symmetric around the centre atom (support value 0.0) so mean ≈ 0.
-    assert writer.value_for("Train/CategoricalTarget/Mean") == pytest.approx(0.0, abs=1e-9)
-    # The 50th percentile should land on the centre atom (support value 0.0).
-    assert writer.value_for("Train/CategoricalTarget/P50") == pytest.approx(0.0, abs=1e-9)
+    flat = np.concatenate([batch_a, batch_b], axis=0).reshape(-1)
+    assert writer.value_for("Train/Quantile/Mean") == pytest.approx(float(flat.mean()), abs=1e-5)
+    assert writer.value_for("Train/Quantile/Std") == pytest.approx(float(flat.std(ddof=0)), abs=1e-5)
+    assert writer.value_for("Train/Quantile/Min") == pytest.approx(float(flat.min()))
+    assert writer.value_for("Train/Quantile/Max") == pytest.approx(float(flat.max()))
+    assert writer.value_for("Train/Quantile/P50") == pytest.approx(float(np.percentile(flat, 50)), abs=1e-4)
+    assert writer.value_for("Train/Quantile/Samples") == pytest.approx(100.0)
 
-    assert any(tag == "Train/CategoricalTarget/Distribution" for tag, _v, _s in writer.histograms)
-    hist_tag, hist_values, hist_step = writer.histograms[0]
-    assert hist_tag == "Train/CategoricalTarget/Distribution"
+    # Histogram: full flattened distribution.
+    histos = [(t, v, s) for t, v, s in writer.histograms if t == "Train/Quantile/Distribution"]
+    assert len(histos) == 1
+    hist_tag, hist_values, hist_step = histos[0]
+    assert hist_tag == "Train/Quantile/Distribution"
     assert hist_step == 1234
-    assert hist_values.shape == (11,)
-    assert hist_values.sum() == pytest.approx(1.0, rel=1e-6)
+    assert hist_values.shape == (flat.size,)
 
     # Accumulator is reset after logging.
-    assert stub._categorical_target_accumulator["samples"] == 0
-    assert stub._categorical_target_accumulator["mass"].sum() == pytest.approx(0.0)
+    assert stub._quantile_target_accumulator["samples"] == 0
+    assert stub._quantile_target_accumulator["values"] == []
 
 
 @pytest.mark.unit
-def test_log_categorical_target_stats_no_writer_is_noop():
-    stub = _make_categorical_stub_agent(num_atoms=11)
-    stub._categorical_target_accumulator["mass"][5] = 100.0
-    stub._categorical_target_accumulator["samples"] = 100
-    # Should not raise even though tb_writer is None.
-    RainbowDQNAgent._log_categorical_target_stats(stub)
-    assert stub._categorical_target_accumulator["samples"] == 0
+def test_log_quantile_target_stats_no_writer_is_noop():
+    stub = _make_quantile_stub_agent()
+    rng = np.random.default_rng(1)
+    stub._quantile_target_accumulator["values"].append(rng.normal(size=(8, 16)).astype(np.float32))
+    stub._quantile_target_accumulator["samples"] = 8
+    RainbowDQNAgent._log_quantile_target_stats(stub)  # should not raise
+    assert stub._quantile_target_accumulator["samples"] == 0
+    assert stub._quantile_target_accumulator["values"] == []
+
+
+@pytest.mark.unit
+def test_accumulate_quantile_target_stats_skips_empty_and_non_finite():
+    stub = _make_quantile_stub_agent()
+    # Empty tensor: short-circuits.
+    RainbowDQNAgent._accumulate_quantile_target_stats(stub, torch.empty(0, 0))
+    assert stub._quantile_target_accumulator["samples"] == 0
+    # Non-finite values: skipped, accumulator unchanged.
+    bad = torch.full((4, 8), float("nan"))
+    RainbowDQNAgent._accumulate_quantile_target_stats(stub, bad)
+    assert stub._quantile_target_accumulator["samples"] == 0
+    # Healthy batch: accumulated.
+    good = torch.zeros(4, 8)
+    RainbowDQNAgent._accumulate_quantile_target_stats(stub, good)
+    assert stub._quantile_target_accumulator["samples"] == 4
+    assert len(stub._quantile_target_accumulator["values"]) == 1
+
+
+@pytest.mark.unit
+def test_accumulate_quantile_target_stats_disabled_when_interval_zero():
+    stub = _make_quantile_stub_agent()
+    stub.quantile_logging_interval = 0
+    RainbowDQNAgent._accumulate_quantile_target_stats(stub, torch.zeros(4, 8))
+    assert stub._quantile_target_accumulator["samples"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -900,7 +930,8 @@ def test_log_grad_stats_emits_global_per_group_and_update_ratio(agent):
     obs = generate_dummy_observation(agent.config if hasattr(agent, "config") else {})
     market = torch.from_numpy(obs["market_data"]).unsqueeze(0).to(agent.device, dtype=torch.float32)
     account = torch.from_numpy(obs["account_state"]).unsqueeze(0).to(agent.device, dtype=torch.float32)
-    out = agent.network.get_q_values(market, account)
+    taus = torch.rand(1, agent.n_quantiles_online, device=agent.device, dtype=torch.float32)
+    out = agent.network.get_q_values(market, account, taus)
     out.sum().backward()
 
     pre_clip_norm = torch.nn.utils.clip_grad_norm_(agent.network.parameters(), max_norm=1e9)

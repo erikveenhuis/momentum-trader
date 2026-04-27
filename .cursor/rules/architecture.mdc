@@ -5,9 +5,12 @@ alwaysApply: true
 
 # Architecture Reference
 
-## Model (1.99M params)
+## Model (~2M params, BTR core)
 - Transformer: 3 encoder layers, 4 heads, hidden_dim=256, FFN=512, pre-norm + GELU
-- CLS token pooling -> concat with account MLP -> LayerNorm -> NoisyLinear dueling heads (C51)
+- CLS token pooling -> concat with account MLP -> LayerNorm -> elementwise gate by IQN cosine-tau embedding -> NoisyLinear dueling heads
+- Distributional head: **IQN** (Dabney et al. 2018) replacing the old C51 fixed-support categorical. Online K=64, target K'=64, policy K=32. Quantile-Huber loss with kappa=1.0.
+- TD target: **Munchausen DQN** (Vieillard et al. 2020) layered onto the IQN bootstrap — ``alpha=0.9``, entropy temperature ``tau_M=0.03``, log-pi clip floor ``-1.0``. Target network is the only network consulted by the target path; online net is reserved for the loss-side ``Z(s_t, a_t, tau)`` only.
+- **Spectral normalization** wraps ``weight_mu`` of every NoisyLinear inside ``value_stream`` and ``advantage_stream`` (toggle: ``spectral_norm_enabled``). Encoder, ``aux_return_head``, and ``tau_embedding`` are *not* normalized.
 - Auxiliary return-prediction head on CLS output (0.1 weight MSE loss on log_return_1 feature)
 - Polyak soft target updates (tau=0.001, every learner step)
 
@@ -25,7 +28,7 @@ alwaysApply: true
 
 ## Training
 - bfloat16 autocast (no GradScaler), torch.compile required
-- C51 support [-1, 1] with 101 atoms (atom spacing 0.02); reward_scale=1.0 keeps per-step rewards O(1e-4 to 1e-3) and n-step returns well within range
+- IQN has unbounded support (no v_min/v_max ceiling); reward_scale=1.0 keeps per-step rewards O(1e-4 to 1e-3) and n-step returns well within numerical range. The Munchausen log-pi bonus is bounded by ``alpha * tau_M * log_pi_clip = 0.9 * 0.03 * -1 = -0.027`` per step.
 - No action masking needed (target allocation actions are always valid)
 - Curriculum learning: training file pool ramps from 30% to 100% over episodes
 - Progress tracked in models/progress.jsonl (one JSONL line per episode/validation)
@@ -42,7 +45,7 @@ alwaysApply: true
 
 ## Key Constraints
 - torch.compile wraps networks in OptimizedModule; always use `is not None` checks, never truthiness
-- Old checkpoints incompatible after architecture changes (different dims)
+- Old checkpoints incompatible after architecture changes (different dims). Pre-IQN (C51) checkpoints are rejected at load time by ``agent_checkpoint._assert_iqn_state_dict``; use ``scripts/migrate_c51_to_iqn.py`` once to warm-start from the encoder + aux head of an old ``best_*.pt``.
 - Live trader (momentum_live) must match training normalization exactly (window-level z-score + derived features)
 - Live inference loads checkpoints with `inference_only=True` (eager forward, no compile); default device is CPU. Set `MOMENTUM_LIVE_DEVICE=cuda` for GPU inference. Training still requires CUDA + compile (`inference_only=False`).
 - Live runs one `MomentumLiveTrader` per symbol against an isolated Alpaca Broker sub-account (one sub-account per pair, JNLC-funded from a designated firm account). The agent stays single-asset; per-pair cash isolation matches the training distribution and removes the multi-asset cash-pool race condition.

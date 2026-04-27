@@ -24,11 +24,22 @@ done
 
 TB_VENV="$REPO_ROOT/.tb-venv"
 
+# Detect a stale venv (e.g. base Python upgraded out from under it) and rebuild.
+if [[ -d "$TB_VENV" ]] && ! "$TB_VENV/bin/python" -c "import tensorboard" >/dev/null 2>&1; then
+  echo "TensorBoard venv at $TB_VENV is stale; recreating ..."
+  rm -rf "$TB_VENV"
+fi
+
 if [[ ! -d "$TB_VENV" ]]; then
   echo "Creating TensorBoard venv at $TB_VENV ..."
-  python3 -m venv "$TB_VENV"
-  "$TB_VENV/bin/pip" install --upgrade pip -q
-  "$TB_VENV/bin/pip" install 'setuptools<81' tensorboard -q
+  if command -v uv >/dev/null 2>&1; then
+    uv venv "$TB_VENV" -q
+    VIRTUAL_ENV="$TB_VENV" uv pip install -q 'setuptools<81' tensorboard
+  else
+    python3 -m venv "$TB_VENV"
+    "$TB_VENV/bin/pip" install --upgrade pip -q
+    "$TB_VENV/bin/pip" install 'setuptools<81' tensorboard -q
+  fi
   echo "TensorBoard venv ready."
 fi
 

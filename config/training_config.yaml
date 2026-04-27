@@ -36,15 +36,34 @@ agent:
   dim_feedforward: 512
   transformer_dropout: 0.1
 
-  # Rainbow params
+  # Rainbow + IQN params
   n_steps: 3            # Reduced from 5; shorter horizon for minute-scale momentum trades
-  num_atoms: 101
-  v_min: -1.0
-  v_max: 1.0
-  categorical_logging_interval: 2000
-  categorical_logging_percentiles: [5, 25, 50, 75, 95]
+  # IQN distributional head (replaces C51 num_atoms/v_min/v_max). Quantile
+  # samples are drawn fresh every step from U(0, 1); the network learns the
+  # quantile function rather than fixed-support probabilities.
+  n_quantiles_online: 64    # K samples for the online network (loss path)
+  n_quantiles_target: 64    # K' samples for the target/bootstrap path
+  n_quantiles_policy: 32    # samples averaged for argmax during action selection
+  quantile_embedding_dim: 64  # cosine basis size for phi(tau) in CosineQuantileEmbedding
+  huber_kappa: 1.0          # Huber threshold inside the quantile-Huber loss
+  quantile_logging_interval: 2000           # cadence for Train/Quantile/* TB scalars
+  quantile_logging_percentiles: [5, 25, 50, 75, 95]
+
+  # Munchausen DQN target augmentation (Vieillard et al. 2020). The Munchausen
+  # bonus is layered on top of the IQN target: alpha * tau * log pi(a_t | s_t),
+  # where pi is the entropy-regularised softmax of the *target* network's
+  # expected Q values. Set ``munchausen_alpha=0`` to fall back to vanilla IQN
+  # for ablations.
+  munchausen_alpha: 0.9         # Scales the log-pi bonus; 0.9 is the BTR default
+  munchausen_entropy_tau: 0.03  # Softmax temperature; smaller -> sharper policy
+  munchausen_log_pi_clip: -1.0  # Floor on the log-pi bonus to bound the target
+
+  # Spectral normalization on the dueling head NoisyLinear weights (BTR Stage 3).
+  # Constrains the operator norm of weight_mu in value/advantage streams to
+  # damp the implicit Q-value drift caused by Polyak target updates.
+  spectral_norm_enabled: true
   # Tier 3a/b/c/d diagnostic cadences. 0 disables the corresponding stream.
-  noisy_sigma_logging_interval: 2000   # matches categorical cadence
+  noisy_sigma_logging_interval: 2000   # matches quantile cadence
   q_value_logging_interval: 250
   q_value_histogram_interval: 2500     # 10x the scalar cadence (heavier)
   grad_logging_interval: 250
@@ -58,7 +77,12 @@ agent:
   lr_scheduler_enabled: true
   lr_scheduler_type: 'CosineAnnealingLR'  # Smoother than ReduceLROnPlateau for long runs
   lr_scheduler_params:
-    T_max: 500000       # Cosine period in learner steps (~full training run)
+    # T_max sized for the actual learner-step budget. The previous 500k value
+    # cycled multiple times through the cosine period (the run reached ~5.7M
+    # learner steps, ~11x past T_max), which manifested as a head-churn
+    # pattern in the canvas health-report. 50M ≈ remaining run length and
+    # keeps the schedule monotonic for the rest of training.
+    T_max: 50000000     # Cosine period in learner steps (~full training run)
     eta_min: 0.00001    # Floor LR
 
   # Exploration (epsilon-greedy on top of NoisyNets)
@@ -86,7 +110,7 @@ environment:
   window_size: 60
   initial_balance: 1000.0
   transaction_fee: 0.001
-  reward_scale: 1.0         # Per-step rewards O(1e-4 to 1e-3); n-step returns well within C51 support [-1, 1]
+  reward_scale: 1.0         # Per-step rewards O(1e-4 to 1e-3); IQN has unbounded support so reward magnitude is unconstrained
   invalid_action_penalty: -0.1   # Slightly stronger signal for masked-but-still-penalized actions
   drawdown_penalty_lambda: 0.3   # Midpoint: 0.5 caused death spirals, 0.15 caused action collapse to 100% exposure
   slippage_bps: 5.0
@@ -124,12 +148,23 @@ trainer:
   #     the next periodic save.
   latest_checkpoint_keep_last_n: 10
   reward_window: 20
-  reward_clip: 0.5          # Clip to match C51 support [-1, 1]; per-step rewards are O(1e-4) to O(1e-3)
+  reward_clip: 0.5          # Soft cap on per-step reward magnitude (IQN itself has unbounded support)
   min_episodes_before_early_stopping: 5000  # Defer best-tracking and early stopping until meaningful training
   early_stopping_patience: 12  # Increased from 6; more runway for slow convergence
   final_phase_lr_start_frac: 0.85  # Later start since cosine already decays smoothly
   final_phase_lr_multiplier: 0.3
   min_validation_threshold: 0.001
+
+  # Top-K best-validation ring. Independent of ``min_validation_threshold``:
+  # the K highest-scoring validation runs are pinned on disk as
+  # ``checkpoint_trainer_topk_<DATE>_ep<N>_score_<X>.pt`` so that small
+  # improvements (e.g. +0.0008 on top of the prior best) still survive,
+  # giving us a recovery option if the threshold-gated ``best_*`` save
+  # misses a true peak. 0 disables; 3-5 is a reasonable safety net.
+  # ``best_*`` and ``topk_*`` files coexist; rotation only touches
+  # ``latest_*``. The ring is rescanned from filenames on every save so it
+  # round-trips across ``--resume``.
+  top_k_best_checkpoints: 5
 
   # Benchmark allocation frac schedule (linear anneal from start -> end across
   # the first N episodes; anchored on absolute episode index so --resume keeps

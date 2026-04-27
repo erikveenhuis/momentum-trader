@@ -1,4 +1,20 @@
-import math  # Import math for positional encoding calculation
+"""Network definitions for the IQN + Munchausen + spectral-norm agent.
+
+The network exposes an IQN-style distributional head: a cosine quantile
+embedding ``phi(tau) = ReLU(W cos(pi n tau) + b)`` is multiplied element-wise
+into the shared encoder feature, after which the dueling value/advantage
+heads emit one scalar quantile sample per tau. ``forward`` therefore takes
+an extra ``taus`` argument (shape ``[B, K]``, values in ``[0, 1]``) and
+returns quantiles ``[B, num_actions, K]``.
+
+C51 specific state (``support``, ``v_min``, ``v_max``, ``num_atoms``) has
+been removed — pre-IQN checkpoints are explicitly rejected by
+``agent_checkpoint``.
+"""
+
+from __future__ import annotations
+
+import math
 from typing import Any
 
 import torch
@@ -8,7 +24,6 @@ from momentum_core.logging import get_logger
 
 from .constants import ACCOUNT_STATE_DIM
 
-# Get logger instance
 logger = get_logger(__name__)
 
 
@@ -44,7 +59,7 @@ class NoisyLinear(nn.Module):
         self.weight_mu.data.uniform_(-mu_range, mu_range)
         self.weight_sigma.data.fill_(self.std_init / math.sqrt(self.in_features))
         self.bias_mu.data.uniform_(-mu_range, mu_range)
-        self.bias_sigma.data.fill_(self.std_init / math.sqrt(self.out_features))  # Corrected bias sigma init
+        self.bias_sigma.data.fill_(self.std_init / math.sqrt(self.out_features))
 
     def _scale_noise(self, size: int) -> torch.Tensor:
         x = torch.randn(size, device=self.weight_mu.device)
@@ -88,11 +103,34 @@ class NoisyLinear(nn.Module):
 # --- End: Noisy Linear Layer ---
 
 
+def _apply_spectral_norm_to_noisy(noisy_linear: NoisyLinear) -> NoisyLinear:
+    """Wrap ``noisy_linear.weight_mu`` with ``spectral_norm`` parametrization.
+
+    Following BTR (Jauhri et al. 2024) we normalize *only* the deterministic
+    ``weight_mu`` of each :class:`NoisyLinear` in the dueling heads. The
+    learned exploration scale (``weight_sigma`` / ``bias_sigma``) is left
+    unconstrained so NoisyNet's effective noise budget is preserved.
+    """
+    from torch.nn.utils.parametrizations import spectral_norm
+
+    spectral_norm(noisy_linear, name="weight_mu")
+    return noisy_linear
+
+
+def _maybe_wrap_stream_with_spectral_norm(stream: nn.Sequential, enabled: bool) -> None:
+    """Apply spectral norm to every NoisyLinear inside *stream* when enabled."""
+    if not enabled:
+        return
+    for module in stream.modules():
+        if isinstance(module, NoisyLinear):
+            _apply_spectral_norm_to_noisy(module)
+
+
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000, debug: bool = False):
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
-        self.d_model = d_model  # Store d_model
+        self.d_model = d_model
         self.debug = debug
 
         position = torch.arange(max_len).unsqueeze(1)
@@ -122,54 +160,106 @@ class PositionalEncoding(nn.Module):
                 f"Input sequence length ({x.shape[1]}) exceeds max_len ({self.pe.shape[0]}) of PositionalEncoding"
             )
 
-        # Positional encoding expects shape [seq_len, batch_size, embedding_dim]
-        x = x.permute(1, 0, 2)  # [seq_len, batch_size, embedding_dim]
+        x = x.permute(1, 0, 2)
         x = x + self.pe[: x.size(0)]
         x = self.dropout(x)
-        x = x.permute(1, 0, 2)  # Permute back to [batch_size, seq_len, embedding_dim]
+        x = x.permute(1, 0, 2)
 
         if self.debug and x.shape[2] != self.d_model:
             raise ValueError("Output shape mismatch from PositionalEncoding")
         return x
 
 
+# --- Start: IQN cosine quantile embedding ---
+class CosineQuantileEmbedding(nn.Module):
+    """IQN cosine basis embedding (Dabney et al. 2018, Eq. 4).
+
+    For each quantile sample ``tau`` in ``[0, 1]`` we build the cosine
+    feature ``cos(pi * n * tau)`` for ``n = 1..embedding_dim`` and then
+    project linearly to ``output_dim`` with a ReLU on top:
+
+        phi(tau) = ReLU(W cos(pi n tau) + b)        # [B, K, output_dim]
+
+    The output is element-wise multiplied into the shared encoder feature,
+    so ``output_dim`` must equal the encoder's shared-feature dimension.
+    """
+
+    def __init__(self, embedding_dim: int, output_dim: int):
+        super().__init__()
+        if embedding_dim < 1:
+            raise ValueError(f"embedding_dim must be >= 1, got {embedding_dim}")
+        if output_dim < 1:
+            raise ValueError(f"output_dim must be >= 1, got {output_dim}")
+        self.embedding_dim = embedding_dim
+        self.output_dim = output_dim
+        # Buffer holding pi * [1, 2, ..., embedding_dim] for the cosine basis.
+        self.register_buffer(
+            "indices",
+            torch.arange(1, embedding_dim + 1, dtype=torch.float32) * math.pi,
+            persistent=False,
+        )
+        self.linear = nn.Linear(embedding_dim, output_dim)
+
+    def forward(self, taus: torch.Tensor) -> torch.Tensor:
+        if taus.ndim != 2:
+            raise ValueError(f"taus must be 2D [B, K], got shape {tuple(taus.shape)}")
+        # taus: [B, K] -> [B, K, 1] * [embedding_dim] -> [B, K, embedding_dim]
+        cos_basis = torch.cos(taus.unsqueeze(-1) * self.indices)
+        # Linear maps to output_dim; ReLU is the final non-linearity per the IQN paper.
+        return F.relu(self.linear(cos_basis))
+
+
+# --- End: IQN cosine quantile embedding ---
+
+
 # --- Start: Rainbow Network Definition ---
 class RainbowNetwork(nn.Module):
-    """Rainbow DQN network: Transformer encoder with CLS pooling, dueling C51 heads, and auxiliary return predictor."""
+    """Transformer encoder + IQN dueling heads + auxiliary return predictor.
 
-    def __init__(self, config: dict[str, Any], device: torch.device):
+    The C51 categorical head has been replaced with an IQN quantile head.
+    See ``forward`` for the new ``(market_data, account_state, taus)``
+    signature.
+    """
+
+    def __init__(
+        self,
+        config: dict[str, Any],
+        device: torch.device,
+        *,
+        spectral_norm_enabled: bool = False,
+    ):
         super().__init__()
 
-        # Extract parameters from config - NO DEFAULTS, will raise KeyError if missing
+        # All required keys; KeyError on missing — mirrors AgentConfig.
         self.window_size = config["window_size"]
         self.n_features = config["n_features"]
-        self.hidden_dim = config["hidden_dim"]  # Also embedding dim
+        self.hidden_dim = config["hidden_dim"]
         self.num_actions = config["num_actions"]
-        self.num_atoms = config["num_atoms"]
-        self.v_min = config["v_min"]
-        self.v_max = config["v_max"]
-        # Transformer specific params
+        self.quantile_embedding_dim = config["quantile_embedding_dim"]
         self.nhead = config["nhead"]
         self.num_encoder_layers = config["num_encoder_layers"]
         self.dim_feedforward = config["dim_feedforward"]
         self.transformer_dropout = config["transformer_dropout"]
         self.debug_mode = bool(config.get("debug", False))
+        self.spectral_norm_enabled = bool(spectral_norm_enabled)
 
-        # Check validity
         if self.hidden_dim % self.nhead != 0:
             raise ValueError(f"hidden_dim ({self.hidden_dim}) must be divisible by nhead ({self.nhead})")
         if ACCOUNT_STATE_DIM < 2:
             raise ValueError(f"ACCOUNT_STATE_DIM must be >= 2, got {ACCOUNT_STATE_DIM}")
+        if self.quantile_embedding_dim < 1:
+            raise ValueError(f"quantile_embedding_dim must be >= 1, got {self.quantile_embedding_dim}")
 
-        logger.info(f"Initializing RainbowNetwork with hidden_dim={self.hidden_dim}")
+        logger.info(
+            "Initializing RainbowNetwork (IQN) with hidden_dim=%d, quantile_embedding_dim=%d, spectral_norm=%s",
+            self.hidden_dim,
+            self.quantile_embedding_dim,
+            self.spectral_norm_enabled,
+        )
 
         self.device = device
 
-        # Save configuration
-        self.register_buffer("support", torch.linspace(self.v_min, self.v_max, self.num_atoms))
-        self.delta_z = (self.v_max - self.v_min) / (self.num_atoms - 1)
-
-        # --- Shared Feature Extractor (Similar to Actor/Critic start) ---
+        # --- Shared Feature Extractor ---
         self.feature_embedding = nn.Linear(self.n_features, self.hidden_dim)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, self.hidden_dim))
         self.pos_encoder = PositionalEncoding(
@@ -193,20 +283,28 @@ class RainbowNetwork(nn.Module):
         )
         # --- End Shared Feature Extractor ---
 
-        shared_feature_dim = self.hidden_dim + self.hidden_dim // 4
-        self.head_norm = nn.LayerNorm(shared_feature_dim)
+        self.shared_feature_dim = self.hidden_dim + self.hidden_dim // 4
+        self.head_norm = nn.LayerNorm(self.shared_feature_dim)
         head_hidden_dim = self.hidden_dim // 2
 
-        self.value_stream = nn.Sequential(
-            NoisyLinear(shared_feature_dim, head_hidden_dim, debug=self.debug_mode),
-            nn.ReLU(),
-            NoisyLinear(head_hidden_dim, self.num_atoms, debug=self.debug_mode),
+        # IQN cosine quantile embedding maps tau into the shared-feature
+        # space so it can be element-wise multiplied with shared_features.
+        self.tau_embedding = CosineQuantileEmbedding(
+            embedding_dim=self.quantile_embedding_dim,
+            output_dim=self.shared_feature_dim,
         )
 
-        self.advantage_stream = nn.Sequential(
-            NoisyLinear(shared_feature_dim, head_hidden_dim, debug=self.debug_mode),
+        # Dueling heads emit one scalar (value) / num_actions scalars
+        # (advantage) per tau sample — *not* per atom.
+        self.value_stream = nn.Sequential(
+            NoisyLinear(self.shared_feature_dim, head_hidden_dim, debug=self.debug_mode),
             nn.ReLU(),
-            NoisyLinear(head_hidden_dim, self.num_actions * self.num_atoms, debug=self.debug_mode),
+            NoisyLinear(head_hidden_dim, 1, debug=self.debug_mode),
+        )
+        self.advantage_stream = nn.Sequential(
+            NoisyLinear(self.shared_feature_dim, head_hidden_dim, debug=self.debug_mode),
+            nn.ReLU(),
+            NoisyLinear(head_hidden_dim, self.num_actions, debug=self.debug_mode),
         )
 
         self.aux_return_head = nn.Sequential(
@@ -217,9 +315,14 @@ class RainbowNetwork(nn.Module):
 
         self._initialize_weights()
 
+        # Spectral-norm wrapping has to happen *after* reset_parameters so
+        # the parametrization sees a properly-initialized weight_mu.
+        if self.spectral_norm_enabled:
+            _maybe_wrap_stream_with_spectral_norm(self.value_stream, True)
+            _maybe_wrap_stream_with_spectral_norm(self.advantage_stream, True)
+
     def _initialize_weights(self):
         """Initializes weights for Linear layers and resets NoisyLinear layers."""
-        # Basic initialization - could be refined
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, mode="fan_in", nonlinearity="relu")
@@ -230,34 +333,67 @@ class RainbowNetwork(nn.Module):
         nn.init.zeros_(self.cls_token)
 
     def _encode_market(self, market_data: torch.Tensor) -> torch.Tensor:
-        """Run the (expensive) Transformer encoder once and return the CLS token.
-
-        Shared by :meth:`forward` and :meth:`predict_return` so a single
-        training step does only one encoder pass instead of two. At batch 8192
-        this shaves ~128 ms/step (see Tier 2.1 in the cleanup plan).
-        """
+        """Run the (expensive) Transformer encoder once and return the CLS token."""
         batch_size = market_data.shape[0]
         market_emb = self.feature_embedding(market_data)
         cls_tokens = self.cls_token.expand(batch_size, -1, -1)
         market_emb = torch.cat([cls_tokens, market_emb], dim=1)
         market_emb = self.pos_encoder(market_emb)
         market_features = self.transformer_encoder(market_emb)
-        return market_features[:, 0, :]  # CLS output: (B, hidden_dim)
+        return market_features[:, 0, :]  # CLS output: [B, hidden_dim]
 
-    def _heads_from_cls(self, cls_out: torch.Tensor, account_state: torch.Tensor) -> torch.Tensor:
-        """Compute log_probs from a cached CLS encoding + account state."""
-        batch_size = cls_out.shape[0]
+    def _shared_features(self, cls_out: torch.Tensor, account_state: torch.Tensor) -> torch.Tensor:
+        """Concat encoder + account features and apply the shared LayerNorm."""
         account_features = self.account_processor(account_state)
-        shared_features = torch.cat([cls_out, account_features], dim=1)
-        shared_features = self.head_norm(shared_features)
+        shared = torch.cat([cls_out, account_features], dim=1)
+        return self.head_norm(shared)
 
-        value_logits = self.value_stream(shared_features).view(batch_size, 1, self.num_atoms)
-        advantage_logits = self.advantage_stream(shared_features).view(batch_size, self.num_actions, self.num_atoms)
-        q_logits = value_logits + advantage_logits - advantage_logits.mean(dim=1, keepdim=True)
-        q_logits = torch.clamp(q_logits, min=-1e4, max=1e4)
-        return F.log_softmax(q_logits, dim=2)
+    def _quantiles_from_features(
+        self,
+        shared_features: torch.Tensor,
+        taus: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute quantile values from cached shared features + taus.
 
-    def forward(self, market_data: torch.Tensor, account_state: torch.Tensor) -> torch.Tensor:
+        Args:
+            shared_features: ``[B, shared_feature_dim]``.
+            taus: ``[B, K]`` quantile fractions in ``[0, 1]``.
+
+        Returns:
+            ``[B, num_actions, K]`` quantile estimates.
+        """
+        if shared_features.ndim != 2:
+            raise ValueError(f"shared_features must be 2D, got shape {tuple(shared_features.shape)}")
+        if taus.ndim != 2:
+            raise ValueError(f"taus must be 2D [B, K], got shape {tuple(taus.shape)}")
+        if taus.shape[0] != shared_features.shape[0]:
+            raise ValueError(
+                f"taus batch dim ({taus.shape[0]}) must match shared_features batch dim ({shared_features.shape[0]})"
+            )
+        batch_size = shared_features.shape[0]
+        num_taus = taus.shape[1]
+
+        phi = self.tau_embedding(taus)  # [B, K, sf_dim]
+        # Element-wise gating: shared_features broadcast across K, then * phi.
+        sf_tau = shared_features.unsqueeze(1) * phi  # [B, K, sf_dim]
+        sf_flat = sf_tau.reshape(batch_size * num_taus, self.shared_feature_dim)
+
+        # Heads emit per-tau scalars; reshape back to [B, K, ...].
+        value = self.value_stream(sf_flat).view(batch_size, num_taus, 1)
+        advantage = self.advantage_stream(sf_flat).view(batch_size, num_taus, self.num_actions)
+
+        # Dueling combine over the action axis (axis 2), per IQN/dueling.
+        quantiles = value + advantage - advantage.mean(dim=2, keepdim=True)  # [B, K, A]
+        # Standardize layout: caller expects [B, num_actions, K].
+        return quantiles.transpose(1, 2).contiguous()
+
+    def forward(
+        self,
+        market_data: torch.Tensor,
+        account_state: torch.Tensor,
+        taus: torch.Tensor,
+    ) -> torch.Tensor:
+        """Returns quantile estimates ``[B, num_actions, K]``."""
         if self.debug_mode:
             if market_data.ndim != 3:
                 raise ValueError(f"Input market_data must be 3D (Batch, Seq, Feat), got shape {market_data.shape}")
@@ -279,51 +415,65 @@ class RainbowNetwork(nn.Module):
                 )
             if market_data.shape[0] != account_state.shape[0]:
                 raise ValueError("Batch size mismatch between market_data and account_state")
+            if taus.ndim != 2:
+                raise ValueError(f"taus must be 2D [B, K], got shape {tuple(taus.shape)}")
+            if taus.shape[0] != market_data.shape[0]:
+                raise ValueError("Batch size mismatch between taus and market_data")
 
         cls_out = self._encode_market(market_data)
-        log_probs = self._heads_from_cls(cls_out, account_state)
+        shared_features = self._shared_features(cls_out, account_state)
+        quantiles = self._quantiles_from_features(shared_features, taus)
 
         if self.debug_mode:
-            if torch.isnan(log_probs).any():
-                raise ValueError("NaN detected in final log_probs")
-            if torch.isinf(log_probs).any():
-                raise ValueError("Inf detected in final log_probs")
+            if torch.isnan(quantiles).any():
+                raise ValueError("NaN detected in IQN quantiles")
+            if torch.isinf(quantiles).any():
+                raise ValueError("Inf detected in IQN quantiles")
 
-        return log_probs
+        return quantiles
 
     def forward_with_cls(
-        self, market_data: torch.Tensor, account_state: torch.Tensor
+        self,
+        market_data: torch.Tensor,
+        account_state: torch.Tensor,
+        taus: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return (log_probs, cls_out) with a single encoder pass.
+        """Return ``(quantiles, cls_out)`` with a single encoder pass.
 
-        Used by the training loss so the auxiliary return-prediction head can
-        reuse the Transformer output instead of running a second full encoder
-        pass via :meth:`predict_return`.
+        The training loss reuses ``cls_out`` for the auxiliary return-prediction
+        head so we don't run the Transformer twice per learn step.
         """
         cls_out = self._encode_market(market_data)
-        log_probs = self._heads_from_cls(cls_out, account_state)
-        return log_probs, cls_out
+        shared_features = self._shared_features(cls_out, account_state)
+        quantiles = self._quantiles_from_features(shared_features, taus)
+        return quantiles, cls_out
 
     def predict_return(self, market_data: torch.Tensor) -> torch.Tensor:
-        """Auxiliary head: predict next-step log return from CLS features.
-
-        Kept for backward-compat with callers outside ``_compute_loss``. The
-        training loop uses :meth:`forward_with_cls` + :meth:`aux_from_cls` to
-        avoid the duplicated encoder pass.
-        """
+        """Auxiliary head: predict next-step log return from CLS features."""
         return self.aux_from_cls(self._encode_market(market_data))
 
     def aux_from_cls(self, cls_out: torch.Tensor) -> torch.Tensor:
         """Apply the auxiliary return-prediction head to a cached CLS encoding."""
         return self.aux_return_head(cls_out).squeeze(-1)
 
-    def get_q_values(self, market_data: torch.Tensor, account_state: torch.Tensor) -> torch.Tensor:
-        """Helper function to get expected Q-values for action selection."""
-        log_probs = self.forward(market_data, account_state)
-        probs = torch.exp(log_probs)
-        # Calculate Q-values from probabilities and support
-        q_values = (probs * self.support.unsqueeze(0).unsqueeze(1)).sum(dim=2)  # Expand support dims for broadcast
+    def get_quantiles(
+        self,
+        market_data: torch.Tensor,
+        account_state: torch.Tensor,
+        taus: torch.Tensor,
+    ) -> torch.Tensor:
+        """Alias for :meth:`forward`. Returns ``[B, num_actions, K]`` quantiles."""
+        return self.forward(market_data, account_state, taus)
 
+    def get_q_values(
+        self,
+        market_data: torch.Tensor,
+        account_state: torch.Tensor,
+        taus: torch.Tensor,
+    ) -> torch.Tensor:
+        """Risk-neutral expected Q-values: mean of quantiles over the K axis."""
+        quantiles = self.forward(market_data, account_state, taus)  # [B, A, K]
+        q_values = quantiles.mean(dim=2)  # [B, A]
         if self.debug_mode and q_values.shape != (market_data.shape[0], self.num_actions):
             raise ValueError("Output q_values shape mismatch")
         return q_values

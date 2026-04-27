@@ -89,9 +89,16 @@ def test_agent_config_range_checks_polyak_tau():
         "target_update_freq": 5,
         "polyak_tau": 1.5,  # invalid: must be in (0, 1)
         "n_steps": 1,
-        "num_atoms": 51,
-        "v_min": -1.0,
-        "v_max": 1.0,
+        # IQN distributional head (replaces C51 num_atoms/v_min/v_max).
+        "n_quantiles_online": 16,
+        "n_quantiles_target": 16,
+        "n_quantiles_policy": 8,
+        "quantile_embedding_dim": 16,
+        "huber_kappa": 1.0,
+        "munchausen_alpha": 0.9,
+        "munchausen_entropy_tau": 0.03,
+        "munchausen_log_pi_clip": -1.0,
+        "spectral_norm_enabled": False,
         "num_actions": 6,
         "window_size": 10,
         "n_features": 12,
@@ -107,8 +114,8 @@ def test_agent_config_range_checks_polyak_tau():
         "entropy_coeff": 0.0,
         "store_partial_n_step": False,
         "debug": False,
-        "categorical_logging_interval": 100,
-        "categorical_logging_percentiles": [5, 50, 95],
+        "quantile_logging_interval": 100,
+        "quantile_logging_percentiles": [5, 50, 95],
         "noisy_sigma_logging_interval": 0,
         "q_value_logging_interval": 0,
         "q_value_histogram_interval": 0,
@@ -142,5 +149,5 @@ def test_agent_config_missing_multiple_keys_reports_all():
         AgentConfig.from_dict({"seed": 1})
     message = str(excinfo.value)
     # A few random required fields should all be mentioned.
-    for key in ("gamma", "lr", "batch_size", "num_atoms"):
+    for key in ("gamma", "lr", "batch_size", "n_quantiles_online", "huber_kappa"):
         assert key in message

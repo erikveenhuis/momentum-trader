@@ -27,7 +27,7 @@ momentum-trader/
 
 ## Architecture Overview
 
-The agent is a full **Rainbow DQN** (C51 distributional + PER + dueling + noisy nets + n-step + double DQN) with a **Transformer encoder** as the feature backbone.
+The agent is a full **Beyond-the-Rainbow DQN** stack — Rainbow's PER + dueling + noisy nets + n-step, with the C51 distributional head replaced by **IQN** (Implicit Quantile Networks, Dabney et al. 2018), the TD target augmented by **Munchausen DQN** (Vieillard et al. 2020) on the target network's log-policy, and **spectral normalization** wrapping the dueling-head NoisyLinears to bound their Lipschitz constant. The shared feature backbone is a **Transformer encoder**.
 
 Key design decisions:
 - **12 features**: 6 raw (OHLCV + transactions) with window-level z-score normalization, plus 6 precomputed derived features (log returns at lag 1/5/10, realized volatility, volume ratio, high-low range ratio)
@@ -212,7 +212,8 @@ they show up as a degraded KPI.
 | `Train/Noisy/*` (`weight_sigma_mean/max/min` per `NoisyLinear` block) | NoisyNet exploration breadth |
 | `Train/Grad/Norm/*` (global + per module group) and `Train/ParamUpdateRatio` | Optimizer stability (vanishing / exploding / dead modules) |
 | `Train/TargetNet/SoftUpdates` and `Train/TargetNet/ParamDeviation` | Polyak target-net divergence |
-| `Train/Categorical/*` and `Train/Categorical/Distribution` | C51 distributional target health |
+| `Train/Quantile/*` (`Mean`, `Std`, `Min`, `Max`, `P{5,25,50,75,95}`, `Distribution`) | IQN target-quantile health (replaces the old C51 categorical stream) |
+| `Train/SpectralNorm/<layer>/SigmaMax` | Operator norm of each spectrally-normed dueling-head NoisyLinear's `weight_mu` (only emitted when `spectral_norm_enabled: true`) |
 | `Train/PER/*` (priority stats, `Train/PER/Reward/*`, `Train/PER/PriorityByAction/k`, `Train/PER/Top1PctActionShare/k`) | Replay-buffer balance, action-class skew, FIFO half-life |
 | `Train/NStep/*` | n-step reward window — confirms the n-step discounting integrates as expected |
 | `Train/Episode/Reward{Min,Max,P99Abs,OutlierFlag}` | Per-episode reward outlier guard (flag fires when any reward exceeds 5× `reward_clip`) |
@@ -231,7 +232,8 @@ Train/Noisy/{layer}_{weight|bias}_sigma_{mean|max|min}
 Train/Grad/{Norm, Group/{encoder|advantage|value|return_pred}}
 Train/ParamUpdateRatio
 Train/TargetNet/{SoftUpdates, ParamDeviation}
-Train/Categorical/{Mean, Std, Entropy, Distribution}
+Train/Quantile/{Mean, Std, Min, Max, P5, P25, P50, P75, P95, Distribution}
+Train/SpectralNorm/{value_stream/N, advantage_stream/N}/SigmaMax  # only when spectral_norm_enabled
 Train/PER/{Sample/*, Priority/*, Reward/*, PriorityByAction/k, Top1PctActionShare/k}
 Train/NStep/{Reward/Mean, Reward/Std, Reward/Skew, Reward/Kurtosis, ClipSaturationRate}
 Train/Episode/{Reward, RewardMin, RewardMax, RewardP99Abs, RewardOutlierFlag}

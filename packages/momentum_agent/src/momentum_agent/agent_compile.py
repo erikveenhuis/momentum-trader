@@ -21,6 +21,7 @@ def compile_networks_or_raise(
     device: torch.device,
     window_size: int,
     n_features: int,
+    smoke_test_quantiles: int = 8,
 ) -> tuple[torch.nn.Module, torch.nn.Module]:
     """Apply ``torch.compile`` to ``network`` / ``target_network``.
 
@@ -28,6 +29,10 @@ def compile_networks_or_raise(
     running a tiny forward pass. If every mode fails, raises
     ``RuntimeError`` with an actionable hint (torch.compile is required on
     the training path for acceptable throughput).
+
+    The IQN forward signature is ``(market_data, account_state, taus)``; we
+    pass a tiny ``[1, smoke_test_quantiles]`` tau tensor so the smoke test
+    actually runs the quantile embedding + dueling head.
     """
 
     if not hasattr(torch, "compile"):
@@ -47,7 +52,8 @@ def compile_networks_or_raise(
             with torch.no_grad():
                 test_market = torch.zeros((1, window_size, n_features), device=device)
                 test_account = torch.zeros((1, ACCOUNT_STATE_DIM), device=device)
-                _ = compiled_network(test_market, test_account)
+                test_taus = torch.rand((1, smoke_test_quantiles), device=device)
+                _ = compiled_network(test_market, test_account, test_taus)
 
             logger.info(f"torch.compile applied successfully with mode='{mode}'.")
             return compiled_network, compiled_target_network

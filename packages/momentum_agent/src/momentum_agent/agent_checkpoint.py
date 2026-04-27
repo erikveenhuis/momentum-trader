@@ -51,7 +51,55 @@ def _maybe_wrap_orig_mod_state_dict(state_dict: dict) -> dict:
     return {f"_orig_mod.{k}": v for k, v in state_dict.items()}
 
 
+_PRE_IQN_CHECKPOINT_MESSAGE = (
+    "Pre-IQN (C51) checkpoint detected: state_dict has no `tau_embedding.linear.*` keys, "
+    "which means it was saved before the Beyond-the-Rainbow IQN/Munchausen/Spectral-Norm upgrade. "
+    "There is no in-place fallback to C51. To preserve training progress, run "
+    "`python -m momentum_train.scripts.migrate_c51_to_iqn --src <c51.pt> --dst <iqn.pt>` to warm-start "
+    "the new agent from the encoder/aux-head weights of this checkpoint."
+)
+
+
+def _is_pre_iqn_state_dict(state_dict: dict) -> bool:
+    """Return True iff ``state_dict`` looks like a pre-IQN (C51) network snapshot.
+
+    The IQN head adds ``tau_embedding.linear.weight``/``bias`` keys that did
+    not exist in C51. We check for the absence of *any* tau-embedding key
+    (after stripping a possible ``_orig_mod.`` prefix) and the presence of
+    *some* network keys (so an empty dict is treated as a generic load
+    failure rather than a stale C51 checkpoint).
+    """
+    if not isinstance(state_dict, dict) or not state_dict:
+        return False
+
+    has_tau_embedding = False
+    has_net_keys = False
+    for key in state_dict:
+        if not isinstance(key, str):
+            continue
+        bare = key[len("_orig_mod.") :] if key.startswith("_orig_mod.") else key
+        if bare.startswith("tau_embedding."):
+            has_tau_embedding = True
+            break
+        if (
+            bare.startswith("encoder.")
+            or bare.startswith("value_stream.")
+            or bare.startswith("advantage_stream.")
+            or bare.startswith("aux_return_head.")
+            or bare.startswith("input_projection.")
+        ):
+            has_net_keys = True
+    return has_net_keys and not has_tau_embedding
+
+
+def _assert_iqn_state_dict(state_dict: dict, *, context: str) -> None:
+    """Raise a clear RuntimeError if ``state_dict`` is a pre-IQN snapshot."""
+    if _is_pre_iqn_state_dict(state_dict):
+        raise RuntimeError(f"[{context}] {_PRE_IQN_CHECKPOINT_MESSAGE}")
+
+
 def _load_state_dict_with_orig_mod_fallback(module: torch.nn.Module, state_dict: dict) -> None:
+    _assert_iqn_state_dict(state_dict, context="network load")
     try:
         module.load_state_dict(state_dict)
     except Exception:
@@ -126,6 +174,7 @@ class AgentCheckpointMixin:
             checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 
             if "network_state_dict" in checkpoint and self.network is not None:
+                _assert_iqn_state_dict(checkpoint["network_state_dict"], context="network load")
                 self.network.load_state_dict(checkpoint["network_state_dict"])
                 logger.info("Network state loaded.")
             else:
@@ -133,6 +182,7 @@ class AgentCheckpointMixin:
                 return False
 
             if "target_network_state_dict" in checkpoint and self.target_network is not None:
+                _assert_iqn_state_dict(checkpoint["target_network_state_dict"], context="target network load")
                 self.target_network.load_state_dict(checkpoint["target_network_state_dict"])
                 logger.info("Target network state loaded.")
             else:
@@ -179,6 +229,12 @@ class AgentCheckpointMixin:
         except FileNotFoundError:
             logger.error(f"Checkpoint file not found at {checkpoint_path}")
             return False
+        except RuntimeError as e:
+            if _PRE_IQN_CHECKPOINT_MESSAGE in str(e):
+                logger.error("Refusing to load pre-IQN checkpoint: %s", e)
+                raise
+            logger.error(f"Error loading agent checkpoint from {checkpoint_path}: {e}", exc_info=True)
+            return False
         except Exception as e:
             logger.error(f"Error loading agent checkpoint from {checkpoint_path}: {e}", exc_info=True)
             return False
@@ -207,6 +263,11 @@ class AgentCheckpointMixin:
                 _load_state_dict_with_orig_mod_fallback(self.network, agent_state_dict["network_state_dict"])
                 self.network.to(self.device)
                 logger.info("Network state loaded from dictionary.")
+            except RuntimeError as e:
+                if _PRE_IQN_CHECKPOINT_MESSAGE in str(e):
+                    raise
+                logger.error(f"Error loading network state_dict from dictionary: {e}", exc_info=True)
+                successful_load = False
             except Exception as e:
                 logger.error(f"Error loading network state_dict from dictionary: {e}", exc_info=True)
                 successful_load = False
@@ -222,6 +283,10 @@ class AgentCheckpointMixin:
                 )
                 self.target_network.to(self.device)
                 logger.info("Target network state loaded from dictionary.")
+            except RuntimeError as e:
+                if _PRE_IQN_CHECKPOINT_MESSAGE in str(e):
+                    raise
+                logger.error(f"Error loading target_network state_dict from dictionary: {e}", exc_info=True)
             except Exception as e:
                 logger.error(f"Error loading target_network state_dict from dictionary: {e}", exc_info=True)
         else:

@@ -45,9 +45,6 @@ class AgentConfig:
     transformer_dropout: float
 
     n_steps: int
-    num_atoms: int
-    v_min: float
-    v_max: float
     alpha: float
     beta_start: float
     beta_frames: int
@@ -62,26 +59,43 @@ class AgentConfig:
     store_partial_n_step: bool
     debug: bool
 
+    # IQN distributional head (replaces C51's num_atoms/v_min/v_max).
+    n_quantiles_online: int
+    n_quantiles_target: int
+    n_quantiles_policy: int
+    quantile_embedding_dim: int
+    huber_kappa: float
+
+    # Munchausen DQN (Vieillard et al. 2020) layered on top of the IQN target.
+    # ``alpha=0`` collapses the target back to vanilla IQN/Double-DQN, which is
+    # useful for ablations and to confirm the Munchausen path is the only
+    # difference. ``entropy_tau`` controls the entropy-regularised softmax; the
+    # log-pi clip keeps the bonus bounded when the target net is overconfident.
+    munchausen_alpha: float
+    munchausen_entropy_tau: float
+    munchausen_log_pi_clip: float
+
+    # Spectral normalization on the dueling head NoisyLinears (BTR Stage 3).
+    spectral_norm_enabled: bool
+
     # Diagnostic logging cadences. Set to 0 to disable the corresponding stream.
-    categorical_logging_interval: int
+    quantile_logging_interval: int
     noisy_sigma_logging_interval: int
     q_value_logging_interval: int
     q_value_histogram_interval: int
     grad_logging_interval: int
     target_net_logging_interval: int
-    # Tier 2.2: cadence for TD-error mean/std D->H sync. Set to 0 to disable.
+    # Cadence for TD-error mean/std D->H sync. Set to 0 to disable.
     td_error_logging_interval: int
 
-    categorical_logging_percentiles: tuple[float, ...]
+    quantile_logging_percentiles: tuple[float, ...]
 
     # LR scheduler. The YAML specifies these explicitly; when the scheduler is
     # disabled only ``lr_scheduler_enabled=False`` is read.
     lr_scheduler_enabled: bool
     lr_scheduler_type: str
 
-    # Tier 2.1: single source of truth for the return-prediction auxiliary head
-    # (previously hardcoded as 0.1 * MSE on feature index 6 inside
-    # ``_compute_loss``). Required — no silent fallback to the 2024 default.
+    # Auxiliary return-prediction head.
     aux_loss_weight: float
     aux_target_feature_index: int
 
@@ -106,13 +120,13 @@ class AgentConfig:
         if missing:
             raise KeyError("AgentConfig is missing required keys: " + ", ".join(sorted(missing)))
 
-        # Normalize categorical_logging_percentiles to a tuple so the dataclass
+        # Normalize quantile_logging_percentiles to a tuple so the dataclass
         # stays hashable / frozen-friendly.
-        if "categorical_logging_percentiles" in kwargs:
-            value = kwargs["categorical_logging_percentiles"]
+        if "quantile_logging_percentiles" in kwargs:
+            value = kwargs["quantile_logging_percentiles"]
             if not isinstance(value, (list, tuple)):
-                raise TypeError(f"categorical_logging_percentiles must be a list or tuple, got {type(value).__name__}")
-            kwargs["categorical_logging_percentiles"] = tuple(float(v) for v in value)
+                raise TypeError(f"quantile_logging_percentiles must be a list or tuple, got {type(value).__name__}")
+            kwargs["quantile_logging_percentiles"] = tuple(float(v) for v in value)
 
         instance = cls(**kwargs)
         _validate_agent_config(instance)
@@ -133,10 +147,24 @@ def _validate_agent_config(cfg: AgentConfig) -> None:
         raise ValueError(f"polyak_tau must be in (0, 1), got {cfg.polyak_tau}")
     if not (0.0 < cfg.gamma < 1.0):
         raise ValueError(f"gamma must be in (0, 1), got {cfg.gamma}")
-    if cfg.num_atoms < 2:
-        raise ValueError(f"num_atoms must be >= 2, got {cfg.num_atoms}")
-    if cfg.v_min >= cfg.v_max:
-        raise ValueError(f"v_min ({cfg.v_min}) must be < v_max ({cfg.v_max})")
+    if cfg.n_quantiles_online < 8:
+        raise ValueError(f"n_quantiles_online must be >= 8, got {cfg.n_quantiles_online}")
+    if cfg.n_quantiles_target < 8:
+        raise ValueError(f"n_quantiles_target must be >= 8, got {cfg.n_quantiles_target}")
+    if cfg.n_quantiles_policy < 8:
+        raise ValueError(f"n_quantiles_policy must be >= 8, got {cfg.n_quantiles_policy}")
+    if cfg.quantile_embedding_dim < 8:
+        raise ValueError(f"quantile_embedding_dim must be >= 8, got {cfg.quantile_embedding_dim}")
+    if cfg.huber_kappa <= 0:
+        raise ValueError(f"huber_kappa must be > 0, got {cfg.huber_kappa}")
+    if not (0.0 <= cfg.munchausen_alpha <= 1.0):
+        raise ValueError(f"munchausen_alpha must be in [0, 1], got {cfg.munchausen_alpha}")
+    if cfg.munchausen_entropy_tau <= 0:
+        raise ValueError(f"munchausen_entropy_tau must be > 0, got {cfg.munchausen_entropy_tau}")
+    if cfg.munchausen_log_pi_clip > 0:
+        raise ValueError(
+            f"munchausen_log_pi_clip must be <= 0 (clip floor for log pi), got {cfg.munchausen_log_pi_clip}"
+        )
     if cfg.n_steps < 1:
         raise ValueError(f"n_steps must be >= 1, got {cfg.n_steps}")
     if cfg.batch_size < 1:

@@ -40,10 +40,11 @@ def _network_forward_with_cls(
     network: torch.nn.Module,
     market_data: torch.Tensor,
     account_state: torch.Tensor,
+    taus: torch.Tensor,
 ):
     """Call RainbowNetwork.forward_with_cls, unwrapping torch.compile if needed."""
     target = getattr(network, "_orig_mod", network)
-    return target.forward_with_cls(market_data, account_state)
+    return target.forward_with_cls(market_data, account_state, taus)
 
 
 def _network_aux_from_cls(network: torch.nn.Module, cls_out: torch.Tensor) -> torch.Tensor:
@@ -55,10 +56,11 @@ def _network_aux_from_cls(network: torch.nn.Module, cls_out: torch.Tensor) -> to
 # --- Start: Rainbow DQN Agent ---
 class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
     """
-    Rainbow DQN Agent incorporating:
-    - Distributional RL (C51)
+    BTR-flavoured DQN agent (IQN + Munchausen + spectral norm + Rainbow).
+
+    - IQN distributional head (replaces C51's fixed-support categorical)
     - Prioritized Experience Replay (PER)
-    - Dueling Networks (Implicit in RainbowNetwork)
+    - Dueling Networks (implicit in RainbowNetwork)
     - Multi-step Returns
     - Double Q-Learning
     - Noisy Nets for exploration
@@ -125,9 +127,6 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
         self.target_update_freq = c.target_update_freq
         self.polyak_tau = c.polyak_tau
         self.n_steps = c.n_steps
-        self.num_atoms = c.num_atoms
-        self.v_min = c.v_min
-        self.v_max = c.v_max
         self.num_actions = c.num_actions
         self.window_size = c.window_size
         self.n_features = c.n_features
@@ -142,10 +141,22 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
         self.epsilon_decay_steps = int(c.epsilon_decay_steps)
         self.entropy_coeff = float(c.entropy_coeff)
         self.store_partial_n_step = c.store_partial_n_step
-        self.categorical_logging_interval = int(c.categorical_logging_interval)
-        if self.categorical_logging_interval <= 0:
+        # IQN distributional head config.
+        self.n_quantiles_online = int(c.n_quantiles_online)
+        self.n_quantiles_target = int(c.n_quantiles_target)
+        self.n_quantiles_policy = int(c.n_quantiles_policy)
+        self.quantile_embedding_dim = int(c.quantile_embedding_dim)
+        self.huber_kappa = float(c.huber_kappa)
+        # Munchausen DQN target augmentation (Vieillard et al. 2020).
+        self.munchausen_alpha = float(c.munchausen_alpha)
+        self.munchausen_entropy_tau = float(c.munchausen_entropy_tau)
+        self.munchausen_log_pi_clip = float(c.munchausen_log_pi_clip)
+        # BTR Stage 3: spectral norm on dueling head NoisyLinears.
+        self.spectral_norm_enabled = bool(c.spectral_norm_enabled)
+        self.quantile_logging_interval = int(c.quantile_logging_interval)
+        if self.quantile_logging_interval <= 0:
             raise ValueError(
-                f"categorical_logging_interval must be a positive integer, got {self.categorical_logging_interval}"
+                f"quantile_logging_interval must be a positive integer, got {self.quantile_logging_interval}"
             )
         # Tier 3a/3b/3c/3d diagnostic cadences. Set to 0 in YAML to disable.
         self.noisy_sigma_logging_interval = max(0, int(c.noisy_sigma_logging_interval))
@@ -158,19 +169,19 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
         # the caller verify Polyak is actually running at the expected cadence.
         self._soft_update_count: int = 0
         filtered_percentiles: list[float] = []
-        for value in c.categorical_logging_percentiles:
+        for value in c.quantile_logging_percentiles:
             try:
                 numeric = float(value)
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 continue
             if 0 < numeric < 100:
                 filtered_percentiles.append(numeric)
         if not filtered_percentiles:
             raise ValueError(
-                "categorical_logging_percentiles must contain at least one value in (0, 100), "
-                f"got {list(c.categorical_logging_percentiles)}"
+                "quantile_logging_percentiles must contain at least one value in (0, 100), "
+                f"got {list(c.quantile_logging_percentiles)}"
             )
-        self.categorical_logging_percentiles = sorted(filtered_percentiles)
+        self.quantile_logging_percentiles = sorted(filtered_percentiles)
         # Tier 2.1: auxiliary return-prediction head config (required, no default).
         self.aux_loss_weight = float(c.aux_loss_weight)
         self.aux_target_feature_index = int(c.aux_target_feature_index)
@@ -206,12 +217,11 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
         logger.info(f"Device type: {self.device.type}, CUDA available: {torch.cuda.is_available()}")
         logger.info(f"Config: {config}")  # Log the entire config
 
-        # Distributional RL setup
-        self.support = torch.linspace(self.v_min, self.v_max, self.num_atoms).to(self.device)
-        self.delta_z = (self.v_max - self.v_min) / (self.num_atoms - 1)
-        self.support_cpu = np.linspace(self.v_min, self.v_max, self.num_atoms, dtype=np.float64)
-        self._categorical_target_accumulator = {
-            "mass": np.zeros(self.num_atoms, dtype=np.float64),
+        # IQN diagnostics: rolling accumulator over the per-step target
+        # quantile distributions (one entry per learn step). Logged on the
+        # ``quantile_logging_interval`` cadence as ``Train/Quantile/*`` tags.
+        self._quantile_target_accumulator = {
+            "values": [],  # list[np.ndarray of shape [B, K']] flushed on log
             "samples": 0,
         }
         # Optional TensorBoard writer injected by the trainer (see logging plan Tier 1c/3a-d).
@@ -221,10 +231,17 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
         self._last_batch_was_greedy: np.ndarray = np.zeros(0, dtype=bool)
         self._last_select_q_values: np.ndarray | None = None
 
-        # Initialize Networks
-        # Pass the agent's config dictionary and device directly
-        self.network = RainbowNetwork(config=self.config, device=self.device).to(self.device)
-        self.target_network = RainbowNetwork(config=self.config, device=self.device).to(self.device)
+        # Initialize Networks. Spectral norm is opt-in via the agent config.
+        self.network = RainbowNetwork(
+            config=self.config,
+            device=self.device,
+            spectral_norm_enabled=self.spectral_norm_enabled,
+        ).to(self.device)
+        self.target_network = RainbowNetwork(
+            config=self.config,
+            device=self.device,
+            spectral_norm_enabled=self.spectral_norm_enabled,
+        ).to(self.device)
 
         self.target_network.load_state_dict(self.network.state_dict())
         self.target_network.eval()  # Target network is not trained directly
@@ -454,7 +471,15 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
 
         with torch.inference_mode():
             with autocast("cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
-                q_values = self.network.get_q_values(market_data, account_state)
+                # Risk-neutral policy: sample a fresh batch of taus and average
+                # quantiles to recover an expected-Q estimate before argmax.
+                taus_policy = torch.rand(
+                    1,
+                    self.n_quantiles_policy,
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+                q_values = self.network.get_q_values(market_data, account_state, taus_policy)
             if self.debug_mode:
                 assert q_values.shape == (
                     1,
@@ -531,7 +556,14 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
 
         with torch.inference_mode():
             with autocast("cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
-                q_values = self.network.get_q_values(market_t, account_t)  # [N, num_actions]
+                # Fresh policy taus per batch — risk-neutral expectation over K samples.
+                taus_policy = torch.rand(
+                    n,
+                    self.n_quantiles_policy,
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+                q_values = self.network.get_q_values(market_t, account_t, taus_policy)  # [N, num_actions]
 
         actions = q_values.argmax(dim=1).cpu().numpy()  # [N]
 
@@ -818,118 +850,102 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
 
             self._n_step_needs_reset_flags[env_id] = True
 
-    def _project_target_distribution(self, next_market_data_batch, next_account_state_batch, rewards, dones):
-        """
-        Computes the projected target distribution for the C51 algorithm.
-        Applies the Bellman update for n-steps and projects the resulting
-        distribution onto the fixed support atoms.
+    def _compute_iqn_target_quantiles(
+        self,
+        market_data_batch: torch.Tensor,
+        account_state_batch: torch.Tensor,
+        next_market_data_batch: torch.Tensor,
+        next_account_state_batch: torch.Tensor,
+        actions_batch: torch.Tensor,
+        rewards: torch.Tensor,
+        dones: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute the Munchausen-IQN target quantile values ``[B, K']``.
 
-        Args:
-            next_market_data_batch (torch.Tensor): Batch of next market data states (s_{t+n}).
-            next_account_state_batch (torch.Tensor): Batch of next account states (s_{t+n}).
-            rewards (torch.Tensor): Batch of n-step rewards (G_t^(n)), shape [B, 1].
-            dones (torch.Tensor): Batch of done flags (d_{t+n}), shape [B, 1].
+        The target is the Munchausen-DQN augmentation of a soft-policy IQN
+        bootstrap, layered entirely on the *target* network (Vieillard et al.
+        2020; BTR Stage 2). With ``alpha`` the Munchausen scale and
+        ``tau_M`` the entropy temperature, the per-quantile target is::
 
-        Returns:
-            torch.Tensor: The projected target distribution (m) with shape [batch_size, num_atoms].
+            taus_*  ~ U(0, 1)^{B x K'}
+            Z_t     = Z_target(s', a, taus_next)                # [B, A, K']
+            q_next  = E_tau' Z_target(s', a, taus_next)         # [B, A]
+            log_pi' = log_softmax(q_next / tau_M, dim=1)        # [B, A]
+            pi'     = exp(log_pi')                              # [B, A]
+            soft_V  = sum_a pi'[..., None] * (Z_t - tau_M * log_pi'[..., None])  # [B, K']
+
+            log_pi  = log_softmax(Q_target(s, taus_curr) / tau_M, dim=1)
+            log_pi_a = clamp(log_pi.gather(actions), min=log_pi_clip)  # [B]
+
+            T_z = r + alpha * tau_M * log_pi_a + (1 - done) * gamma^n * soft_V
+
+        The Munchausen log-policy bonus on ``log_pi_a`` is *not* masked by
+        ``(1 - done)``: it is the immediate-reward component, not part of
+        the bootstrapped value, and stays attached even at episode
+        terminations. ``alpha = 0`` collapses the bonus, leaving the soft
+        target-net bootstrap intact (i.e. an entropy-regularised IQN); set
+        ``alpha = 0`` *and* ``tau_M -> 0`` to recover plain target-net
+        argmax IQN (used in the Stage 2 ablation tests).
+
+        The online network is intentionally never invoked here: Munchausen
+        replaces the Double-DQN argmax with a target-net soft policy, which
+        is the variance-reduction story behind Vieillard et al.'s
+        suppression of dominated-action overestimation.
         """
         with torch.no_grad():
-            # Double DQN: Use online network to select best next action's index at state s_{t+n}
-            next_q_values = self.network.get_q_values(next_market_data_batch, next_account_state_batch)
-            if self.debug_mode:
-                assert next_q_values.shape == (
-                    self.batch_size,
-                    self.num_actions,
-                ), "Next Q-values shape mismatch"
-            next_actions = next_q_values.argmax(dim=1)  # [batch_size]
-            if self.debug_mode:
-                assert next_actions.shape == (self.batch_size,), "Next actions shape mismatch"
+            batch_size = next_market_data_batch.shape[0]
+            n_target = self.n_quantiles_target
+            tau_M = self.munchausen_entropy_tau
+            alpha = self.munchausen_alpha
+            log_pi_clip = self.munchausen_log_pi_clip
 
-            # Get next state's distribution Z(s_{t+n}, a*) from target network for selected actions a*
-            next_log_dist = self.target_network(
-                next_market_data_batch, next_account_state_batch
-            )  # [B, num_actions, num_atoms]
-            if self.debug_mode:
-                assert next_log_dist.shape == (
-                    self.batch_size,
-                    self.num_actions,
-                    self.num_atoms,
-                ), "Next log distribution shape mismatch"
-                assert next_actions.max() < self.num_actions and next_actions.min() >= 0, "Invalid next_action indices"
-
-            # Get the probability distribution for the chosen actions: p(s_{t+n}, a*)
-            next_dist = torch.exp(next_log_dist[range(self.batch_size), next_actions])  # [B, num_atoms]
-            if self.debug_mode:
-                assert next_dist.shape == (
-                    self.batch_size,
-                    self.num_atoms,
-                ), "Next distribution shape mismatch"
-
-            # Compute the projected Bellman target T_z = G_t^(n) + gamma^n * Z(s_{t+n}, a*)
-            # Rewards are [B, 1], dones are [B, 1], support is [num_atoms]
-            # Broadcasting applies correctly.
-            Tz = rewards + (1 - dones) * (self.gamma**self.n_steps) * self.support  # [B, num_atoms]
-            if self.debug_mode:
-                assert Tz.shape == (
-                    self.batch_size,
-                    self.num_atoms,
-                ), f"Projected Tz shape mismatch: {Tz.shape}"
-            Tz = Tz.clamp(min=self.v_min, max=self.v_max)
-
-            # Compute projection indices and weights
-            b = (Tz - self.v_min) / self.delta_z  # Normalized position on support axis [B, num_atoms]
-            if self.debug_mode:
-                assert b.shape == (
-                    self.batch_size,
-                    self.num_atoms,
-                ), f"Projection 'b' shape mismatch: {b.shape}"
-            lower_atom_idx = b.floor().long()
-            u = b.ceil().long()  # Upper atom index
-            # Fix disappearing probability mass when l = b = u (b is int)
-            lower_atom_idx[(u > 0) * (lower_atom_idx == u)] -= 1
-            u[(lower_atom_idx < (self.num_atoms - 1)) * (lower_atom_idx == u)] += 1
-
-            # Distribute probability
-            m = torch.zeros_like(next_dist)
-            offset = (
-                torch.linspace(0, (self.batch_size - 1) * self.num_atoms, self.batch_size)
-                .long()
-                .unsqueeze(1)
-                .expand(self.batch_size, self.num_atoms)
-                .to(self.device)
+            # IQN target taus for the bootstrap quantiles.
+            taus_target = torch.rand(
+                batch_size,
+                n_target,
+                device=self.device,
+                dtype=next_market_data_batch.dtype,
             )
 
-            # Ensure indices are within bounds [0, num_atoms - 1]
-            lower_atom_idx = lower_atom_idx.clamp(0, self.num_atoms - 1)
-            u = u.clamp(0, self.num_atoms - 1)
-
-            # Debugging shapes right before indexing
-            # logger.debug(f"Shapes before indexing: m={m.shape}, offset={offset.shape}, l={l.shape}, u={u.shape}, next_dist={next_dist.shape}, b={b.shape}")
-            # logger.debug(f"Indices: l max={l.max()}, min={l.min()}; u max={u.max()}, min={u.min()}")
-
-            m.view(-1).index_add_(
-                0,
-                (lower_atom_idx + offset).view(-1),
-                (next_dist * (u.float() - b)).view(-1),
-            )
-            m.view(-1).index_add_(
-                0,
-                (u + offset).view(-1),
-                (next_dist * (b - lower_atom_idx.float())).view(-1),
-            )
-
-            # Optional: Check if target distribution sums to 1 (approximately)
-            # This check can be expensive, use cautiously or only in debug mode
+            # Soft-policy bootstrap on the *target* net: E_{a~pi'} [Z(s', a, tau') - tau_M * log pi'(a|s')].
+            target_quantiles_all = self.target_network.get_quantiles(
+                next_market_data_batch, next_account_state_batch, taus_target
+            )  # [B, A, K']
             if self.debug_mode:
-                sums = m.sum(dim=1)
-                if not torch.allclose(sums, torch.ones_like(sums), atol=1e-4):
-                    logger.warning(
-                        f"Target distribution M does not sum to 1. Sums: {sums}. Min sum: {sums.min()}, Max sum: {sums.max()}"
-                    )
-                    # It might not sum *exactly* to 1 due to floating point, clamping, and edge cases.
-                    # A small tolerance is usually acceptable.
+                assert target_quantiles_all.shape == (batch_size, self.num_actions, n_target), (
+                    "Target net quantile shape mismatch"
+                )
+            q_next_target = target_quantiles_all.mean(dim=2)  # [B, A]
+            log_pi_next = torch.log_softmax(q_next_target / tau_M, dim=1)  # [B, A]
+            pi_next = torch.exp(log_pi_next)  # [B, A]
+            # soft_value_z[b, k'] = sum_a pi'(a|s')[b, a] * (Z(s', a, tau')[b, a, k'] - tau_M * log pi'(a|s')[b, a])
+            soft_value_z = (pi_next.unsqueeze(2) * (target_quantiles_all - tau_M * log_pi_next.unsqueeze(2))).sum(
+                dim=1
+            )  # [B, K']
+            if self.debug_mode:
+                assert soft_value_z.shape == (batch_size, n_target), "Soft value shape mismatch"
 
-            return m
+            # Munchausen log-policy bonus on the *current* state, target net.
+            taus_curr = torch.rand(
+                batch_size,
+                n_target,
+                device=self.device,
+                dtype=market_data_batch.dtype,
+            )
+            q_curr_target = self.target_network.get_q_values(
+                market_data_batch, account_state_batch, taus_curr
+            )  # [B, A]
+            log_pi_curr = torch.log_softmax(q_curr_target / tau_M, dim=1)  # [B, A]
+            log_pi_a = log_pi_curr.gather(1, actions_batch.view(batch_size, 1)).squeeze(1)  # [B]
+            log_pi_a = log_pi_a.clamp(min=log_pi_clip)  # [B]
+            munchausen_bonus = alpha * tau_M * log_pi_a.unsqueeze(1)  # [B, 1] broadcasts across K'
+
+            target_q_z = (
+                rewards + munchausen_bonus + (1.0 - dones) * (self.gamma**self.n_steps) * soft_value_z
+            )  # [B, K']
+            if self.debug_mode:
+                assert target_q_z.shape == (batch_size, n_target), f"Target quantile shape mismatch: {target_q_z.shape}"
+            return target_q_z
 
     def reset_noisy_sigma(self, std_init: float | None = None) -> int:
         """Re-initialise sigma parameters of every NoisyLinear layer in-place.
@@ -1000,7 +1016,7 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
         return online_count
 
     def _compute_loss(self, batch, weights):
-        """Computes the C51 loss using PER weights."""
+        """Computes the IQN quantile-Huber loss using PER weights."""
         (
             market_data,
             account_state,
@@ -1092,65 +1108,78 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
             # --- End: Assert tensor shapes ---
 
         amp_enabled = self.device.type == "cuda" and torch.cuda.is_available()
+        n_online = self.n_quantiles_online
+        n_target = self.n_quantiles_target
 
         with autocast("cuda", dtype=torch.bfloat16, enabled=amp_enabled):
-            target_distribution = self._project_target_distribution(
-                next_market_data_batch, next_account_state_batch, rewards_batch, dones_batch
-            )
+            target_q_z = self._compute_iqn_target_quantiles(
+                market_data_batch,
+                account_state_batch,
+                next_market_data_batch,
+                next_account_state_batch,
+                actions_batch,
+                rewards_batch,
+                dones_batch,
+            )  # [B, K']
             if self.debug_mode:
-                assert target_distribution.shape == (
-                    self.batch_size,
-                    self.num_atoms,
-                ), "Target distribution shape mismatch"
-            self._accumulate_categorical_target_stats(target_distribution)
-            # ---------------------------------------- #
+                assert target_q_z.shape == (self.batch_size, n_target), "Target quantile shape mismatch"
+            self._accumulate_quantile_target_stats(target_q_z)
 
-            # --- Calculate Online Distribution and Loss --- #
-            # Tier 2.1: one encoder pass feeds both the distributional head and
-            # the auxiliary return-prediction head. The old code called
-            # ``self.network.predict_return(...)`` afterwards, forcing a second
-            # full Transformer forward pass at ~128 ms/step at batch 8192.
-            log_ps, cls_out = _network_forward_with_cls(self.network, market_data_batch, account_state_batch)
+            # IQN online quantile samples (independent of taus_target).
+            taus_online = torch.rand(
+                self.batch_size,
+                n_online,
+                device=self.device,
+                dtype=market_data_batch.dtype,
+            )
+            online_quantiles, cls_out = _network_forward_with_cls(
+                self.network,
+                market_data_batch,
+                account_state_batch,
+                taus_online,
+            )  # [B, A, K]
             if self.debug_mode:
-                assert log_ps.shape == (
+                assert online_quantiles.shape == (
                     self.batch_size,
                     self.num_actions,
-                    self.num_atoms,
-                ), "Online log_ps shape mismatch"
+                    n_online,
+                ), "Online quantile shape mismatch"
 
-            # Tier 3b: stash the per-action expected Q-values from the *online* net
-            # so _log_q_value_stats can mirror them to TB without recomputing.
-            # Detached + cpu-bound to avoid keeping the autograd graph alive.
+            # Stash expected Q-values from the *online* network so the Tier 3b
+            # diagnostics can mirror them without recomputation.
             with torch.no_grad():
-                self._last_batch_q = (torch.exp(log_ps) * self.support.unsqueeze(0).unsqueeze(0)).sum(dim=2).detach()
+                self._last_batch_q = online_quantiles.mean(dim=2).detach()
 
-            # Gather the log-probabilities for the actions actually taken: log Z(s_t, a_t)
-            # We need to select the log probabilities corresponding to actions_batch
-            actions_indices = actions_batch.view(self.batch_size, 1, 1).expand(self.batch_size, 1, self.num_atoms)
-            log_ps_a = log_ps.gather(1, actions_indices).squeeze(1)  # [B, num_atoms]
+            # Gather the quantiles for the action actually taken: Z(s_t, a_t, tau).
+            actions_idx = actions_batch.view(self.batch_size, 1, 1).expand(self.batch_size, 1, n_online)
+            online_z = online_quantiles.gather(1, actions_idx).squeeze(1)  # [B, K]
             if self.debug_mode:
-                assert log_ps_a.shape == (
-                    self.batch_size,
-                    self.num_atoms,
-                ), "Online log_ps_a shape mismatch"
+                assert online_z.shape == (self.batch_size, n_online), "Online z shape mismatch"
 
-            # Calculate cross-entropy loss between target and online distributions
-            # Loss = -sum_i [ target_distribution_i * log(online_distribution_i) ]
-            # Target distribution is detached as it acts as the label.
-            loss_elementwise = -(target_distribution.detach() * log_ps_a).sum(dim=1)  # [B]
-            if self.debug_mode:
-                assert loss_elementwise.shape == (self.batch_size,), "Per-sample loss shape mismatch"
-
-            loss = (loss_elementwise * weights_batch.squeeze(1).detach()).mean()
+            # Quantile Huber loss (Dabney et al. 2018, Eq. 10).
+            # delta[i, j, k] = target_q_z[i, k] - online_z[i, j]
+            kappa = self.huber_kappa
+            target_detached = target_q_z.detach()
+            delta = target_detached.unsqueeze(1) - online_z.unsqueeze(2)  # [B, K, K']
+            abs_delta = delta.abs()
+            huber = torch.where(
+                abs_delta <= kappa,
+                0.5 * delta.pow(2),
+                kappa * (abs_delta - 0.5 * kappa),
+            )  # [B, K, K']
+            # Asymmetric quantile weighting: |tau - I{delta < 0}| / kappa
+            indicator = (delta < 0).to(huber.dtype)
+            tau_weight = (taus_online.unsqueeze(2) - indicator).abs() / kappa  # [B, K, K']
+            rho = tau_weight * huber  # [B, K, K']
+            # Sum over target axis K', mean over online axis K (Dabney convention).
+            per_sample_loss = rho.sum(dim=2).mean(dim=1)  # [B]
+            loss = (per_sample_loss * weights_batch.squeeze(1).detach()).mean()
             if loss.ndim != 0:
                 raise RuntimeError("Final loss is not a scalar")
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Loss calculation resulted in NaN or Inf: {loss.item()}")
 
-            # Tier 2.1: auxiliary return-prediction head reuses the CLS
-            # encoding computed above. Previous implementation called
-            # ``predict_return`` which ran the full Transformer encoder a
-            # second time on the same batch.
+            # Aux head reuses cls_out from the single encoder pass above.
             aux_pred = _network_aux_from_cls(self.network, cls_out)
             log_ret_col = self.aux_target_feature_index
             if market_data_batch.shape[2] > log_ret_col:
@@ -1158,9 +1187,9 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
                 aux_loss = torch.nn.functional.mse_loss(aux_pred, target_return)
                 loss = loss + self.aux_loss_weight * aux_loss
 
-            # --- Action entropy regularization --- #
+            # --- Action entropy regularization (operates on expected Q) --- #
             if self.entropy_coeff > 0:
-                all_q = (torch.exp(log_ps) * self.support.unsqueeze(0).unsqueeze(0)).sum(dim=2)  # [B, num_actions]
+                all_q = online_quantiles.mean(dim=2)  # [B, num_actions]
                 q_range = (all_q.max(dim=1, keepdim=True).values - all_q.min(dim=1, keepdim=True).values).clamp(
                     min=1e-6
                 )
@@ -1172,14 +1201,12 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
                 self.last_entropy = float(entropy.detach())
             # ----------------------------------------- #
 
-            # --- Calculate TD errors for PER update --- #
-            # TD error is | E[Target Distribution] - E[Online Distribution for a_t] |
-            # Calculate expected Q-values E[Z(s_t, a_t)] from the online distribution for the action taken
-            q_values_online = (torch.exp(log_ps_a) * self.support.unsqueeze(0)).sum(dim=1)  # [B]
-            # Calculate expected target Q-values E[Projected Target Distribution]
-            q_values_target = (target_distribution * self.support.unsqueeze(0)).sum(dim=1)  # [B]
-            # TD error = |Target Q - Online Q|
-            td_errors_tensor = (q_values_target.detach() - q_values_online.detach()).abs()
+            # --- TD errors for PER update --- #
+            # TD-error = | E_tau'[target] - E_tau[online for a_t] |.
+            with torch.no_grad():
+                q_target_mean = target_detached.mean(dim=1)  # [B]
+                q_online_mean = online_z.detach().mean(dim=1)  # [B]
+                td_errors_tensor = (q_target_mean - q_online_mean).abs()
             if self.debug_mode:
                 assert td_errors_tensor.shape == (self.batch_size,), "TD errors tensor shape mismatch"
                 assert torch.isfinite(td_errors_tensor).all(), "NaN or Inf found in TD errors tensor"
@@ -1274,10 +1301,14 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
 
         # Increment step counter and update target network periodically
         self.total_steps += 1
-        if self.categorical_logging_interval > 0 and self.total_steps % self.categorical_logging_interval == 0:
-            self._log_categorical_target_stats()
+        if self.quantile_logging_interval > 0 and self.total_steps % self.quantile_logging_interval == 0:
+            self._log_quantile_target_stats()
         if self.noisy_sigma_logging_interval > 0 and self.total_steps % self.noisy_sigma_logging_interval == 0:
             self._log_noisy_sigma_stats()
+            # Spectral-norm stats share the noisy-sigma cadence: both summarise
+            # the head's effective Lipschitz/spectral footprint.
+            if self.spectral_norm_enabled:
+                self._log_spectral_norm_stats()
         if self.q_value_logging_interval > 0 and self.total_steps % self.q_value_logging_interval == 0:
             emit_hist = self.q_value_histogram_interval > 0 and self.total_steps % self.q_value_histogram_interval == 0
             self._log_q_value_stats(emit_histogram=emit_hist)
@@ -1413,7 +1444,7 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
                 # greedy block.
                 try:
                     self.network.reset_noise()
-                except (AttributeError, RuntimeError):  # pragma: no cover - defensive
+                except AttributeError, RuntimeError:  # pragma: no cover - defensive
                     logger.debug("Failed to reset NoisyNet noise after greedy() exit", exc_info=True)
 
     def _apply_network_mode(self, training: bool) -> None:

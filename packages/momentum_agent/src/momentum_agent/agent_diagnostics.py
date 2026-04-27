@@ -18,108 +18,108 @@ logger = get_logger(__name__)
 
 
 class AgentDiagnosticsMixin:
-    """TB-emitter methods for categorical targets, grad norms, Q-stats, noisy sigma."""
+    """TB-emitter methods for quantile targets, grad norms, Q-stats, noisy sigma."""
 
-    def _accumulate_categorical_target_stats(self, target_distribution: torch.Tensor) -> None:
-        """Accumulates categorical target distributions for periodic logging."""
-        if self.categorical_logging_interval <= 0 or target_distribution is None:
+    def _accumulate_quantile_target_stats(self, target_q_z: torch.Tensor) -> None:
+        """Stash a batch of IQN target quantile values for periodic logging.
+
+        ``target_q_z`` has shape ``[B, K']`` where ``K'`` = ``n_quantiles_target``.
+        We move each batch to CPU/float32 so the GPU buffer can be released, then
+        materialise the full distribution at log time. This is bounded by the
+        product of ``batch_size * n_quantiles_target * quantile_logging_interval``,
+        which sits well within available host RAM at default settings.
+        """
+        if self.quantile_logging_interval <= 0 or target_q_z is None:
             return
 
-        if target_distribution.numel() == 0:
+        if target_q_z.numel() == 0:
             return
 
         try:
-            batch_mass = target_distribution.detach().sum(dim=0).to(device="cpu", dtype=torch.float64).numpy()
+            batch_np = target_q_z.detach().to(device="cpu", dtype=torch.float32).numpy()
         except (RuntimeError, ValueError) as error:
-            logger.warning(f"Failed to accumulate categorical target stats: {error}")
+            logger.warning(f"Failed to accumulate IQN target quantile stats: {error}")
             return
 
-        if not np.isfinite(batch_mass).all():
+        if not np.isfinite(batch_np).all():
             logger.warning(
-                "Non-finite values encountered while accumulating categorical target stats; skipping update."
+                "Non-finite values encountered while accumulating IQN target quantile stats; skipping batch."
             )
             return
 
-        self._categorical_target_accumulator["mass"] += batch_mass
-        self._categorical_target_accumulator["samples"] += target_distribution.shape[0]
+        accumulator = self._quantile_target_accumulator
+        accumulator["values"].append(batch_np)
+        accumulator["samples"] += int(batch_np.shape[0])
 
-    def _log_categorical_target_stats(self) -> None:
-        """Logs histogram and percentiles for accumulated categorical target distributions."""
-        accumulator = self._categorical_target_accumulator
+    def _log_quantile_target_stats(self) -> None:
+        """Emit ``Train/Quantile/*`` summaries from accumulated IQN target batches."""
+        accumulator = self._quantile_target_accumulator
 
         total_samples = accumulator["samples"]
-        if total_samples == 0:
+        batches = accumulator["values"]
+        if total_samples == 0 or not batches:
             return
 
-        mass = accumulator["mass"]
-        total_mass = mass.sum()
-        if not np.isfinite(total_mass) or total_mass <= 0:
-            logger.warning(
-                "Invalid total mass encountered while logging categorical target stats; resetting accumulator."
-            )
-            accumulator["mass"].fill(0.0)
+        try:
+            stacked = np.concatenate(batches, axis=0)  # [N, K']
+        except ValueError as exc:  # pragma: no cover - defensive
+            logger.warning("Failed to stack IQN target quantile batches: %s", exc)
+            accumulator["values"] = []
             accumulator["samples"] = 0
             return
 
-        probs = mass / total_mass
-        if not np.isfinite(probs).all():
-            logger.warning("Non-finite probabilities encountered in categorical target stats; resetting accumulator.")
-            accumulator["mass"].fill(0.0)
+        flat = stacked.reshape(-1)
+        if not np.isfinite(flat).all() or flat.size == 0:
+            logger.warning("Non-finite or empty IQN target quantile distribution; resetting accumulator.")
+            accumulator["values"] = []
             accumulator["samples"] = 0
             return
 
-        cdf = np.cumsum(probs)
-        percentile_strings = []
-        for percentile in self.categorical_logging_percentiles:
-            target = percentile / 100.0
-            idx = int(np.searchsorted(cdf, target, side="left"))
-            idx = min(max(idx, 0), self.num_atoms - 1)
-            percentile_strings.append(f"{percentile:.1f}%={self.support_cpu[idx]:.4f}")
-
-        mean_value = float(np.dot(probs, self.support_cpu))
-        edge_min = float(probs[0])
-        edge_max = float(probs[-1])
+        mean_value = float(flat.mean())
+        std_value = float(flat.std(ddof=0))
+        min_value = float(flat.min())
+        max_value = float(flat.max())
 
         percentile_values: dict[float, float] = {}
-        for percentile in self.categorical_logging_percentiles:
-            target = percentile / 100.0
-            idx = int(np.searchsorted(cdf, target, side="left"))
-            idx = min(max(idx, 0), self.num_atoms - 1)
-            percentile_values[float(percentile)] = float(self.support_cpu[idx])
+        percentile_strings: list[str] = []
+        for percentile in self.quantile_logging_percentiles:
+            value = float(np.percentile(flat, percentile))
+            percentile_values[float(percentile)] = value
+            percentile_strings.append(f"{percentile:.1f}%={value:.4f}")
 
         logger.info(
-            "Categorical target stats at learn step %s (accumulated over %s samples): mean=%.4f, edge_mass=(min=%.4f, max=%.4f), percentiles=[%s]",
+            "IQN target quantile stats at learn step %s (accumulated over %s samples, %s atoms): "
+            "mean=%.4f, std=%.4f, range=[%.4f, %.4f], percentiles=[%s]",
             self.total_steps,
             total_samples,
+            stacked.shape[1],
             mean_value,
-            edge_min,
-            edge_max,
+            std_value,
+            min_value,
+            max_value,
             ", ".join(percentile_strings),
-        )
-        logger.info(
-            "Categorical target histogram (avg prob per atom, sum=1.0): %s",
-            np.array2string(probs, precision=4, suppress_small=True),
         )
 
         if self.tb_writer is not None:
             try:
                 step = int(self.total_steps)
-                self.tb_writer.add_scalar("Train/CategoricalTarget/Mean", mean_value, step)
-                self.tb_writer.add_scalar("Train/CategoricalTarget/Edge_Mass_Min", edge_min, step)
-                self.tb_writer.add_scalar("Train/CategoricalTarget/Edge_Mass_Max", edge_max, step)
-                self.tb_writer.add_scalar("Train/CategoricalTarget/Samples", float(total_samples), step)
-                for percentile, support_value in percentile_values.items():
-                    tag = f"Train/CategoricalTarget/P{percentile:g}"
-                    self.tb_writer.add_scalar(tag, support_value, step)
+                self.tb_writer.add_scalar("Train/Quantile/Mean", mean_value, step)
+                self.tb_writer.add_scalar("Train/Quantile/Std", std_value, step)
+                self.tb_writer.add_scalar("Train/Quantile/Min", min_value, step)
+                self.tb_writer.add_scalar("Train/Quantile/Max", max_value, step)
+                self.tb_writer.add_scalar("Train/Quantile/Samples", float(total_samples), step)
+                for percentile, value in percentile_values.items():
+                    tag = f"Train/Quantile/P{percentile:g}"
+                    self.tb_writer.add_scalar(tag, value, step)
                 self.tb_writer.add_histogram(
-                    "Train/CategoricalTarget/Distribution",
-                    probs.astype(np.float32),
+                    "Train/Quantile/Distribution",
+                    flat.astype(np.float32),
                     step,
                 )
             except (OSError, RuntimeError, ValueError) as exc:  # pragma: no cover - defensive
-                logger.debug("Failed to mirror categorical target stats to TensorBoard: %s", exc)
+                logger.debug("Failed to mirror IQN target quantile stats to TensorBoard: %s", exc)
 
-        accumulator["mass"].fill(0.0)
+        accumulator["values"] = []
         accumulator["samples"] = 0
 
     def _log_n_step_reward_window_stats(self) -> None:
@@ -287,3 +287,52 @@ class AgentDiagnosticsMixin:
                 self.tb_writer.add_scalar("Train/Noisy/ModuleCount", float(len(all_means)), step)
             except (OSError, RuntimeError, ValueError) as exc:  # pragma: no cover - defensive
                 logger.debug("Failed to mirror aggregate NoisyLinear sigma to TB: %s", exc)
+
+    def _log_spectral_norm_stats(self) -> None:
+        """Mirror per-layer spectral-norm operator-norm estimates to TensorBoard.
+
+        ``torch.nn.utils.parametrizations.spectral_norm`` keeps the running
+        right-singular-vector estimate ``_v`` on the parametrization module;
+        the operator norm of the un-normalized weight is then ``u^T W v``
+        (or, simply, the largest singular value of ``weight_mu`` evaluated
+        with the latest power-iteration estimate). We surface the *bound*
+        being enforced — ``sigma_max(weight_mu_normalized)`` should hover
+        near ``1`` when the constraint is binding, so a single per-layer
+        ``Train/SpectralNorm/<layer>/SigmaMax`` tag is enough to notice
+        the rare "constraint never binds" pathology that signals a bug
+        in the wrapping itself.
+        """
+        if self.tb_writer is None or self.network is None:
+            return
+        net = getattr(self.network, "_orig_mod", self.network)
+        if not getattr(net, "spectral_norm_enabled", False):
+            return
+
+        step = int(self.total_steps)
+        any_logged = False
+        for name, module in net.named_modules():
+            parametrizations = getattr(module, "parametrizations", None)
+            if parametrizations is None:
+                continue
+            if "weight_mu" not in parametrizations:
+                continue
+            try:
+                weight_mu = module.weight_mu  # parametrized -> normalized weight
+                if weight_mu.ndim < 2:
+                    continue
+                w2d = weight_mu.detach().reshape(weight_mu.shape[0], -1).float()
+                sigma_max = float(torch.linalg.matrix_norm(w2d, ord=2).item())
+            except (RuntimeError, ValueError, AttributeError) as exc:  # pragma: no cover - defensive
+                logger.debug("Failed to read spectral-norm sigma for %s: %s", name, exc)
+                continue
+            tag = name.replace(".", "/") if name else "root"
+            try:
+                self.tb_writer.add_scalar(f"Train/SpectralNorm/{tag}/SigmaMax", sigma_max, step)
+                any_logged = True
+            except (OSError, RuntimeError, ValueError) as exc:  # pragma: no cover - defensive
+                logger.debug("Failed to mirror spectral-norm sigma for %s: %s", name, exc)
+        if any_logged:
+            try:
+                self.tb_writer.add_scalar("Train/SpectralNorm/Enabled", 1.0, step)
+            except (OSError, RuntimeError, ValueError) as exc:  # pragma: no cover - defensive
+                logger.debug("Failed to emit Train/SpectralNorm/Enabled: %s", exc)

@@ -48,6 +48,12 @@ class TrainerConfig:
     reward_clip: float | None = None
     per_buffer_audit_interval: int | None = None
     invalid_action_window: int = 20
+    # Top-K best-validation ring. 0 (default) keeps only the threshold-gated
+    # ``best_*`` save; set >0 to also pin the K highest-scoring validation
+    # checkpoints on disk (via separate ``checkpoint_trainer_topk_*`` files)
+    # without honouring ``min_validation_threshold``. Survives restarts because
+    # the ring is reconstructed from filenames in ``model_dir`` on each save.
+    top_k_best_checkpoints: int = 0
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> TrainerConfig:

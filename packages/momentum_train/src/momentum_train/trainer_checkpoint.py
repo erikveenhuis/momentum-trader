@@ -19,6 +19,12 @@ from momentum_core.logging import get_logger
 logger = get_logger(__name__)
 
 
+# Filename schema for the top-K best-validation ring. Anchored regex so files
+# that don't match the canonical pattern (third-party copies, manual renames)
+# are left alone rather than being parsed with a fragile suffix split.
+_TOPK_FILENAME_RE = re.compile(r"^checkpoint_trainer_topk_\d{8}_ep(\d+)_score_(-?\d+\.\d+)\.pt$")
+
+
 class CheckpointMixin:
     """Checkpoint save/rotate/finalize methods split from the monolithic trainer."""
 
@@ -168,8 +174,170 @@ class CheckpointMixin:
             return
         try:
             writer.flush()
-        except (OSError, RuntimeError, ValueError, AttributeError):  # pragma: no cover - defensive
+        except OSError, RuntimeError, ValueError, AttributeError:  # pragma: no cover - defensive
             logger.debug("Failed to flush TensorBoard writer", exc_info=True)
+
+    def _scan_topk_ring(self) -> list[tuple[float, int, Path]]:
+        """Return the on-disk top-K ring as a list of ``(score, episode, path)``.
+
+        Reconstructed from filenames each call so the ring round-trips across
+        ``--resume`` without any extra serialised state. Files that don't match
+        the canonical ``checkpoint_trainer_topk_<DATE>_ep<N>_score_<X>.pt``
+        schema are silently skipped (left in place — never deleted by the ring
+        logic).
+        """
+        model_dir = Path(self.run_config.get("model_dir", "models"))
+        try:
+            candidates = list(model_dir.glob("checkpoint_trainer_topk_*_ep*_score_*.pt"))
+        except OSError as exc:
+            logger.warning("Top-K ring scan: failed to list %s: %s", model_dir, exc)
+            return []
+        entries: list[tuple[float, int, Path]] = []
+        for path in candidates:
+            m = _TOPK_FILENAME_RE.match(path.name)
+            if not m:
+                continue
+            try:
+                ep = int(m.group(1))
+                score = float(m.group(2))
+            except ValueError:
+                continue
+            entries.append((score, ep, path))
+        return entries
+
+    def _build_topk_checkpoint_dict(self, episode: int, total_steps: int, validation_score: float) -> dict:
+        """Build the trainer-state dict written into a top-K checkpoint ``.pt``.
+
+        Mirrors the ``best_*`` save layout — no buffer side-car (resume from
+        ``latest_*``) — so a top-K file is drop-in usable with the same
+        loaders as ``best_*``. Kept in a tiny helper rather than reusing
+        ``_save_checkpoint``'s inline construction to avoid an accidental
+        side-car write or rotation pass on the top-K stream.
+        """
+        cp: dict = {
+            "episode": episode,
+            "total_train_steps": total_steps,
+            "best_validation_metric": self.best_validation_metric,
+            "early_stopping_counter": self.early_stopping_counter,
+            "buffer_state": None,
+            "buffer_sidecar_relpath": None,
+            "agent_config": self.agent.config,
+            "agent_total_steps": self.agent.total_steps,
+            "agent_env_steps": getattr(self.agent, "env_steps", None),
+            "total_steps": self.agent.total_steps,
+            "network_state_dict": self.agent.network.state_dict() if self.agent.network is not None else None,
+            "target_network_state_dict": (
+                self.agent.target_network.state_dict() if self.agent.target_network is not None else None
+            ),
+            "optimizer_state_dict": (self.agent.optimizer.state_dict() if self.agent.optimizer else None),
+            "scaler_state_dict": None,
+            "scheduler_state_dict": (
+                self.agent.scheduler.state_dict() if self.agent.scheduler and self.agent.lr_scheduler_enabled else None
+            ),
+            "validation_score": float(validation_score),
+        }
+        if self.writer:
+            cp["tensorboard_log_dir"] = getattr(self.writer, "log_dir", None)
+        return cp
+
+    def _maybe_save_topk_checkpoint(self, *, episode: int, total_steps: int, validation_score: float) -> Path | None:
+        """Pin the new validation score into the top-K best ring if it qualifies.
+
+        This runs alongside (not instead of) the threshold-gated ``best_*`` save:
+        the ring deliberately ignores ``min_validation_threshold`` so that a
+        small but real improvement (e.g. +0.0008 over the prior best, the
+        case that motivated this feature) still lands on disk. Eligibility
+        otherwise mirrors ``best_*``: no save before the
+        ``min_episodes_before_early_stopping`` gate has been crossed.
+
+        The ring is reconstructed from filenames on every call (see
+        :meth:`_scan_topk_ring`) so it survives ``--resume`` without any
+        extra serialised state. When the ring is full the lowest-scoring
+        existing entry is evicted only after the new ``.pt`` is safely on
+        disk; if the new save fails we abort before evicting so the ring
+        never shrinks below the prior cardinality.
+
+        Returns the saved path, or ``None`` when the feature is disabled,
+        the score isn't finite, the eligibility gate hasn't been crossed,
+        the score doesn't crack the ring, or the save itself failed.
+        """
+        k = int(getattr(self, "top_k_best_checkpoints", 0) or 0)
+        if k <= 0:
+            return None
+        if not np.isfinite(validation_score):
+            return None
+        # Eligibility gate: defer until the early-stop minimum-episode
+        # threshold has been crossed, mirroring the threshold-gated
+        # ``best_*`` save in ``_handle_validation_and_checkpointing``.
+        min_eps = int(getattr(self, "min_episodes_before_early_stopping", 0) or 0)
+        if min_eps > 0 and episode < min_eps:
+            return None
+
+        # Networks/optimizer must be initialised; otherwise the .pt would be
+        # malformed. Skip silently — the regular save path already logs.
+        if self.agent.optimizer is None or self.agent.network is None or self.agent.target_network is None:
+            return None
+
+        entries = sorted(self._scan_topk_ring(), key=lambda x: (x[0], x[1]))
+        if len(entries) >= k:
+            min_score = entries[0][0]
+            # Strict > ensures we don't churn the ring on a tie, which
+            # would just rotate filenames without improving anything.
+            if validation_score <= min_score:
+                logger.debug(
+                    "Top-K ring: skipping save (score %.4f does not beat ring min %.4f at full size %d/%d).",
+                    validation_score,
+                    min_score,
+                    len(entries),
+                    k,
+                )
+                return None
+
+        current_date = datetime.now().strftime("%Y%m%d")
+        topk_path = (
+            Path(self.run_config.get("model_dir", "models"))
+            / f"checkpoint_trainer_topk_{current_date}_ep{episode}_score_{validation_score:.4f}.pt"
+        )
+        checkpoint = self._build_topk_checkpoint_dict(
+            episode=episode,
+            total_steps=total_steps,
+            validation_score=validation_score,
+        )
+        try:
+            torch.save(checkpoint, topk_path)
+            logger.info(
+                "Top-K checkpoint saved to %s (score=%.4f, ring %d/%d before save).",
+                topk_path,
+                validation_score,
+                len(entries),
+                k,
+            )
+        except Exception:  # noqa: BLE001 — never let ring save break training
+            logger.error("Error saving top-K checkpoint to %s", topk_path, exc_info=True)
+            return None
+
+        # Re-scan after the save so eviction operates on the actual on-disk
+        # state (the new file we just wrote is now part of it). Anything
+        # beyond the K best gets pruned, lowest-score-first.
+        new_entries = sorted(self._scan_topk_ring(), key=lambda x: (x[0], x[1]))
+        overflow = len(new_entries) - k
+        if overflow > 0:
+            for evict_score, evict_ep, evict_path in new_entries[:overflow]:
+                if evict_path.resolve() == topk_path.resolve():
+                    # Defensive: never evict the file we just saved. Can only
+                    # happen if external state changed mid-save (unlikely).
+                    continue
+                try:
+                    evict_path.unlink()
+                    logger.info(
+                        "Top-K ring evicted %s (score=%.4f, ep=%d).",
+                        evict_path.name,
+                        evict_score,
+                        evict_ep,
+                    )
+                except OSError as exc:
+                    logger.warning("Top-K ring: failed to evict %s: %s", evict_path, exc)
+        return topk_path
 
     def _save_checkpoint(
         self,
@@ -334,6 +502,22 @@ class CheckpointMixin:
                     logger.info("  No improvement over previous best model")
             except Exception as e:
                 logger.error(f"Error saving best checkpoint: {e}", exc_info=True)  # Kept traceback
+
+        # Top-K best-validation ring (independent of ``is_best`` / threshold).
+        # We try to pin every finite validation score into the ring, even when
+        # the threshold-gated ``best_*`` save above declined. This is the
+        # safety net for the "improvement smaller than min_validation_threshold
+        # but still a true peak" case; the ring caps total disk use at
+        # ``top_k_best_checkpoints`` (each file ~50 MB, no buffer side-car).
+        if validation_score is not None:
+            try:
+                self._maybe_save_topk_checkpoint(
+                    episode=episode,
+                    total_steps=total_steps,
+                    validation_score=float(validation_score),
+                )
+            except Exception:  # noqa: BLE001 — ring save must never break training
+                logger.warning("Top-K ring save raised; continuing.", exc_info=True)
 
         # Keep TB event file in sync with the checkpoint we just flushed to
         # disk. Without this, a hard freeze right after a checkpoint save can
