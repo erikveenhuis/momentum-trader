@@ -121,6 +121,8 @@ class StubAgent:
         self.scheduler = None
         self.lr_scheduler_enabled = False
         self.buffer = StubBuffer()
+        self.reset_iqn_heads_called = False
+        self.reset_iqn_heads_sync_target = None
 
     def load_state(self, checkpoint):
         self.total_steps = checkpoint.get("agent_total_steps", 0)
@@ -131,6 +133,11 @@ class StubAgent:
 
     def set_training_mode(self, training=True):
         self.training_mode = training
+
+    def reset_iqn_heads(self, *, sync_target=True):
+        self.reset_iqn_heads_called = True
+        self.reset_iqn_heads_sync_target = sync_target
+        return 4
 
 
 class StubTrainer:
@@ -452,6 +459,8 @@ def _apply_common_resume_monkeypatches(monkeypatch, tmp_path, *, find_latest, lo
     monkeypatch.setattr(run_training_module, "TradingEnv", StubTradingEnv)
     monkeypatch.setattr(run_training_module, "TradingEnvConfig", dummy_trading_env_config)
     monkeypatch.setattr(run_training_module, "SummaryWriter", dummy_summary_writer)
+    monkeypatch.setattr(run_training_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(run_training_module.torch.backends.mps, "is_available", lambda: False)
 
 
 @pytest.mark.unit
@@ -638,3 +647,50 @@ def test_resume_raises_when_no_buffer_state_in_checkpoint(monkeypatch, tmp_path)
             resume_training_flag=True,
             reset_lr_on_resume=False,
         )
+
+
+@pytest.mark.unit
+def test_resume_reset_value_head_on_resume_calls_reset_and_strips_optimizer(monkeypatch, tmp_path):
+    """``--reset-value-head-on-resume`` re-inits IQN heads and drops stale Adam state."""
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    checkpoint_path.write_text("dummy")
+    config = _base_config(str(tmp_path))
+
+    def fake_load_checkpoint(path):
+        assert str(path) == str(checkpoint_path)
+        return {
+            "episode": 5,
+            "total_train_steps": 1234,
+            "best_validation_metric": 0.5,
+            "early_stopping_counter": 2,
+            "agent_config": config["agent"],
+            "agent_total_steps": 400,
+            "network_state_dict": {},
+            "target_network_state_dict": {},
+            "optimizer_state_dict": {"stale": True},
+            "scheduler_state_dict": {"stale": True},
+            "buffer_state": {"legacy-stub": True},
+        }
+
+    _apply_common_resume_monkeypatches(
+        monkeypatch,
+        tmp_path,
+        find_latest=lambda model_dir, prefix: str(checkpoint_path),
+        load_checkpoint=fake_load_checkpoint,
+    )
+
+    data_manager = make_stub_data_manager(tmp_path)
+
+    agent, trainer = run_training_module.run_training(
+        config,
+        data_manager,
+        resume_training_flag=True,
+        reset_lr_on_resume=False,
+        reset_value_head_on_resume=True,
+    )
+
+    assert isinstance(agent, StubAgent)
+    assert agent.reset_iqn_heads_called is True
+    assert agent.reset_iqn_heads_sync_target is True
+    assert agent.total_steps == 400
+    assert trainer.captured_start_total_steps == 1234

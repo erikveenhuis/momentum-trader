@@ -1153,6 +1153,53 @@ def test_reset_noisy_sigma_no_writer_is_noop_for_logging(agent):
 
 
 # ---------------------------------------------------------------------------
+# reset_iqn_heads helper (recovery: fresh critic scale, keep encoder)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def inference_agent(default_config):
+    """CPU agent without torch.compile (for head-reset unit tests)."""
+    agent_instance = RainbowDQNAgent(
+        config=default_config,
+        device="cpu",
+        inference_only=True,
+    )
+    agent_instance.set_training_mode(True)
+    return agent_instance
+
+
+@pytest.mark.unit
+def test_reset_iqn_heads_preserves_encoder_and_syncs_target(inference_agent):
+    agent = inference_agent
+    enc_before = agent.network.feature_embedding.weight.detach().clone()
+    online_layers = _collect_noisy_layers(agent.network)
+    head_mu_before = online_layers[0].weight_mu.detach().clone()
+
+    count = agent.reset_iqn_heads(sync_target=True)
+    assert count > 0
+    assert torch.equal(agent.network.feature_embedding.weight, enc_before)
+    assert not torch.equal(online_layers[0].weight_mu, head_mu_before)
+
+    target_layers = _collect_noisy_layers(agent.target_network)
+    assert torch.allclose(online_layers[0].weight_mu, target_layers[0].weight_mu)
+
+
+@pytest.mark.unit
+def test_reset_iqn_heads_logs_tb_scalar_when_writer_attached(inference_agent):
+    agent = inference_agent
+    agent.tb_writer = _CapturingWriter()
+    agent.total_steps = 99
+    count = agent.reset_iqn_heads()
+    tags = {t for t, _v, _s in agent.tb_writer.scalars}
+    assert "Agent/IqnHeadReset" in tags
+    value = next(v for t, v, _s in agent.tb_writer.scalars if t == "Agent/IqnHeadReset")
+    assert value == float(count)
+    step = next(s for t, _v, s in agent.tb_writer.scalars if t == "Agent/IqnHeadReset")
+    assert step == 99
+
+
+# ---------------------------------------------------------------------------
 # torch.compile state_dict prefix fallback (bidirectional)
 # ---------------------------------------------------------------------------
 

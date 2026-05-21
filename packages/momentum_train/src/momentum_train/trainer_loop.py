@@ -443,12 +443,39 @@ class LoopMixin:
             if len(self.agent.buffer) >= self.agent.batch_size and total_train_steps > self.warmup_steps:
                 while steps_since_last_learn >= self.update_freq:
                     try:
+                        losses_this_micro: list[float] = []
                         for _ in range(self.gradient_updates_per_step):
                             loss = self.agent.learn()
                             if loss is None:
                                 break
-                            if self.writer:
-                                self.writer.add_scalar("Train/Loss", float(loss), total_train_steps)
+                            losses_this_micro.append(float(loss))
+                        if losses_this_micro and self.writer:
+                            loss_value = float(np.mean(losses_this_micro))
+                            self.writer.add_scalar("Train/Loss", loss_value, total_train_steps)
+                            self.writer.add_scalar(
+                                "Train/Gradient Updates Per Step",
+                                len(losses_this_micro),
+                                total_train_steps,
+                            )
+                            td_stats = getattr(self.agent, "last_td_error_stats", None)
+                            if td_stats:
+                                self.writer.add_scalar(
+                                    "Train/TD_Error_Mean",
+                                    td_stats.get("mean", float("nan")),
+                                    total_train_steps,
+                                )
+                                self.writer.add_scalar(
+                                    "Train/TD_Error_Std",
+                                    td_stats.get("std", float("nan")),
+                                    total_train_steps,
+                                )
+                            last_entropy = getattr(self.agent, "last_entropy", None)
+                            if last_entropy is not None:
+                                self.writer.add_scalar(
+                                    "Train/Action_Entropy",
+                                    last_entropy,
+                                    total_train_steps,
+                                )
                     except Exception:
                         logger.error("Exception during learning update", exc_info=True)
                         self._abort_training = True
@@ -588,7 +615,7 @@ class LoopMixin:
                             # Tier 4b: per-episode reward outlier guard (vectorized loop).
                             try:
                                 vec_outlier_stats = per_env_trackers[i].get_reward_outlier_stats(self.reward_clip_value)
-                            except (ValueError, KeyError, AttributeError, TypeError):  # pragma: no cover - defensive
+                            except ValueError, KeyError, AttributeError, TypeError:  # pragma: no cover - defensive
                                 logger.debug(
                                     "Failed to compute Tier 4b reward outlier stats for env %d", i, exc_info=True
                                 )
@@ -613,7 +640,7 @@ class LoopMixin:
                             # Tier 4c: per-action reward mean/std (vectorized).
                             try:
                                 vec_by_action = per_env_trackers[i].get_reward_by_action_stats()
-                            except (ValueError, KeyError, AttributeError, TypeError):  # pragma: no cover - defensive
+                            except ValueError, KeyError, AttributeError, TypeError:  # pragma: no cover - defensive
                                 logger.debug(
                                     "Failed to compute Tier 4c reward-by-action stats for env %d",
                                     i,
@@ -669,7 +696,7 @@ class LoopMixin:
                             1.0,
                             completed_episodes,
                         )
-                    except (OSError, RuntimeError, ValueError):  # pragma: no cover - defensive
+                    except OSError, RuntimeError, ValueError:  # pragma: no cover - defensive
                         logger.debug("Failed to emit Train/Diagnostics/ValidationSkippedDueToVectorJump", exc_info=True)
 
                 if crossed_validation_boundary:

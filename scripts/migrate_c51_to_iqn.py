@@ -18,19 +18,29 @@ scaler / validation-metadata that no longer apply.
 Usage
 -----
 
-::
+Option A (warm encoder + reuse C51-collected buffer with priorities reset)::
 
     python scripts/migrate_c51_to_iqn.py \\
         --source-checkpoint models/checkpoint_trainer_best_20260426_ep6803_score_0.4479.pt \\
         --buffer-source     models/checkpoint_trainer_latest_20260427_ep8403_reward0.4479.buffer \\
         --config            config/training_config.yaml \\
-        --output-stem       models/checkpoint_trainer_latest_20260427_ep6803_iqn_warmstart \\
+        --output-stem       models/checkpoint_trainer_latest_20260427_ep6803_iqn_warmstart_a \\
+        [--dry-run]
+
+Option B (warm encoder + *fresh* empty buffer)::
+
+    python scripts/migrate_c51_to_iqn.py \\
+        --source-checkpoint models/_archive_pre_iqn/checkpoint_trainer_best_..._0.4479.pt \\
+        --empty-buffer \\
+        --config            config/training_config.yaml \\
+        --output-stem       models/checkpoint_trainer_latest_20260427_ep6803_iqn_warmstart_b \\
         [--dry-run]
 
 The script never modifies the source files. It writes only
-``<output-stem>.pt`` (and, when a buffer source is supplied,
-``<output-stem>.buffer/``). With ``--dry-run`` it prints the summary and
-writes nothing.
+``<output-stem>.pt`` and (when ``--buffer-source`` or ``--empty-buffer`` is
+supplied) ``<output-stem>.buffer/``. With ``--dry-run`` it prints the
+summary and writes nothing. ``--buffer-source`` and ``--empty-buffer`` are
+mutually exclusive.
 
 Tensors transferred (after stripping any ``_orig_mod.`` prefix that
 ``torch.compile`` adds):
@@ -250,6 +260,67 @@ def _copy_buffer_sidecar(src: Path, dst: Path) -> None:
     shutil.copytree(src, dst)
 
 
+def _write_empty_buffer_sidecar(
+    buffer_dir: Path,
+    *,
+    capacity: int,
+    alpha: float,
+    beta_start: float,
+    beta_frames: int,
+    epsilon: float = 1e-5,
+    max_priority: float = 1.0,
+) -> int:
+    """Write a *fresh*, empty PER side-car at ``buffer_dir`` shaped exactly
+    like the one ``PrioritizedReplayBuffer.save_to_path`` would produce for
+    a brand-new buffer (size=0).
+
+    This is the Option B counterpart to ``_copy_buffer_sidecar`` /
+    ``_reset_buffer_priorities_in_place``: when a warm-start should *not*
+    inherit the source-run's replay buffer (because the off-policy
+    distribution would poison the new heads), we still need a side-car file
+    on disk because the trainer's ``--resume`` path refuses to start without
+    one. An empty side-car satisfies the contract: ``load_from_path``
+    materialises a zero-sized deque, then warmup re-fills the buffer from
+    fresh on-policy rollouts.
+
+    Returns the configured ``capacity`` so the caller can log the value
+    that ended up in the side-car.
+    """
+    if buffer_dir.exists():
+        shutil.rmtree(buffer_dir)
+    buffer_dir.mkdir(parents=True, exist_ok=False)
+
+    # SumTree state for an empty buffer: tree is all zeros, data_indices
+    # is a zero array of length ``capacity``, write head at 0, size 0.
+    tree = np.zeros(2 * capacity - 1, dtype=np.float64)
+    data_indices = np.zeros(capacity, dtype=np.int64)
+    np.savez(
+        buffer_dir / "sumtree.npz",
+        tree=tree,
+        data_indices=data_indices,
+        write=np.int64(0),
+        size=np.int64(0),
+    )
+
+    meta = {
+        "format_version": 1,
+        "size": 0,
+        "buffer_write_idx": 0,
+        "max_priority": float(max_priority),
+        "alpha": float(alpha),
+        "beta": float(beta_start),
+        "beta_start": float(beta_start),
+        "beta_frames": int(beta_frames),
+        "epsilon": float(epsilon),
+        "capacity": int(capacity),
+    }
+    (buffer_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+    # Completion marker MUST be written last to mirror save_to_path's
+    # atomicity contract; trainer's resume path keys off this file.
+    (buffer_dir / "_COMPLETE").write_bytes(b"")
+    return capacity
+
+
 # ---------------------------------------------------------------------------
 # Main migration entrypoint.
 # ---------------------------------------------------------------------------
@@ -294,8 +365,29 @@ def migrate_checkpoint(
     yaml_config_path: Path,
     buffer_source: Path | None,
     dry_run: bool,
+    empty_buffer: bool = False,
 ) -> dict[str, Any]:
-    """Run the migration. Returns a structured summary suitable for tests."""
+    """Run the migration. Returns a structured summary suitable for tests.
+
+    Buffer-side options (mutually exclusive):
+
+    * ``buffer_source`` — copy an existing PER side-car bit-for-bit, then
+      reset all populated leaves to ``max_priority`` so PER samples uniformly
+      until IQN TD-errors re-prioritise organically (Option A).
+    * ``empty_buffer`` — write a fresh empty side-car (size=0) so the
+      trainer's ``--resume`` path can attach it but warmup will refill the
+      buffer from scratch with on-policy IQN rollouts (Option B).
+    * Neither — produces a warmstart .pt with ``buffer_sidecar_relpath=None``;
+      the trainer's resume path will refuse to load it. Only useful for
+      tests / further downstream inspection, not for live resume.
+    """
+    if buffer_source is not None and empty_buffer:
+        raise ValueError(
+            "buffer_source and empty_buffer are mutually exclusive: pass at "
+            "most one. Use buffer_source to inherit + uniformly re-prioritise "
+            "an existing PER buffer (Option A), or empty_buffer=True to write "
+            "a fresh empty side-car so warmup re-fills (Option B)."
+        )
     logger.info("Loading source checkpoint from %s", source_path)
     source_blob = torch.load(source_path, map_location="cpu", weights_only=False)
     if not isinstance(source_blob, dict):
@@ -371,12 +463,42 @@ def migrate_checkpoint(
             raise FileNotFoundError(f"Buffer source {buffer_source} does not exist or is not a directory.")
         output_buffer = output_stem.with_suffix(".buffer")
         summary["output_buffer"] = str(output_buffer)
+        summary["buffer_mode"] = "copied"
         if not dry_run:
             _copy_buffer_sidecar(buffer_source, output_buffer)
             count, priority = _reset_buffer_priorities_in_place(output_buffer)
             summary["buffer_priority_reset_count"] = int(count)
             summary["buffer_priority_value"] = float(priority)
             new_checkpoint["buffer_sidecar_relpath"] = output_buffer.name
+    elif empty_buffer:
+        # Pull the buffer-shape parameters straight out of the YAML the
+        # fresh agent was built from, so the side-car's capacity/alpha/beta
+        # tuple matches what ``RainbowDQNAgent.__init__`` will construct on
+        # the first --resume after migration.
+        agent_yaml = yaml_config.get("agent") or {}
+        capacity = int(agent_yaml.get("replay_buffer_size", 0) or 0)
+        if capacity <= 0:
+            raise KeyError(
+                "agent.replay_buffer_size must be a positive int in the YAML config to write an empty buffer side-car."
+            )
+        alpha = float(agent_yaml.get("alpha", 0.6))
+        beta_start = float(agent_yaml.get("beta_start", 0.4))
+        beta_frames = int(agent_yaml.get("beta_frames", 100_000))
+        output_buffer = output_stem.with_suffix(".buffer")
+        summary["output_buffer"] = str(output_buffer)
+        summary["buffer_mode"] = "empty"
+        summary["buffer_capacity"] = capacity
+        if not dry_run:
+            _write_empty_buffer_sidecar(
+                output_buffer,
+                capacity=capacity,
+                alpha=alpha,
+                beta_start=beta_start,
+                beta_frames=beta_frames,
+            )
+            new_checkpoint["buffer_sidecar_relpath"] = output_buffer.name
+    else:
+        summary["buffer_mode"] = "none"
 
     if not dry_run:
         output_pt = output_stem.with_suffix(".pt")
@@ -398,13 +520,16 @@ def _print_summary(summary: dict[str, Any]) -> None:
     print(f"  source val score      : {summary['source_validation_score']}")
     print(f"  output (.pt)          : {summary['output_pt']}")
     print(f"  output (.buffer/)     : {summary['output_buffer']}")
+    print(f"  buffer mode           : {summary.get('buffer_mode', 'none')}")
     print(f"  tensors transferred   : {summary['transferred_tensor_count']}")
     print(f"  tensors left fresh    : {summary['fresh_tensor_count']}")
     print(f"  skipped (forbidden)   : {len(summary['skipped_forbidden_keys'])}")
     print(f"  missing in source     : {len(summary['missing_in_source_keys'])}")
-    if summary["output_buffer"]:
+    if summary.get("buffer_mode") == "copied" and summary["output_buffer"]:
         print(f"  buffer leaves reset   : {summary['buffer_priority_reset_count']}")
         print(f"  buffer priority value : {summary['buffer_priority_value']}")
+    elif summary.get("buffer_mode") == "empty":
+        print(f"  buffer capacity       : {summary.get('buffer_capacity')} (size=0, fresh)")
     print(f"  dry-run               : {summary['dry_run']}")
     print("=" * 72)
 
@@ -419,11 +544,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         required=True,
         help="Path stem (no suffix); .pt and .buffer/ are appended.",
     )
-    p.add_argument(
+    buffer_group = p.add_mutually_exclusive_group()
+    buffer_group.add_argument(
         "--buffer-source",
         type=Path,
         default=None,
-        help="Optional .buffer/ side-car to copy + reset priorities.",
+        help=(
+            "Existing .buffer/ side-car to copy + reset PER priorities to "
+            "max_priority (Option A: warm-start retains C51-collected "
+            "transitions for sampling under the new IQN heads)."
+        ),
+    )
+    buffer_group.add_argument(
+        "--empty-buffer",
+        action="store_true",
+        help=(
+            "Write a fresh empty .buffer/ side-car next to the .pt so the "
+            "trainer's --resume path can attach it but warmup re-fills the "
+            "buffer with on-policy IQN rollouts (Option B: encoder-only "
+            "warm-start, fresh on-policy buffer)."
+        ),
     )
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--verbose", action="store_true")
@@ -443,6 +583,7 @@ def main(argv: list[str] | None = None) -> int:
         yaml_config_path=args.config,
         buffer_source=args.buffer_source,
         dry_run=args.dry_run,
+        empty_buffer=bool(args.empty_buffer),
     )
     _print_summary(summary)
     return 0

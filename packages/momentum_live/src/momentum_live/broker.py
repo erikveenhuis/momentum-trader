@@ -94,12 +94,14 @@ class BrokerAccountManager:
     """High-level operations on Broker sub-accounts.
 
     Wraps :class:`alpaca.broker.client.BrokerClient` so the rest of momentum_live
-    only ever sees the four operations we actually use:
+    only ever sees the Broker operations we actually use:
 
     - :meth:`ensure_subaccount` - get-or-create the sub-account for a pair.
     - :meth:`get_account_cash` - cash balance for a sub-account.
     - :meth:`journal_cash` - JNLC transfer between firm and sub-account.
     - :meth:`reset_subaccount` - cancel orders, close positions, journal back to target.
+    - :meth:`close_subaccount` - reset cash to ``0`` (requires firm id when balance > 0),
+      then ``POST /accounts/{id}/actions/close`` via ``BrokerClient.close_account``.
     """
 
     DEFAULT_RESET_WAIT_TIMEOUT = 30.0
@@ -439,6 +441,22 @@ class BrokerAccountManager:
             "target_balance": target_balance,
             "journal_id": journal_id,
         }
+
+    def close_subaccount(self, account_id: str, *, wait_timeout: float | None = None) -> None:
+        """Liquidate and close an Alpaca Broker sub-account.
+
+        Runs :meth:`reset_subaccount` with ``target_balance=0`` so open orders are
+        canceled, positions closed, and USD journaled back to the firm account when
+        ``ALPACA_BROKER_ACCOUNT_ID`` is set (required if cash must leave the sub-account).
+
+        Then calls ``BrokerClient.close_account``. Alpaca retains underlying records;
+        this does not hard-delete the entity server-side.
+        """
+        timeout = wait_timeout if wait_timeout is not None else self.DEFAULT_RESET_WAIT_TIMEOUT
+        LOGGER.info("Closing Broker sub-account %s (reset to 0 USD then close_account)", account_id)
+        self.reset_subaccount(account_id, 0.0, wait_timeout=timeout, skip_threshold=0.0)
+        self._client.close_account(account_id)
+        LOGGER.info("BrokerClient.close_account completed for %s", account_id)
 
     def _wait_for_positions_empty(self, account_id: str, *, timeout: float, interval: float) -> None:
         deadline = time.monotonic() + max(timeout, interval)

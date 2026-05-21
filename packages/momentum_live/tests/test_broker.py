@@ -75,6 +75,7 @@ class _FakeBrokerClient:
         self.created_accounts: list[str] = []
         self.cancel_orders_calls: list[str] = []
         self.close_positions_calls: list[str] = []
+        self.close_account_calls: list[str] = []
         self.positions_by_account: dict[str, list] = {}
 
     def create_account(self, request):
@@ -110,6 +111,9 @@ class _FakeBrokerClient:
 
     def get_journal_by_id(self, journal_id):
         return _FakeJournal(id=journal_id, status="executed")
+
+    def close_account(self, account_id):
+        self.close_account_calls.append(str(account_id))
 
 
 def _make_manager(
@@ -286,3 +290,18 @@ def test_reset_subaccount_no_journal_when_within_threshold(tmp_path: Path) -> No
 
     manager.reset_subaccount(entry.account_id, target_balance=1000.0, wait_timeout=0.0)
     assert fake.journals == []
+
+
+def test_close_subaccount_resets_and_calls_close_account(tmp_path: Path) -> None:
+    manager, fake, _ = _make_manager(tmp_path, cash=123.45)
+    entry = manager.ensure_subaccount("BTC/USD")
+
+    manager.close_subaccount(entry.account_id, wait_timeout=0.0)
+
+    assert entry.account_id in fake.cancel_orders_calls
+    assert entry.account_id in fake.close_positions_calls
+    assert fake.close_account_calls == [entry.account_id]
+    assert any(
+        j["from"] == entry.account_id and j["to"] == _FIRM_ID and abs(j["amount"] - 123.45) < 1e-6
+        for j in fake.journals
+    )

@@ -1015,6 +1015,57 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
                 logger.debug("Failed to log Agent/NoisySigmaReset: %s", exc)
         return online_count
 
+    def reset_iqn_heads(self, *, sync_target: bool = True) -> int:
+        """Re-initialize IQN critic heads while keeping the shared encoder (and aux head).
+
+        Resets ``tau_embedding``, ``value_stream``, and ``advantage_stream`` on the
+        online network, then either copies those tensors into the target network
+        (default) or re-initializes the target heads independently. Use after
+        resume when absolute Q/TD scales have diverged but encoder weights and
+        replay buffer should be preserved.
+
+        Pair with a fresh optimizer (``--reset-value-head-on-resume`` drops stale
+        Adam moments automatically).
+
+        Args:
+            sync_target: When True, copy freshly reset online head weights into
+                the target net so both critics start aligned.
+
+        Returns:
+            Number of head submodules re-initialized on the online network.
+        """
+        from .model import copy_iqn_head_state_dict, reinitialize_iqn_head_modules
+
+        if self.network is None:
+            logger.warning("reset_iqn_heads: network is None; nothing to reset.")
+            return 0
+
+        layer_count = reinitialize_iqn_head_modules(self.network)
+
+        if self.target_network is not None:
+            if sync_target:
+                copied = copy_iqn_head_state_dict(self.network, self.target_network)
+                logger.info(
+                    "Copied %d IQN-head parameter tensor(s) from online to target after head reset.",
+                    copied,
+                )
+            else:
+                reinitialize_iqn_head_modules(self.target_network)
+
+        logger.info(
+            "Reset IQN heads on online network (%d submodule(s)); encoder and aux_return_head preserved.",
+            layer_count,
+        )
+
+        if self.tb_writer is not None and layer_count > 0:
+            try:
+                step = int(self.total_steps)
+                self.tb_writer.add_scalar("Agent/IqnHeadReset", float(layer_count), step)
+            except (OSError, RuntimeError, ValueError) as exc:  # pragma: no cover - defensive
+                logger.debug("Failed to log Agent/IqnHeadReset: %s", exc)
+
+        return layer_count
+
     def _compute_loss(self, batch, weights):
         """Computes the IQN quantile-Huber loss using PER weights."""
         (

@@ -480,6 +480,118 @@ def test_migrate_dry_run_writes_no_files(tmp_path):
 
 
 @pytest.mark.unit
+def test_migrate_empty_buffer_writes_resumable_sidecar(tmp_path):
+    """Option B: ``empty_buffer=True`` should write a complete, *empty*
+    side-car (size=0, _COMPLETE marker, capacity matching the YAML) and
+    set ``buffer_sidecar_relpath`` on the .pt so the trainer's resume path
+    can attach it without raising."""
+    yaml_path = _minimal_iqn_yaml(tmp_path)
+    src = _make_pre_iqn_checkpoint(_make_synthetic_pre_iqn_state_dict())
+    src_path = tmp_path / "src.pt"
+    torch.save(src, src_path)
+
+    output_stem = tmp_path / "warmstart_b"
+    summary = migration.migrate_checkpoint(
+        source_path=src_path,
+        output_stem=output_stem,
+        yaml_config_path=yaml_path,
+        buffer_source=None,
+        empty_buffer=True,
+        dry_run=False,
+    )
+
+    out_pt = Path(summary["output_pt"])
+    out_buf = Path(summary["output_buffer"])
+    assert out_pt.exists()
+    assert out_buf.exists() and out_buf.is_dir()
+    assert (out_buf / "_COMPLETE").is_file(), "side-car missing the _COMPLETE marker"
+    assert summary["buffer_mode"] == "empty"
+
+    # meta.json must report size=0 and the YAML's capacity.
+    yaml_blob = yaml.safe_load(yaml_path.read_text())
+    expected_capacity = int(yaml_blob["agent"]["replay_buffer_size"])
+    assert summary["buffer_capacity"] == expected_capacity
+    meta = json.loads((out_buf / "meta.json").read_text())
+    assert meta["size"] == 0
+    assert meta["capacity"] == expected_capacity
+    assert meta["alpha"] == pytest.approx(yaml_blob["agent"]["alpha"])
+    assert meta["beta_start"] == pytest.approx(yaml_blob["agent"]["beta_start"])
+    assert meta["max_priority"] == pytest.approx(1.0)
+
+    # SumTree must be all-zero (an empty buffer has no priority mass).
+    npz = np.load(out_buf / "sumtree.npz")
+    assert npz["tree"].shape == (2 * expected_capacity - 1,)
+    assert np.all(npz["tree"] == 0.0)
+    assert int(npz["size"]) == 0
+    assert int(npz["write"]) == 0
+
+    # The migrated .pt must point at the freshly-written side-car so the
+    # trainer's --resume path doesn't refuse with "no replay buffer".
+    blob = torch.load(out_pt, map_location="cpu", weights_only=False)
+    assert blob["buffer_sidecar_relpath"] == out_buf.name
+
+
+@pytest.mark.unit
+def test_migrate_empty_buffer_loads_into_real_buffer(tmp_path):
+    """The empty side-car the migrator writes must be load-compatible with
+    the live ``PrioritizedReplayBuffer.load_from_path`` so the trainer
+    resume path can attach it without raising."""
+    yaml_path = _minimal_iqn_yaml(tmp_path)
+    src = _make_pre_iqn_checkpoint(_make_synthetic_pre_iqn_state_dict())
+    src_path = tmp_path / "src.pt"
+    torch.save(src, src_path)
+
+    output_stem = tmp_path / "warmstart_b"
+    summary = migration.migrate_checkpoint(
+        source_path=src_path,
+        output_stem=output_stem,
+        yaml_config_path=yaml_path,
+        buffer_source=None,
+        empty_buffer=True,
+        dry_run=False,
+    )
+
+    from momentum_agent.buffer import PrioritizedReplayBuffer
+
+    yaml_blob = yaml.safe_load(yaml_path.read_text())
+    capacity = int(yaml_blob["agent"]["replay_buffer_size"])
+    buf = PrioritizedReplayBuffer(
+        capacity=capacity,
+        alpha=float(yaml_blob["agent"]["alpha"]),
+        beta_start=float(yaml_blob["agent"]["beta_start"]),
+        beta_frames=int(yaml_blob["agent"]["beta_frames"]),
+    )
+    buf.load_from_path(Path(summary["output_buffer"]))
+    assert len(buf) == 0
+    assert buf.tree.size == 0
+
+
+@pytest.mark.unit
+def test_migrate_rejects_buffer_source_and_empty_buffer_together(tmp_path):
+    """``buffer_source`` and ``empty_buffer=True`` are mutually exclusive."""
+    yaml_path = _minimal_iqn_yaml(tmp_path)
+    src = _make_pre_iqn_checkpoint(_make_synthetic_pre_iqn_state_dict())
+    src_path = tmp_path / "src.pt"
+    torch.save(src, src_path)
+
+    capacity = 16
+    size = 4
+    buffer_src = tmp_path / "src.buffer"
+    _write_synthetic_buffer_sidecar(buffer_src, capacity=capacity, size=size, max_priority=0.5)
+
+    output_stem = tmp_path / "warmstart"
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        migration.migrate_checkpoint(
+            source_path=src_path,
+            output_stem=output_stem,
+            yaml_config_path=yaml_path,
+            buffer_source=buffer_src,
+            empty_buffer=True,
+            dry_run=False,
+        )
+
+
+@pytest.mark.unit
 def test_migrate_rejects_iqn_source(tmp_path):
     """Running the migration on an already-IQN checkpoint must fail loudly
     so we never accidentally re-migrate a freshly-warmstarted file."""

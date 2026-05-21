@@ -23,10 +23,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from momentum_agent.constants import ACCOUNT_STATE_DIM
 from momentum_agent.model import (
+    IQN_HEAD_PREFIXES,
     CosineQuantileEmbedding,
     NoisyLinear,
     PositionalEncoding,
     RainbowNetwork,
+    canonical_param_key,
+    copy_iqn_head_state_dict,
+    is_iqn_head_param_key,
+    reinitialize_iqn_head_modules,
 )
 
 
@@ -339,3 +344,64 @@ def test_forward_rejects_wrong_taus_shape(network, default_config, device):
     market, account, _ = _make_inputs(default_config, device, batch_size=2, k=4)
     with pytest.raises(ValueError, match="taus must be 2D"):
         network(market, account, torch.rand(2, device=device))
+
+
+# ---------------------------------------------------------------------------
+# IQN head reset helpers (encoder preserved)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_is_iqn_head_param_key_matches_dueling_and_tau():
+    assert is_iqn_head_param_key("tau_embedding.linear.weight")
+    assert is_iqn_head_param_key("value_stream.0.weight_mu")
+    assert is_iqn_head_param_key("_orig_mod.advantage_stream.2.bias_mu")
+    assert not is_iqn_head_param_key("feature_embedding.weight")
+    assert not is_iqn_head_param_key("aux_return_head.0.weight")
+    assert canonical_param_key("_orig_mod.cls_token") == "cls_token"
+
+
+@pytest.fixture
+def spectral_network(default_config, device):
+    cfg = {**default_config, "spectral_norm_enabled": True, "debug": False}
+    return RainbowNetwork(cfg, device).to(device)
+
+
+@pytest.mark.unit
+def test_reinitialize_iqn_heads_changes_heads_not_encoder(spectral_network):
+    enc_before = spectral_network.feature_embedding.weight.detach().clone()
+    head_before = spectral_network.value_stream[0].weight_mu.detach().clone()
+
+    count = reinitialize_iqn_head_modules(spectral_network)
+    assert count >= 3
+
+    assert torch.equal(spectral_network.feature_embedding.weight, enc_before)
+    assert not torch.equal(spectral_network.value_stream[0].weight_mu, head_before)
+
+
+@pytest.mark.unit
+def test_copy_iqn_head_state_dict_aligns_target(spectral_network, default_config, device):
+    online = spectral_network
+    target = RainbowNetwork(
+        {**default_config, "spectral_norm_enabled": True, "debug": False},
+        device,
+    ).to(device)
+
+    reinitialize_iqn_head_modules(online)
+    assert not torch.allclose(
+        online.value_stream[0].weight_mu,
+        target.value_stream[0].weight_mu,
+    )
+
+    copied = copy_iqn_head_state_dict(online, target)
+    assert copied > 0
+    assert torch.allclose(online.value_stream[0].weight_mu, target.value_stream[0].weight_mu)
+
+
+@pytest.mark.unit
+def test_iqn_head_prefixes_cover_all_head_keys(default_config, device):
+    net = RainbowNetwork({**default_config, "spectral_norm_enabled": True}, device)
+    for key in net.state_dict():
+        bare = canonical_param_key(key)
+        if any(bare.startswith(p) for p in IQN_HEAD_PREFIXES):
+            assert is_iqn_head_param_key(key)

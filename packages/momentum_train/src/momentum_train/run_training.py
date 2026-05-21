@@ -89,7 +89,7 @@ def _safe_add_scalar(writer: SummaryWriter, tag: str, value: Any, step: int) -> 
         return
     try:
         scalar_value = float(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return
     if not np.isfinite(scalar_value):
         return
@@ -115,7 +115,7 @@ def _emit_action_rates(
                 continue
             try:
                 steps_total = int(steps_count)
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 continue
             if steps_total <= 0:
                 continue
@@ -124,7 +124,7 @@ def _emit_action_rates(
             try:
                 k_int = int(k)
                 v_float = float(v)
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 continue
             if not np.isfinite(v_float):
                 continue
@@ -174,7 +174,7 @@ def _emit_trade_metrics(
             pnl = trade.get("pnl_pct") if isinstance(trade, dict) else None
             try:
                 pnl_f = float(pnl) if pnl is not None else None
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 continue
             if pnl_f is None or not np.isfinite(pnl_f):
                 continue
@@ -217,7 +217,7 @@ def evaluate_on_test_data(
         tb_step_raw = getattr(agent_for_step, "total_steps", 0) if agent_for_step is not None else 0
         try:
             tb_step = int(tb_step_raw or 0)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             tb_step = 0
 
     try:
@@ -336,8 +336,11 @@ def run_training(
     resume_training_flag: bool,
     reset_lr_on_resume: bool = False,
     reset_noisy_on_resume: bool = False,
+    reset_value_head_on_resume: bool = False,
     noisy_sigma_init: float | None = None,
     benchmark_frac_override: float | None = None,
+    *,
+    skip_archive_on_fresh_start: bool = False,
 ):
     """Runs the training loop for the Rainbow DQN agent."""
     # Extract relevant config sections directly (will raise KeyError if missing)
@@ -362,6 +365,24 @@ def run_training(
     set_seeds(trainer_config["seed"])
     # Update config dict to reflect actual resume status from flag for logging
     config["run"]["resume"] = resume_training_flag
+
+    # Fresh-run hygiene: move prior artifacts out of ``model_dir`` so rotation
+    # and ``find_latest_checkpoint`` see only this run's files (unless --resume,
+    # --skip-archive-on-fresh-start, or run.archive_model_dir_before_fresh_start
+    # is false). Centralised in ``archive_model_dir_for_fresh_training_if_needed``
+    # so the gating is unit-testable instead of buried in this entrypoint.
+    from .utils.model_dir_archive import archive_model_dir_for_fresh_training_if_needed
+
+    archived_to = archive_model_dir_for_fresh_training_if_needed(
+        model_dir,
+        resume_training_flag=resume_training_flag,
+        skip_archive_on_fresh_start=skip_archive_on_fresh_start,
+        archive_enabled_in_config=bool(run_config.get("archive_model_dir_before_fresh_start", True)),
+        include_tensorboard_runs=bool(run_config.get("archive_tensorboard_runs", False)),
+    )
+    if archived_to is not None:
+        logger.info("Prior model_dir artifacts archived to %s", archived_to)
+
     logger.info(f"Running training with config: {config}")
 
     # Determine device
@@ -437,8 +458,16 @@ def run_training(
             logger.error(msg)
             raise ResumeFailedError(msg)
 
-        if reset_lr_on_resume:
-            logger.info("Reset LR on resume requested. Removing optimizer/scheduler/scaler states from checkpoint.")
+        if reset_lr_on_resume or reset_value_head_on_resume:
+            reasons = []
+            if reset_lr_on_resume:
+                reasons.append("reset-lr-on-resume")
+            if reset_value_head_on_resume:
+                reasons.append("reset-value-head-on-resume")
+            logger.info(
+                "Resume optimizer refresh requested (%s). Removing optimizer/scheduler/scaler states from checkpoint.",
+                ", ".join(reasons),
+            )
             removed_optimizer = checkpoint_data.pop("optimizer_state_dict", None)
             removed_scheduler = checkpoint_data.pop("scheduler_state_dict", None)
             removed_scaler = checkpoint_data.pop("scaler_state_dict", None)
@@ -567,6 +596,19 @@ def run_training(
             logger.error(msg)
             raise ResumeFailedError(msg)
 
+        # Priority exponent ``alpha`` on the replay buffer is restored from side-car
+        # / legacy meta (historical trained value). ``agent.alpha`` always reflects
+        # the **current YAML**. Without re-syncing, tuning ``alpha`` mid-run via
+        # config alone would silently have no effect on ``update_priorities``.
+        buf_alpha = getattr(agent.buffer, "alpha", None)
+        if buf_alpha is not None and buf_alpha != agent.alpha:
+            logger.info(
+                "Syncing buffer PER alpha from YAML: restored buffer had %.4f, config says %.4f — using config.",
+                buf_alpha,
+                agent.alpha,
+            )
+            agent.buffer.alpha = agent.alpha
+
         # IMPORTANT: agent.total_steps and trainer.total_train_steps live on
         # *different axes* and must not be collapsed into one another:
         #   - trainer.total_train_steps counts *environment steps* taken across
@@ -605,6 +647,19 @@ def run_training(
                 )
             except Exception as exc:
                 logger.error("Failed to reset NoisyNet sigma on resume: %s", exc, exc_info=True)
+
+        if reset_value_head_on_resume:
+            try:
+                head_layers = agent.reset_iqn_heads(sync_target=True)
+                logger.info(
+                    "Reset IQN value/advantage/tau heads on resume: %d online head submodule(s) "
+                    "re-initialized; encoder, aux head, buffer, and trainer counters preserved.",
+                    head_layers,
+                )
+            except Exception as exc:
+                msg = f"--resume --reset-value-head-on-resume: reset_iqn_heads failed with {type(exc).__name__}: {exc}"
+                logger.error(msg, exc_info=True)
+                raise ResumeFailedError(msg) from exc
 
     # --- Ensure agent is instantiated if not loaded during resume attempt ---
     if not agent_loaded:
@@ -757,6 +812,15 @@ def main():  # Remove default config_path
         ),
     )
     parser.add_argument(
+        "--reset-value-head-on-resume",
+        action="store_true",
+        help=(
+            "When resuming, re-initialize IQN tau_embedding + dueling heads (fresh critic scale) while "
+            "keeping the Transformer encoder, aux head, replay buffer, and episode counters. "
+            "Also discards optimizer/scheduler state so Adam moments match the new head weights."
+        ),
+    )
+    parser.add_argument(
         "--noisy-sigma-init",
         type=float,
         default=None,
@@ -787,12 +851,18 @@ def main():  # Remove default config_path
         action="store_true",
         help="Run validation/test in stochastic (training) mode instead of agent.greedy().",
     )
+    parser.add_argument(
+        "--skip-archive-on-fresh-start",
+        action="store_true",
+        help="Do not move prior model_dir artifacts into _archive/ when starting without --resume.",
+    )
     args = parser.parse_args()
     config_path = args.config_path
     # Use the command-line flag directly for resuming
     resume_training_flag = args.resume
     reset_lr_on_resume = args.reset_lr_on_resume
     reset_noisy_on_resume = args.reset_noisy_on_resume
+    reset_value_head_on_resume = args.reset_value_head_on_resume
     noisy_sigma_init = args.noisy_sigma_init
     benchmark_frac_override = args.benchmark_frac_override
     eval_stochastic_flag = args.eval_stochastic
@@ -863,8 +933,10 @@ def main():  # Remove default config_path
             resume_training_flag,
             reset_lr_on_resume=reset_lr_on_resume,
             reset_noisy_on_resume=reset_noisy_on_resume,
+            reset_value_head_on_resume=reset_value_head_on_resume,
             noisy_sigma_init=noisy_sigma_init,
             benchmark_frac_override=benchmark_frac_override,
+            skip_archive_on_fresh_start=args.skip_archive_on_fresh_start,
         )
         assert isinstance(trained_agent, RainbowDQNAgent), "run_training did not return a valid agent"
         assert isinstance(trained_trainer, RainbowTrainerModule), "run_training did not return a valid trainer"
@@ -886,7 +958,7 @@ def main():  # Remove default config_path
             try:
                 train_writer.close()
                 logger.info("TensorBoard writer closed.")
-            except (OSError, RuntimeError):  # pragma: no cover - defensive
+            except OSError, RuntimeError:  # pragma: no cover - defensive
                 logger.debug("Failed to close TensorBoard writer", exc_info=True)
 
     elif mode == "eval":

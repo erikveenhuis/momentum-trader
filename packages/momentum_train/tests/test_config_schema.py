@@ -46,6 +46,22 @@ def test_live_yaml_parses_trainer_run_logging_agent(yaml_config):
     assert run_cfg.episodes == yaml_config["run"]["episodes"]
     assert logging_cfg.log_filename == yaml_config["logging"]["log_filename"]
     assert agent_cfg.gamma == yaml_config["agent"]["gamma"]
+    assert run_cfg.archive_model_dir_before_fresh_start is yaml_config["run"]["archive_model_dir_before_fresh_start"]
+    assert run_cfg.archive_tensorboard_runs is yaml_config["run"]["archive_tensorboard_runs"]
+
+
+def test_run_config_archive_defaults_when_keys_omitted():
+    """Optional archive toggles default sanely when absent from YAML-shaped dict."""
+    raw = {
+        "mode": "train",
+        "episodes": 1,
+        "model_dir": "models",
+        "resume": False,
+        "skip_evaluation": True,
+    }
+    cfg = RunConfig.from_dict(raw)
+    assert cfg.archive_model_dir_before_fresh_start is True
+    assert cfg.archive_tensorboard_runs is False
 
 
 def test_trainer_config_missing_key_raises_keyerror():

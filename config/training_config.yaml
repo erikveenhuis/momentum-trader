@@ -1,4 +1,36 @@
 # Configuration for Rainbow DQN Trading Agent Training
+#
+# --- Experiment log (PER / IQN stability) ---
+# Prior polluted long run: models/runs/20260505-101223 (alpha=0 ablation mid-run; TD/Q blow-up).
+# Current fresh run: archive-on-fresh-start, TB models/runs/20260511-202918, progress.jsonl from 2026-05-11.
+# Config: PER alpha=0.45, munchausen_entropy_tau=0.001, munchausen_alpha=0, lr=5e-5.
+#
+# Update 2026-05-21 — fresh run HALTED ~2026-05-16 12:38 (logs/training.log; no error/early-stop line;
+#   last lines are normal PER/TD stats — likely process killed or machine stop, ~5 days idle since):
+#   * Span: first val 2026-05-11 21:52 → last activity 2026-05-16 12:38 (~4.6 days wall clock).
+#   * progress.jsonl: ~10,312 episodes, ~14.85M env steps, 51 validations.
+#   * Best val (excl. V1 flat): score ~0.529, avg_return ~-4.0%, PV ~960 (2026-05-12 23:21).
+#   * Last val before halt: score ~0.399, avg_return ~-7.0%, PV ~930 (2026-05-16 11:24);
+#     early_stop_counter=0 — not early stopping.
+#   * Last training episode logged: ep ~10312, PV ~565, total_return ~-43.5% (train slice still harsh;
+#     val better than train episodes — different files / less friction).
+#   * training.log at halt: TD error mean ~1.5e5–3.1e5 @ learner ~742k; PER alpha=0.45, beta=1.0,
+#     buffer full — per-step rewards still O(1e-3) in n-step window; critic scale still far above ~50 ballpark.
+# Interpretation: fresh run improved val vs the May 5–11 continuation (~-4% best vs ~-11% old best), but
+#   TD/critic pathology persists; halt was external, not convergence. Resume only if you accept same basin;
+#   otherwise n_steps cut, encoder-only warm-start, or LR/polyak probe (list below).
+#
+# Next probes (LR already 5e-5): one change per short run, watch Train/TD_Error_Mean and
+#   Train/Quantile/Max vs bounded-reward ballpark (~50 with |r|<=0.5, gamma=0.99):
+#   1) tau_M=0.001 + alpha=0.45 — ran on fresh run; val OK-ish but TD still ~1e5+ at halt — move on.
+#   2) n_steps: 3 -> 2 or 1 — top candidate before another long continue.
+#   3) Resume with fresh IQN heads (encoder + buffer kept):
+#        uv run python -m momentum_train.run_training --config_path config/training_config.yaml \\
+#          --resume --reset-value-head-on-resume
+#      Drops optimizer moments; re-inits tau_embedding + dueling streams; syncs target heads.
+#   3b) Fresh encoder warm-start (migrate / best_*) with new value head — if resume feels stale.
+#   4) polyak_tau: 0.005 -> 0.01 — only if target lag suspected.
+#   5) LR 5e-5 -> 2e-5 — last resort; pair with (2) or (3).
 
 window_size: 60
 
@@ -19,8 +51,24 @@ logging:
 agent:
   # Core RL params
   gamma: 0.99           # Increased from 0.95; minute-scale trades still care about future bars
-  lr: 0.0001            # Reduced from 3e-4; previous run showed policy churn from overshooting
-  batch_size: 8192      # 8192 at 41% VRAM; try 16384 (84% VRAM) with num_vector_envs >= 4 for faster buffer fill
+  # lr lowered 1e-4 -> 5e-5 at the BTR-v3 cutover (2026-04-29 16:08). BTR-v2
+  # ran ~43h with healthy validation (peak 0.3911 @ ep7403) but TD-error mean
+  # exploded geometrically from 0.5 (cutover) to 52,000 (Apr 29 15:58) — Q
+  # values drifted 5-6 OOM above the theoretical reward bound r/(1-gamma) ~ 4.
+  # Same exponential-overestimation pattern in BTR-v1 (warm buffer, nhead=4)
+  # and BTR-v2 (fresh buffer, nhead=8), so the cause is structural to the
+  # PER + DDQN-IQN + Munchausen recipe, not buffer composition. Lower LR
+  # gives the optimiser less per-step compounding and lets the slow Polyak
+  # target catch up before each batch's bootstrap is itself stale.
+  lr: 0.00005           # Reduced from 1e-4 (was 3e-4 originally) for BTR-v3 stability run
+  # batch_size kept at 8192 for BTR-v3. Earlier draft of BTR-v3 lowered
+  # this to 4096 as a belt-and-suspenders move against PER concentration,
+  # but the dominant divergence levers are lr / polyak_tau /
+  # gradient_updates_per_step (all tuned below); cutting batch on top of
+  # those would have left the GPU at ~21% VRAM with no further stability
+  # margin. Keeping 8192 maintains GPU saturation per gradient step and,
+  # combined with num_vector_envs=8 below, keeps wall-clock throughput up.
+  batch_size: 8192      # Unchanged from BTR-v2 (deliberately reverted from a 4096 draft)
   replay_buffer_size: 1000000  # Doubled from 500k; more diverse replay with 24k training files
   target_update_freq: 1000     # Logging frequency only (Polyak updates every step regardless)
 
@@ -31,7 +79,16 @@ agent:
   num_actions: 6  # Target allocation: 0%, 20%, 40%, 60%, 80%, 100%
 
   # Transformer params
-  nhead: 4
+  # nhead bumped 4 -> 8 at the BTR-v2 cutover (2026-04-27 20:50). Effective per-
+  # head dim drops from 64 to 32 but total embed_dim stays at hidden_dim=256, so
+  # PyTorch nn.MultiheadAttention parameter shapes are *identical* (in_proj
+  # 768x256, out_proj 256x256) and the C51-pretrained encoder weights load
+  # cleanly; only the internal head split changes. Rationale: BTR-v1 ran with
+  # 4 heads and showed poor specialisation (action mix went near-uniform after
+  # the first IQN validation, suggesting the attention layer wasn't routing
+  # distinct sub-features); 8 heads gives the model finer-grained routing
+  # capacity for free.
+  nhead: 8
   num_encoder_layers: 3
   dim_feedforward: 512
   transformer_dropout: 0.1
@@ -54,9 +111,16 @@ agent:
   # where pi is the entropy-regularised softmax of the *target* network's
   # expected Q values. Set ``munchausen_alpha=0`` to fall back to vanilla IQN
   # for ablations.
-  munchausen_alpha: 0.9         # Scales the log-pi bonus; 0.9 is the BTR default
-  munchausen_entropy_tau: 0.03  # Softmax temperature; smaller -> sharper policy
-  munchausen_log_pi_clip: -1.0  # Floor on the log-pi bonus to bound the target
+  munchausen_alpha: 0.0         # Scales the log-pi bonus; stays 0 during Option A probe
+  # BTR-v5 Option A (2026-04-30): ``munchausen_entropy_tau`` is NOT only for
+  # Munchausen -- ``_compute_munchausen_iqn_target_quantiles`` still builds the
+  # bootstrap target from softmax(q_target / tau_M) over actions even when
+  # alpha=0. tau_M=0.03 produced an overly diffuse target policy that, with
+  # runaway absolute Q scales (~1e5) and PER, compounded bootstrap noise. Cut
+  # tau_M to sharpen toward target-net greedy / near-argmax weighting (~6× vs
+  # 0.03). Tightened 0.005 -> 0.001 (2026-05). May 2026 TB: critic scales still worsened — see header Update.
+  munchausen_entropy_tau: 0.001  # was 0.005; sharper target softmax (smaller → nearer argmax)
+  munchausen_log_pi_clip: -1.0  # Floor on log-pi; only binds when munchausen_alpha > 0
 
   # Spectral normalization on the dueling head NoisyLinear weights (BTR Stage 3).
   # Constrains the operator norm of weight_mu in value/advantage streams to
@@ -69,7 +133,8 @@ agent:
   grad_logging_interval: 250
   target_net_logging_interval: 250
   td_error_logging_interval: 100
-  alpha: 0.6            # PER priority exponent
+  # PER: priority = (|TD|+eps)**alpha. Restored 0.45 after alpha=0 did not fix critic drift (header).
+  alpha: 0.45           # BTR-v5 Option A; softer than 0.6 linear TD weighting
   beta_start: 0.4       # Increased from 0.3; less bias early on
   beta_frames: 200000   # Reduced from 400k; reach full IS correction sooner
 
@@ -95,7 +160,15 @@ agent:
 
   # Other agent params
   grad_clip_norm: 1.0
-  polyak_tau: 0.001     # Reduced from 0.005; more inertia in target network for stable bootstraps
+  # polyak_tau raised back 0.001 -> 0.005 at the BTR-v3 cutover. The "more
+  # inertia" framing assumed reward signal was stable enough that a slow-
+  # moving target would average out noise. In practice, with PER prioritising
+  # high-|TD-error| transitions, a 1000-step target lag (1/tau) gave the
+  # online net plenty of room to drift Q upward between target updates,
+  # which then encoded the drift into the bootstrap target. tau=0.005 cuts
+  # the lag to ~200 steps, killing the slow-bootstrap-pressure feedback
+  # loop while still keeping the target net distinct from online.
+  polyak_tau: 0.005     # Increased from 0.001 for BTR-v3 stability run
   store_partial_n_step: true
   debug: false
 
@@ -124,10 +197,26 @@ feature_rolling_window: 20   # Lookback bars for derived features (realized vol,
 
 trainer:
   seed: 42
-  num_vector_envs: 4        # Parallel TradingEnv workers (1 = legacy single-env loop; 4-8 recommended for GPU saturation)
+  # num_vector_envs raised 4 -> 8 at the BTR-v3 cutover. Doubles wall-clock
+  # env-step throughput (env loop was the bottleneck, not the GPU) and
+  # halves PER-buffer turnover time, which evicts stale high-|TD-error|
+  # transitions ~2x faster -- a mild stability win on top of the lr / tau /
+  # gradient_updates changes. Divergence dynamics are decoupled from this
+  # axis (they live on the learner-call counter), so no stability cost.
+  # Costs: 2x CPU load on env-stepping subprocesses (fine on >= 8 physical
+  # cores) and 2x learner-call frequency in wall-clock terms. Within the
+  # YAML's documented "4-8 recommended" supported band.
+  num_vector_envs: 8        # Raised from 4 for BTR-v3 throughput
   warmup_steps: 20000       # With action masking, warmup produces cleaner transitions
   update_freq: 20           # Learn every 20 env steps; vectorized loop uses threshold counter to avoid modulo drift
-  gradient_updates_per_step: 2  # Reduced from 3; try 2 with num_vector_envs >= 4 at lr=1e-4 (monitor val score)
+  # gradient_updates_per_step lowered 2 -> 1 at the BTR-v3 cutover. With
+  # update_freq=20 and 2 grad updates/step the agent did 1 grad update per
+  # 10 env steps; combined with batch_size=8192 and PER, the off-policy
+  # bootstrap pressure was high enough to compound Q-value drift faster
+  # than the target net could equilibrate. 1 grad update per 20 env steps
+  # halves bootstrap pressure and roughly matches Rainbow/BTR reference
+  # impls when num_vector_envs >= 4.
+  gradient_updates_per_step: 1  # Reduced from 2 for BTR-v3 stability run
   log_freq: 60
   per_stats_log_freq: 300
   validation_freq: 200      # Less frequent validation; avoids judging a still-learning policy too often
@@ -149,7 +238,14 @@ trainer:
   latest_checkpoint_keep_last_n: 10
   reward_window: 20
   reward_clip: 0.5          # Soft cap on per-step reward magnitude (IQN itself has unbounded support)
-  min_episodes_before_early_stopping: 5000  # Defer best-tracking and early stopping until meaningful training
+  # Raised 5000 -> 15000 after the BTR-v3 fresh run hit early stopping at ep
+  # ~7400. Diagnosis: ``best_validation_metric`` got anchored on the very first
+  # eligible validation at ep 5000 (score 0.406) — exactly where the
+  # benchmark anneal floor was reached and action mix collapsed toward action 0
+  # (~70% flat). Extending this gate past the new anneal end (also 15000)
+  # ensures best-tracking starts on a stationary policy, not on a transitional
+  # one that's still rebalancing as the reward landscape changes.
+  min_episodes_before_early_stopping: 15000  # Defer best-tracking until after the extended benchmark anneal completes
   early_stopping_patience: 12  # Increased from 6; more runway for slow convergence
   final_phase_lr_start_frac: 0.85  # Later start since cosine already decays smoothly
   final_phase_lr_multiplier: 0.3
@@ -176,9 +272,21 @@ trainer:
   # Anneal length is aligned with min_episodes_before_early_stopping so the
   # benchmark reaches its low-pressure end value just as best-checkpoint
   # selection becomes active.
+  #
+  # Extended 2026-05-05 after fresh BTR-v3 run early-stopped at ep ~7400 with
+  # ~70% action-0 (flat) policy collapse. The previous schedule (0.50 -> 0.10
+  # over 5000 eps) released anti-flat pressure too quickly and bottomed at a
+  # frac low enough that "do nothing" became a reward-positive equilibrium.
+  # Two changes:
+  #   * end raised 0.10 -> 0.20: keep some long-bias floor so a perfectly
+  #     flat policy is still mildly penalized indefinitely (~20% of the bar's
+  #     drift must be cleared to be reward-neutral).
+  #   * anneal_episodes raised 5000 -> 15000: 3x slower release means the
+  #     policy has more episodes at strong anti-flat pressure to learn a
+  #     non-trivial action repertoire before pressure relaxes.
   benchmark_allocation_frac_start: 0.5
-  benchmark_allocation_frac_end: 0.10
-  benchmark_allocation_frac_anneal_episodes: 5000
+  benchmark_allocation_frac_end: 0.20
+  benchmark_allocation_frac_anneal_episodes: 15000
 
 # --- Run Configuration --- #
 run:
@@ -188,3 +296,11 @@ run:
   resume: false
   specific_file: null
   skip_evaluation: false
+  # Without --resume: move prior checkpoints, replay sidecars, progress.jsonl,
+  # validation/test exports, trades JSONL, and rainbow_transformer_*.pt out of
+  # model_dir into ``models/_archive/pre_fresh_<tag>/`` so stale high-episode
+  # latest_* files cannot delete the new run's checkpoints. Ignored when --resume
+  # is set. Override with ``--skip-archive-on-fresh-start`` if needed.
+  archive_model_dir_before_fresh_start: true
+  # Also archive ``runs/`` (TensorBoard). Default false — can be multi‑GB.
+  archive_tensorboard_runs: false

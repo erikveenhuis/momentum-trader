@@ -75,6 +75,12 @@ class RunConfig:
     eval_model_prefix: str | None = None
     data_base_dir: str = "data"
     benchmark_frac_override: float | None = None
+    # When ``--resume`` is not set, move prior checkpoints / progress / validation
+    # artifacts out of ``model_dir`` so ``latest_*`` rotation and resume picks are
+    # keyed to the new run only. Disable via YAML or ``--skip-archive-on-fresh-start``.
+    archive_model_dir_before_fresh_start: bool = True
+    # Also move ``runs/`` (TensorBoard). Off by default — can be large.
+    archive_tensorboard_runs: bool = False
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> RunConfig:

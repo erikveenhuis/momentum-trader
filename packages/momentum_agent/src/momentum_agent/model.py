@@ -126,6 +126,72 @@ def _maybe_wrap_stream_with_spectral_norm(stream: nn.Sequential, enabled: bool) 
             _apply_spectral_norm_to_noisy(module)
 
 
+# State-dict prefixes for the IQN critic path (encoder / aux head are untouched).
+IQN_HEAD_PREFIXES: tuple[str, ...] = (
+    "tau_embedding.",
+    "value_stream.",
+    "advantage_stream.",
+)
+
+
+def canonical_param_key(name: str) -> str:
+    """Strip ``torch.compile``'s ``_orig_mod.`` wrapper from a parameter name."""
+    return name[len("_orig_mod.") :] if name.startswith("_orig_mod.") else name
+
+
+def is_iqn_head_param_key(name: str) -> bool:
+    """True if *name* belongs to the IQN tau embedding or dueling heads."""
+    bare = canonical_param_key(name)
+    return any(bare.startswith(prefix) for prefix in IQN_HEAD_PREFIXES)
+
+
+def _reinit_linear(module: nn.Linear) -> None:
+    nn.init.kaiming_normal_(module.weight, mode="fan_in", nonlinearity="relu")
+    if module.bias is not None:
+        nn.init.zeros_(module.bias)
+
+
+def reinitialize_iqn_head_modules(network: nn.Module) -> int:
+    """Re-initialize IQN head submodules in-place; shared encoder is preserved.
+
+    Returns the number of head ``Module`` objects re-initialized (tau linear +
+    each ``NoisyLinear`` / ``Linear`` inside the dueling streams).
+    """
+    inner = getattr(network, "_orig_mod", network)
+    if not (hasattr(inner, "tau_embedding") and hasattr(inner, "value_stream") and hasattr(inner, "advantage_stream")):
+        raise TypeError(f"Module lacks IQN head attributes, got {type(inner).__name__}")
+
+    reset_count = 0
+    _reinit_linear(inner.tau_embedding.linear)
+    reset_count += 1
+
+    for stream in (inner.value_stream, inner.advantage_stream):
+        for module in stream.modules():
+            if isinstance(module, NoisyLinear):
+                module.reset_parameters()
+                reset_count += 1
+            elif isinstance(module, nn.Linear):
+                _reinit_linear(module)
+                reset_count += 1
+
+    return reset_count
+
+
+def copy_iqn_head_state_dict(source: nn.Module, target: nn.Module) -> int:
+    """Copy IQN-head tensors from *source* into *target* (``strict=False``)."""
+    src_sd = source.state_dict()
+    tgt_sd = target.state_dict()
+    to_load: dict[str, torch.Tensor] = {}
+    for key, tensor in src_sd.items():
+        if not is_iqn_head_param_key(key):
+            continue
+        if key not in tgt_sd or tgt_sd[key].shape != tensor.shape:
+            continue
+        to_load[key] = tensor.detach()
+    target.load_state_dict(to_load, strict=False)
+    return len(to_load)
+
+
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000, debug: bool = False):
         super().__init__()
@@ -320,6 +386,10 @@ class RainbowNetwork(nn.Module):
         if self.spectral_norm_enabled:
             _maybe_wrap_stream_with_spectral_norm(self.value_stream, True)
             _maybe_wrap_stream_with_spectral_norm(self.advantage_stream, True)
+
+    def reset_iqn_heads(self) -> int:
+        """Re-initialize tau embedding + dueling streams (encoder / aux head unchanged)."""
+        return reinitialize_iqn_head_modules(self)
 
     def _initialize_weights(self):
         """Initializes weights for Linear layers and resets NoisyLinear layers."""
