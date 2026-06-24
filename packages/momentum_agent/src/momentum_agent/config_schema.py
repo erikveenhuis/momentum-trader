@@ -49,6 +49,19 @@ class AgentConfig:
     beta_start: float
     beta_frames: int
 
+    # PER priority hygiene (decouples new-transition seeding from the
+    # historical ``max_priority`` ceiling and clips per-update priorities
+    # so a single TD spike cannot dominate sampling for millions of
+    # steps). ``per_new_transition_priority`` is in alpha-space (i.e.
+    # already raised to ``alpha``); the canonical PER default is 1.0
+    # ("new transitions are mildly interesting until proven otherwise").
+    # ``per_priority_cap`` is the upper bound applied to both
+    # ``update_priorities`` outputs and to leaves on
+    # ``clamp_tree_priorities``; with alpha=0.45 a cap of 50 corresponds
+    # to ``|TD|`` ~ 2,300 (50^(1/0.45)) before clipping kicks in.
+    per_new_transition_priority: float
+    per_priority_cap: float
+
     epsilon_start: float
     epsilon_end: float
     epsilon_decay_steps: int
@@ -74,6 +87,14 @@ class AgentConfig:
     munchausen_alpha: float
     munchausen_entropy_tau: float
     munchausen_log_pi_clip: float
+
+    # IQN bootstrap at s': ``soft`` = Munchausen entropy-regularised softmax
+    # over target-net actions; ``greedy`` = target-net argmax (vanilla DQN);
+    # ``double`` = Rainbow Double-DQN (online argmax, target quantiles).
+    # ``munchausen_entropy_tau`` affects the soft path and the current-state
+    # log-pi bonus when ``munchausen_alpha>0``; ignored for next-state bootstrap
+    # when mode is ``greedy`` or ``double``.
+    iqn_bootstrap_mode: str
 
     # Spectral normalization on the dueling head NoisyLinears (BTR Stage 3).
     spectral_norm_enabled: bool
@@ -165,6 +186,8 @@ def _validate_agent_config(cfg: AgentConfig) -> None:
         raise ValueError(
             f"munchausen_log_pi_clip must be <= 0 (clip floor for log pi), got {cfg.munchausen_log_pi_clip}"
         )
+    if cfg.iqn_bootstrap_mode not in ("soft", "greedy", "double"):
+        raise ValueError(f"iqn_bootstrap_mode must be 'soft', 'greedy', or 'double', got {cfg.iqn_bootstrap_mode!r}")
     if cfg.n_steps < 1:
         raise ValueError(f"n_steps must be >= 1, got {cfg.n_steps}")
     if cfg.batch_size < 1:
@@ -175,6 +198,13 @@ def _validate_agent_config(cfg: AgentConfig) -> None:
         raise ValueError(f"alpha must be in [0, 1], got {cfg.alpha}")
     if not (0.0 <= cfg.beta_start <= 1.0):
         raise ValueError(f"beta_start must be in [0, 1], got {cfg.beta_start}")
+    if cfg.per_new_transition_priority <= 0:
+        raise ValueError(f"per_new_transition_priority must be > 0, got {cfg.per_new_transition_priority}")
+    if cfg.per_priority_cap < cfg.per_new_transition_priority:
+        raise ValueError(
+            f"per_priority_cap ({cfg.per_priority_cap}) must be >= per_new_transition_priority "
+            f"({cfg.per_new_transition_priority})"
+        )
     if cfg.lr <= 0:
         raise ValueError(f"lr must be positive, got {cfg.lr}")
     if not (0.0 <= cfg.epsilon_end <= cfg.epsilon_start <= 1.0):

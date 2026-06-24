@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import signal
 from datetime import datetime
 from pathlib import Path
 
@@ -23,10 +24,73 @@ logger = get_logger(__name__)
 # that don't match the canonical pattern (third-party copies, manual renames)
 # are left alone rather than being parsed with a fragile suffix split.
 _TOPK_FILENAME_RE = re.compile(r"^checkpoint_trainer_topk_\d{8}_ep(\d+)_score_(-?\d+\.\d+)\.pt$")
+_PEAK_FILENAME_RE = re.compile(r"^checkpoint_trainer_peak_\d{8}_ep(\d+)_score_(-?\d+\.\d+)\.pt$")
+
+
+def _is_flat_benchmark_validation(
+    score: float,
+    metrics: dict | None,
+    *,
+    score_threshold: float,
+    max_abs_return_pct: float,
+) -> bool:
+    """True when score looks like a near-passive policy matching the benchmark.
+
+    Flat validations score ~0.59–0.60 with total_return near 0%. They pollute
+    the top-K ring and ``best_validation_metric`` tracking while not representing
+    useful active-trading checkpoints.
+    """
+    if not np.isfinite(score) or score < score_threshold:
+        return False
+    if not metrics:
+        return False
+    ret = metrics.get("total_return", np.nan)
+    if not np.isfinite(ret):
+        return False
+    return abs(float(ret)) < max_abs_return_pct
 
 
 class CheckpointMixin:
     """Checkpoint save/rotate/finalize methods split from the monolithic trainer."""
+
+    def _install_emergency_checkpoint_signal_handler(self) -> None:
+        """Arm SIGUSR1 so ``scripts/training_watchdog.sh`` can request a safe save."""
+
+        def _handler(signum: int, frame: object | None) -> None:
+            del signum, frame
+            self._emergency_checkpoint_requested = True
+            logger.info("SIGUSR1 received: emergency checkpoint queued for next training step.")
+
+        try:
+            signal.signal(signal.SIGUSR1, _handler)
+            logger.info(
+                "Emergency checkpoint handler installed (SIGUSR1). Run scripts/training_watchdog.sh alongside training."
+            )
+        except Exception:
+            logger.warning("Failed to install SIGUSR1 emergency checkpoint handler.", exc_info=True)
+
+    def _maybe_save_emergency_checkpoint(self, episode: int, total_steps: int) -> None:
+        """Persist a latest checkpoint when the external watchdog sends SIGUSR1."""
+        if not self._emergency_checkpoint_requested:
+            return
+        self._emergency_checkpoint_requested = False
+        logger.info(
+            "Saving emergency checkpoint at episode %d, step %d (watchdog SIGUSR1).",
+            episode + 1,
+            total_steps,
+        )
+        try:
+            self._save_checkpoint(
+                episode=episode,
+                total_steps=total_steps,
+                is_best=False,
+                validation_score=None,
+            )
+            self._flush_writer()
+            logger.info("Emergency checkpoint save completed.")
+        except Exception:
+            logger.error("Emergency checkpoint save failed.", exc_info=True)
+            self._emergency_checkpoint_requested = True
 
     @staticmethod
     def _buffer_sidecar_dir_for(checkpoint_path: str | Path) -> Path:
@@ -218,6 +282,7 @@ class CheckpointMixin:
             "episode": episode,
             "total_train_steps": total_steps,
             "best_validation_metric": self.best_validation_metric,
+            "checkpoint_pin_best_metric": self.checkpoint_pin_best_metric,
             "early_stopping_counter": self.early_stopping_counter,
             "buffer_state": None,
             "buffer_sidecar_relpath": None,
@@ -240,7 +305,14 @@ class CheckpointMixin:
             cp["tensorboard_log_dir"] = getattr(self.writer, "log_dir", None)
         return cp
 
-    def _maybe_save_topk_checkpoint(self, *, episode: int, total_steps: int, validation_score: float) -> Path | None:
+    def _maybe_save_topk_checkpoint(
+        self,
+        *,
+        episode: int,
+        total_steps: int,
+        validation_score: float,
+        validation_metrics: dict | None = None,
+    ) -> Path | None:
         """Pin the new validation score into the top-K best ring if it qualifies.
 
         This runs alongside (not instead of) the threshold-gated ``best_*`` save:
@@ -248,7 +320,7 @@ class CheckpointMixin:
         small but real improvement (e.g. +0.0008 over the prior best, the
         case that motivated this feature) still lands on disk. Eligibility
         otherwise mirrors ``best_*``: no save before the
-        ``min_episodes_before_early_stopping`` gate has been crossed.
+        ``min_episodes_before_checkpoint_pinning`` gate has been crossed.
 
         The ring is reconstructed from filenames on every call (see
         :meth:`_scan_topk_ring`) so it survives ``--resume`` without any
@@ -266,11 +338,22 @@ class CheckpointMixin:
             return None
         if not np.isfinite(validation_score):
             return None
-        # Eligibility gate: defer until the early-stop minimum-episode
-        # threshold has been crossed, mirroring the threshold-gated
-        # ``best_*`` save in ``_handle_validation_and_checkpointing``.
-        min_eps = int(getattr(self, "min_episodes_before_early_stopping", 0) or 0)
-        if min_eps > 0 and episode < min_eps:
+        if bool(getattr(self, "top_k_skip_flat_benchmark", True)) and _is_flat_benchmark_validation(
+            validation_score,
+            validation_metrics,
+            score_threshold=float(getattr(self, "top_k_flat_score_threshold", 0.585)),
+            max_abs_return_pct=float(getattr(self, "top_k_flat_max_abs_return_pct", 2.0)),
+        ):
+            logger.info(
+                "Top-K ring: skipping flat-benchmark validation (score=%.4f, return=%.2f%%).",
+                validation_score,
+                float(validation_metrics.get("total_return", float("nan"))) if validation_metrics else float("nan"),
+            )
+            return None
+        # Eligibility gate: defer until the checkpoint-pinning threshold has
+        # been crossed (independent of early-stopping deferral).
+        min_pin = int(getattr(self, "min_episodes_before_checkpoint_pinning", 0) or 0)
+        if min_pin > 0 and episode < min_pin:
             return None
 
         # Networks/optimizer must be initialised; otherwise the .pt would be
@@ -339,12 +422,124 @@ class CheckpointMixin:
                     logger.warning("Top-K ring: failed to evict %s: %s", evict_path, exc)
         return topk_path
 
+    def _rotate_peak_checkpoints(self) -> list[Path]:
+        """Prune ``checkpoint_trainer_peak_*`` files beyond the keep-N window."""
+        keep_n = int(getattr(self, "peak_checkpoint_keep_last_n", 0) or 0)
+        if keep_n <= 0:
+            return []
+
+        model_dir = Path(self.run_config.get("model_dir", "models"))
+        try:
+            candidates = list(model_dir.glob("checkpoint_trainer_peak_*_ep*_score_*.pt"))
+        except OSError as exc:
+            logger.warning("Peak checkpoint rotation: failed to list %s: %s", model_dir, exc)
+            return []
+
+        episode_files: list[tuple[int, Path]] = []
+        for path in candidates:
+            m = _PEAK_FILENAME_RE.match(path.name)
+            if not m:
+                continue
+            try:
+                episode_files.append((int(m.group(1)), path))
+            except ValueError:
+                continue
+
+        if len(episode_files) <= keep_n:
+            return []
+
+        episode_files.sort(key=lambda item: item[0], reverse=True)
+        deleted: list[Path] = []
+        for path in [p for _, p in episode_files[keep_n:]]:
+            try:
+                path.unlink()
+                deleted.append(path)
+            except OSError as exc:
+                logger.warning("Peak checkpoint rotation: failed to delete %s: %s", path, exc)
+            sidecar = self._buffer_sidecar_dir_for(path)
+            if sidecar.is_dir():
+                try:
+                    shutil.rmtree(sidecar)
+                except OSError as exc:
+                    logger.warning("Peak checkpoint rotation: failed to delete side-car %s: %s", sidecar, exc)
+        if deleted:
+            logger.info(
+                "Peak checkpoint rotation: kept %d, deleted %d older file(s).",
+                keep_n,
+                len(deleted),
+            )
+        return deleted
+
+    def _maybe_save_peak_checkpoint(
+        self,
+        *,
+        episode: int,
+        total_steps: int,
+        validation_score: float,
+        validation_metrics: dict | None,
+        checkpoint: dict,
+    ) -> Path | None:
+        """Save a full checkpoint + PER buffer on strict validation improvement."""
+        keep_n = int(getattr(self, "peak_checkpoint_keep_last_n", 0) or 0)
+        if keep_n <= 0:
+            return None
+        if not np.isfinite(validation_score):
+            return None
+        if bool(getattr(self, "top_k_skip_flat_benchmark", True)) and _is_flat_benchmark_validation(
+            validation_score,
+            validation_metrics,
+            score_threshold=float(getattr(self, "top_k_flat_score_threshold", 0.585)),
+            max_abs_return_pct=float(getattr(self, "top_k_flat_max_abs_return_pct", 2.0)),
+        ):
+            logger.info(
+                "Peak checkpoint: skipping flat-benchmark validation (score=%.4f).",
+                validation_score,
+            )
+            return None
+
+        current_date = datetime.now().strftime("%Y%m%d")
+        peak_path = (
+            Path(self.run_config.get("model_dir", "models"))
+            / f"checkpoint_trainer_peak_{current_date}_ep{episode}_score_{validation_score:.4f}.pt"
+        )
+        peak_ckpt = dict(checkpoint)
+        try:
+            sidecar_dir = self._save_buffer_sidecar(peak_path)
+        except Exception as sidecar_exc:  # noqa: BLE001
+            logger.error(
+                "Peak checkpoint: buffer side-car write failed for %s; skipping peak save.",
+                peak_path,
+                exc_info=sidecar_exc,
+            )
+            return None
+        if sidecar_dir is not None:
+            peak_ckpt["buffer_sidecar_relpath"] = sidecar_dir.name
+        else:
+            peak_ckpt["buffer_sidecar_relpath"] = None
+        try:
+            torch.save(peak_ckpt, peak_path)
+            logger.info(
+                "Peak checkpoint saved to %s (score=%.4f, strict validation improvement).",
+                peak_path,
+                validation_score,
+            )
+        except Exception:  # noqa: BLE001
+            logger.error("Error saving peak checkpoint to %s", peak_path, exc_info=True)
+            return None
+        try:
+            self._rotate_peak_checkpoints()
+        except Exception:  # noqa: BLE001
+            logger.warning("Peak checkpoint rotation raised; continuing.", exc_info=True)
+        return peak_path
+
     def _save_checkpoint(
         self,
         episode: int,
         total_steps: int,
         is_best: bool,
         validation_score: float | None = None,  # Add optional validation score
+        validation_metrics: dict | None = None,
+        strict_validation_improvement: bool = False,
     ):
         """Save trainer-specific checkpoint (episode, validation score, etc.)."""
         assert isinstance(episode, int) and episode >= 0, "Invalid episode number for checkpoint"
@@ -376,6 +571,7 @@ class CheckpointMixin:
             "episode": episode,
             "total_train_steps": total_steps,  # Store steps from trainer perspective
             "best_validation_metric": self.best_validation_metric,
+            "checkpoint_pin_best_metric": self.checkpoint_pin_best_metric,
             "early_stopping_counter": self.early_stopping_counter,
             "buffer_state": None,
             "buffer_sidecar_relpath": None,  # filled in after side-car is written
@@ -489,11 +685,6 @@ class CheckpointMixin:
                 logger.info("  (no buffer side-car written for best; resume from latest_* for full buffer state)")
                 # Log the actual score achieved that triggered this save
                 if validation_score is not None:
-                    self.best_validation_metric = validation_score
-                    # --- MODIFIED: Construct filename with score ---
-                    # best_model_save_prefix = f"{self.best_model_base_prefix}_{current_date}_ep{episode}_score_{validation_score:.4f}"
-                    # self.agent.save_model(best_model_save_prefix) # REMOVED - Agent state is in checkpoint
-                    # --- END MODIFICATION ---
                     logger.info(f"  Score: {validation_score:.4f}")
                     logger.info(
                         f"  Best checkpoint with agent state saved to: {best_checkpoint_path}"
@@ -515,9 +706,22 @@ class CheckpointMixin:
                     episode=episode,
                     total_steps=total_steps,
                     validation_score=float(validation_score),
+                    validation_metrics=validation_metrics,
                 )
             except Exception:  # noqa: BLE001 — ring save must never break training
                 logger.warning("Top-K ring save raised; continuing.", exc_info=True)
+
+        if strict_validation_improvement and validation_score is not None:
+            try:
+                self._maybe_save_peak_checkpoint(
+                    episode=episode,
+                    total_steps=total_steps,
+                    validation_score=float(validation_score),
+                    validation_metrics=validation_metrics,
+                    checkpoint=checkpoint,
+                )
+            except Exception:  # noqa: BLE001 — peak save must never break training
+                logger.warning("Peak checkpoint save raised; continuing.", exc_info=True)
 
         # Keep TB event file in sync with the checkpoint we just flushed to
         # disk. Without this, a hard freeze right after a checkpoint save can

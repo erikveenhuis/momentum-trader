@@ -34,6 +34,10 @@ class TrainerConfig:
     reward_window: int
     early_stopping_patience: int
     min_episodes_before_early_stopping: int
+    # Separate gate for top-K / peak / threshold-gated ``best_*`` saves. Early
+    # stopping and ``best_validation_metric`` tracking use
+    # ``min_episodes_before_early_stopping`` only.
+    min_episodes_before_checkpoint_pinning: int
     min_validation_threshold: float
 
     # Benchmark frac schedule (linear anneal).
@@ -43,6 +47,12 @@ class TrainerConfig:
 
     final_phase_lr_start_frac: float
     final_phase_lr_multiplier: float
+
+    # Training-file pool sampling (see ``schedules.compute_curriculum_sampling``).
+    curriculum_mode: str
+    curriculum_start_frac: float
+    curriculum_end_frac: float
+    curriculum_recent_frac: float
 
     # Optional toggles: ``None`` disables the feature entirely.
     reward_clip: float | None = None
@@ -54,6 +64,15 @@ class TrainerConfig:
     # without honouring ``min_validation_threshold``. Survives restarts because
     # the ring is reconstructed from filenames in ``model_dir`` on each save.
     top_k_best_checkpoints: int = 0
+    # Skip near-passive validations (high score, ~0% return) so the ring keeps
+    # active-trading peaks like 0.54 instead of filling with ~0.596 flat modes.
+    top_k_skip_flat_benchmark: bool = True
+    top_k_flat_score_threshold: float = 0.585
+    top_k_flat_max_abs_return_pct: float = 2.0
+    # Peak stream: full latest-style checkpoint + PER buffer on every strict
+    # validation improvement (after min_episodes_before_checkpoint_pinning).
+    # Rotates independently of ``latest_*``. 0 disables (~9 GB per peak file).
+    peak_checkpoint_keep_last_n: int = 0
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> TrainerConfig:

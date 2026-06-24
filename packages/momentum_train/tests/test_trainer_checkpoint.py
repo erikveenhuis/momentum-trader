@@ -24,6 +24,7 @@ class DummyBuffer:
 def test_save_checkpoint_persists_expected_keys(tmp_path):
     trainer = RainbowTrainerModule.__new__(RainbowTrainerModule)
     trainer.best_validation_metric = 0.75
+    trainer.checkpoint_pin_best_metric = 0.6
     trainer.early_stopping_counter = 1
     # Bookkeeping counter introduced for the "don't clobber _final.pt if no
     # real saves happened this run" guard; _save_checkpoint increments it.
@@ -65,6 +66,7 @@ def test_save_checkpoint_persists_expected_keys(tmp_path):
         "episode",
         "total_train_steps",
         "best_validation_metric",
+        "checkpoint_pin_best_metric",
         "early_stopping_counter",
         # ``buffer_state`` stays present but is now always None -- the
         # replay buffer itself is persisted to a side-car directory next

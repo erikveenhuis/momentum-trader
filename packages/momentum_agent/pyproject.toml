@@ -17,17 +17,17 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "torch>=2.11.0",
-    "numpy==2.4.4",
+    "torch>=2.12.1",
+    "numpy>=2.4.6",
     "momentum_env==0.2.0",
     "momentum-core==0.1.0",
 ]
 
 [dependency-groups]
 dev = [
-    "pytest==9.0.3",
-    "pytest-cov==7.1.0",
-    "ruff",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.15.18",
 ]
 
 [tool.setuptools.packages.find]

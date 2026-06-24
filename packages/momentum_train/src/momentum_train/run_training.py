@@ -337,6 +337,8 @@ def run_training(
     reset_lr_on_resume: bool = False,
     reset_noisy_on_resume: bool = False,
     reset_value_head_on_resume: bool = False,
+    reset_buffer_on_resume: bool = False,
+    clamp_priorities_on_resume: bool = False,
     noisy_sigma_init: float | None = None,
     benchmark_frac_override: float | None = None,
     *,
@@ -417,6 +419,7 @@ def run_training(
     start_episode = 0
     start_total_steps = 0
     initial_best_score = -np.inf
+    initial_checkpoint_pin_best_metric = -np.inf
     initial_early_stopping_counter = 0
     checkpoint_data: dict[str, Any] | None = None
     # optimizer_state = None <-- Removed unused variable
@@ -458,12 +461,14 @@ def run_training(
             logger.error(msg)
             raise ResumeFailedError(msg)
 
-        if reset_lr_on_resume or reset_value_head_on_resume:
+        if reset_lr_on_resume or reset_value_head_on_resume or reset_buffer_on_resume:
             reasons = []
             if reset_lr_on_resume:
                 reasons.append("reset-lr-on-resume")
             if reset_value_head_on_resume:
                 reasons.append("reset-value-head-on-resume")
+            if reset_buffer_on_resume:
+                reasons.append("reset-buffer-on-resume")
             logger.info(
                 "Resume optimizer refresh requested (%s). Removing optimizer/scheduler/scaler states from checkpoint.",
                 ", ".join(reasons),
@@ -483,6 +488,10 @@ def run_training(
         # Extract trainer state
         start_episode = checkpoint_data.get("episode", 0)
         initial_best_score = checkpoint_data.get("best_validation_metric", -np.inf)
+        initial_checkpoint_pin_best_metric = checkpoint_data.get(
+            "checkpoint_pin_best_metric",
+            initial_best_score,
+        )
         initial_early_stopping_counter = checkpoint_data.get("early_stopping_counter", 0)
         if reset_lr_on_resume and initial_early_stopping_counter:
             logger.info(
@@ -531,6 +540,16 @@ def run_training(
             logger.error(msg)
             raise ResumeFailedError(msg)
 
+        if reset_buffer_on_resume:
+            removed_sidecar = checkpoint_data.pop("buffer_sidecar_relpath", None)
+            removed_legacy = checkpoint_data.pop("buffer_state", None)
+            logger.info(
+                "Reset buffer on resume requested. Skipping checkpoint replay restore "
+                "(side-car=%s, legacy buffer_state=%s). PER will refill from rollout after warmup.",
+                "present" if removed_sidecar else "absent",
+                "present" if removed_legacy else "absent",
+            )
+
         # --- Restore the replay buffer ---
         #
         # Preference order:
@@ -542,10 +561,8 @@ def run_training(
         #   2. Legacy in-checkpoint ``buffer_state`` dict (pickled deque
         #      + SumTree arrays). Still honoured so checkpoints written
         #      before this change can be resumed.
-        #   3. Nothing -- loudly fail, because --resume with no restored
-        #      buffer means training would silently refill 1M transitions
-        #      from warmup, which wastes many hours and is never what the
-        #      user wanted.
+        #   3. Nothing -- fail unless ``--reset-buffer-on-resume`` (empty buffer
+        #      is intentional; warmup refills transitions at fresh priorities).
         sidecar_relpath = checkpoint_data.get("buffer_sidecar_relpath")
         legacy_buf_state = checkpoint_data.get("buffer_state")
         buffer_restored = False
@@ -588,13 +605,24 @@ def run_training(
                 logger.error(msg, exc_info=True)
                 raise ResumeFailedError(msg) from exc
         if not buffer_restored:
-            msg = (
-                f"--resume: {trainer_checkpoint_path!r} has neither a buffer side-car "
-                f"(buffer_sidecar_relpath) nor a legacy buffer_state; there is no replay buffer "
-                "to restore. Refusing to silently continue."
-            )
-            logger.error(msg)
-            raise ResumeFailedError(msg)
+            if reset_buffer_on_resume:
+                if hasattr(agent.buffer, "clear"):
+                    agent.buffer.clear()
+                logger.info(
+                    "Replay buffer intentionally empty after --reset-buffer-on-resume "
+                    "(%d transitions). Training will refill during warmup.",
+                    len(agent.buffer),
+                )
+                buffer_restored = True
+            else:
+                msg = (
+                    f"--resume: {trainer_checkpoint_path!r} has neither a buffer side-car "
+                    f"(buffer_sidecar_relpath) nor a legacy buffer_state; there is no replay buffer "
+                    "to restore. Refusing to silently continue. Use --reset-buffer-on-resume if an "
+                    "empty buffer is intentional."
+                )
+                logger.error(msg)
+                raise ResumeFailedError(msg)
 
         # Priority exponent ``alpha`` on the replay buffer is restored from side-car
         # / legacy meta (historical trained value). ``agent.alpha`` always reflects
@@ -608,6 +636,21 @@ def run_training(
                 agent.alpha,
             )
             agent.buffer.alpha = agent.alpha
+
+        # Operator escape hatch: scrub any pre-cap priority leaves left over
+        # from a contaminated run. The load_from_path / load_state_dict paths
+        # already auto-clamp to the buffer's ``priority_cap``; this flag is
+        # for the case where the operator wants the loud "we clamped X leaves"
+        # accounting even when the auto-clamp didn't fire (and to pair with
+        # head/buffer resets when chasing a stability regression).
+        if clamp_priorities_on_resume and hasattr(agent.buffer, "clamp_tree_priorities"):
+            clamped = agent.buffer.clamp_tree_priorities()
+            logger.info(
+                "--clamp-priorities-on-resume: clamped %d SumTree leaves to priority_cap=%g (max_priority now %g).",
+                clamped,
+                getattr(agent.buffer, "priority_cap", float("nan")),
+                getattr(agent.buffer, "max_priority", float("nan")),
+            )
 
         # IMPORTANT: agent.total_steps and trainer.total_train_steps live on
         # *different axes* and must not be collapsed into one another:
@@ -651,10 +694,14 @@ def run_training(
         if reset_value_head_on_resume:
             try:
                 head_layers = agent.reset_iqn_heads(sync_target=True)
+                preserved = "encoder, aux head, and trainer counters"
+                if not reset_buffer_on_resume:
+                    preserved += "; replay buffer preserved"
                 logger.info(
                     "Reset IQN value/advantage/tau heads on resume: %d online head submodule(s) "
-                    "re-initialized; encoder, aux head, buffer, and trainer counters preserved.",
+                    "re-initialized; %s preserved.",
                     head_layers,
+                    preserved,
                 )
             except Exception as exc:
                 msg = f"--resume --reset-value-head-on-resume: reset_iqn_heads failed with {type(exc).__name__}: {exc}"
@@ -753,6 +800,7 @@ def run_training(
             start_total_steps=start_total_steps,
             initial_best_score=initial_best_score,
             initial_early_stopping_counter=initial_early_stopping_counter,
+            initial_checkpoint_pin_best_metric=initial_checkpoint_pin_best_metric,
             specific_file=specific_file,
             # Other params like validation_freq, gamma, batch_size etc. are now taken from config inside trainer
         )
@@ -816,8 +864,28 @@ def main():  # Remove default config_path
         action="store_true",
         help=(
             "When resuming, re-initialize IQN tau_embedding + dueling heads (fresh critic scale) while "
-            "keeping the Transformer encoder, aux head, replay buffer, and episode counters. "
+            "keeping the Transformer encoder, aux head, and episode counters. "
             "Also discards optimizer/scheduler state so Adam moments match the new head weights."
+        ),
+    )
+    parser.add_argument(
+        "--reset-buffer-on-resume",
+        action="store_true",
+        help=(
+            "When resuming, skip restoring the replay buffer side-car / legacy buffer_state and start "
+            "with an empty PER buffer (fresh priorities). Use with --reset-value-head-on-resume after "
+            "critic blow-up. Also discards optimizer/scheduler state. Encoder and episode counters "
+            "are still restored from the checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--clamp-priorities-on-resume",
+        action="store_true",
+        help=(
+            "After restoring the replay buffer on resume, clamp every SumTree leaf priority to the "
+            "configured per_priority_cap. Use this when resuming on top of a checkpoint whose buffer "
+            "carries pre-cap priority spikes (the load path also auto-clamps, but this makes the "
+            "scrub explicit in the log and runs even if the auto-clamp condition is not met)."
         ),
     )
     parser.add_argument(
@@ -863,6 +931,8 @@ def main():  # Remove default config_path
     reset_lr_on_resume = args.reset_lr_on_resume
     reset_noisy_on_resume = args.reset_noisy_on_resume
     reset_value_head_on_resume = args.reset_value_head_on_resume
+    reset_buffer_on_resume = args.reset_buffer_on_resume
+    clamp_priorities_on_resume = args.clamp_priorities_on_resume
     noisy_sigma_init = args.noisy_sigma_init
     benchmark_frac_override = args.benchmark_frac_override
     eval_stochastic_flag = args.eval_stochastic
@@ -934,6 +1004,8 @@ def main():  # Remove default config_path
             reset_lr_on_resume=reset_lr_on_resume,
             reset_noisy_on_resume=reset_noisy_on_resume,
             reset_value_head_on_resume=reset_value_head_on_resume,
+            reset_buffer_on_resume=reset_buffer_on_resume,
+            clamp_priorities_on_resume=clamp_priorities_on_resume,
             noisy_sigma_init=noisy_sigma_init,
             benchmark_frac_override=benchmark_frac_override,
             skip_archive_on_fresh_start=args.skip_archive_on_fresh_start,

@@ -73,50 +73,55 @@ def find_latest_checkpoint(model_dir: str = "models", model_prefix: str = "check
     """
     import re
 
-    # First try to find the latest checkpoint with the new naming pattern
-    # Look for files matching the pattern: checkpoint_trainer_latest_YYYYMMDD_epXXX_rewardX.XXXX.pt
-    pattern = os.path.join(model_dir, f"{model_prefix}_latest_*_ep*_reward*.pt")
-    matching_files = glob.glob(pattern)
-
-    if matching_files:
-        # Extract episode numbers from filenames and find the one with highest episode
-        episode_files = []
-        for file_path in matching_files:
-            filename = os.path.basename(file_path)
-            # Match pattern: checkpoint_trainer_latest_YYYYMMDD_ep{episode}_reward{reward}.pt
-            match = re.search(r"_ep(\d+)_", filename)
+    # Episode-tagged checkpoints: latest (rotation), top-K ring, peak stream, and
+    # dated best_* saves. ``--resume`` must be able to warm-start from a pinned
+    # topk file when that is the only artifact left in model_dir.
+    episode_globs = (
+        f"{model_prefix}_latest_*_ep*_reward*.pt",
+        f"{model_prefix}_topk_*_ep*_score_*.pt",
+        f"{model_prefix}_peak_*_ep*_score_*.pt",
+        f"{model_prefix}_best_*_ep*_score_*.pt",
+    )
+    episode_files: list[tuple[int, str]] = []
+    seen_paths: set[str] = set()
+    for glob_pattern in episode_globs:
+        for file_path in glob.glob(os.path.join(model_dir, glob_pattern)):
+            resolved = os.path.abspath(file_path)
+            if resolved in seen_paths:
+                continue
+            seen_paths.add(resolved)
+            match = re.search(r"_ep(\d+)_", os.path.basename(file_path))
             if match:
-                episode_num = int(match.group(1))
-                episode_files.append((episode_num, file_path))
+                episode_files.append((int(match.group(1)), file_path))
 
-        if episode_files:
-            # Sort by episode number (highest first) and walk down until we find
-            # a candidate that passes the usability probe. Interrupted saves
-            # (zero-byte stubs OR truncated ZIPs missing the central directory)
-            # would otherwise get returned here, then blow up in torch.load and
-            # -- via the new ResumeFailedError gate in run_training.py -- abort
-            # the run. Falling back to the next-oldest complete file keeps
-            # ``--resume`` working unattended across OOM-during-save events.
-            episode_files.sort(key=lambda x: x[0], reverse=True)
-            for episode_num, file_path in episode_files:
-                usable, reason = _probe_checkpoint_usable(file_path)
-                if not usable:
-                    logger.warning(
-                        "Skipping checkpoint %s (ep%d): %s. Trying next-oldest.",
-                        file_path,
-                        episode_num,
-                        reason,
-                    )
-                    continue
-                logger.info(f"Found latest checkpoint (episode {episode_num}): {file_path}")
-                return file_path
-            logger.warning(
-                "All %d candidate checkpoints under %s/%s_latest_*_ep*_reward*.pt failed the "
-                "usability probe (empty, truncated, or unreadable).",
-                len(episode_files),
-                model_dir,
-                model_prefix,
-            )
+    if episode_files:
+        # Sort by episode number (highest first) and walk down until we find
+        # a candidate that passes the usability probe. Interrupted saves
+        # (zero-byte stubs OR truncated ZIPs missing the central directory)
+        # would otherwise get returned here, then blow up in torch.load and
+        # -- via the new ResumeFailedError gate in run_training.py -- abort
+        # the run. Falling back to the next-oldest complete file keeps
+        # ``--resume`` working unattended across OOM-during-save events.
+        episode_files.sort(key=lambda x: x[0], reverse=True)
+        for episode_num, file_path in episode_files:
+            usable, reason = _probe_checkpoint_usable(file_path)
+            if not usable:
+                logger.warning(
+                    "Skipping checkpoint %s (ep%d): %s. Trying next-oldest.",
+                    file_path,
+                    episode_num,
+                    reason,
+                )
+                continue
+            logger.info(f"Found latest checkpoint (episode {episode_num}): {file_path}")
+            return file_path
+        logger.warning(
+            "All %d episode-tagged checkpoints under %s/%s_* failed the "
+            "usability probe (empty, truncated, or unreadable).",
+            len(episode_files),
+            model_dir,
+            model_prefix,
+        )
 
     # Fallback to old naming pattern
     latest_path = os.path.join(model_dir, f"{model_prefix}_latest.pt")

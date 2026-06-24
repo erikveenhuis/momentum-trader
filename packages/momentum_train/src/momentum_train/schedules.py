@@ -55,3 +55,41 @@ def compute_benchmark_frac(
     if interpolated > hi:
         return hi
     return interpolated
+
+
+def compute_curriculum_sampling(
+    episode: int,
+    num_episodes: int,
+    *,
+    mode: str,
+    start_frac: float,
+    end_frac: float,
+    recent_frac: float,
+) -> tuple[float, bool]:
+    """Return ``(pool_frac, sample_from_recent)`` for training file selection.
+
+    Modes (``trainer.curriculum_mode`` in ``training_config.yaml``):
+
+    * ``flat`` — uniform random over **all** training files every episode.
+    * ``linear_chronological`` — legacy ramp: earliest ``start_frac`` of files
+      at episode 0, expanding linearly to ``end_frac`` by the final episode.
+    * ``recent`` — uniform random over the newest ``recent_frac`` of files
+      (chronological sort); useful when val/test are recent months.
+    """
+    mode_norm = str(mode).strip().lower()
+    if mode_norm == "flat":
+        return 1.0, False
+    if mode_norm == "recent":
+        frac = min(max(float(recent_frac), 0.0), 1.0)
+        return frac, True
+    if mode_norm == "linear_chronological":
+        start_f = float(start_frac)
+        end_f = float(end_frac)
+        ep_denom = max(int(num_episodes), 1)
+        ep = max(0, int(episode))
+        interpolated = start_f + (end_f - start_f) * (ep / ep_denom)
+        lo = min(start_f, end_f)
+        hi = max(start_f, end_f)
+        pool_frac = min(max(interpolated, lo), hi)
+        return min(max(pool_frac, 0.0), 1.0), False
+    raise ValueError(f"Unknown curriculum_mode {mode!r}; expected flat, linear_chronological, or recent.")

@@ -51,6 +51,7 @@ def _make_dummy_agent(
     munchausen_alpha: float,
     munchausen_entropy_tau: float,
     munchausen_log_pi_clip: float = -1.0,
+    iqn_bootstrap_mode: str = "soft",
 ):
     """Build an in-memory pseudo-agent suitable for calling
     ``RainbowDQNAgent._compute_iqn_target_quantiles`` as an unbound method.
@@ -80,6 +81,7 @@ def _make_dummy_agent(
     agent.munchausen_alpha = munchausen_alpha
     agent.munchausen_entropy_tau = munchausen_entropy_tau
     agent.munchausen_log_pi_clip = munchausen_log_pi_clip
+    agent.iqn_bootstrap_mode = iqn_bootstrap_mode
     return agent
 
 
@@ -258,7 +260,7 @@ def test_munchausen_uses_only_target_network_logits(iqn_config):
     online net to assert if it gets called.
     """
     cfg = dict(iqn_config)
-    agent = _make_dummy_agent(cfg, munchausen_alpha=0.9, munchausen_entropy_tau=0.03)
+    agent = _make_dummy_agent(cfg, munchausen_alpha=0.9, munchausen_entropy_tau=0.03, iqn_bootstrap_mode="soft")
     batch = 2
     market = torch.zeros(batch, cfg["window_size"], cfg["n_features"])
     account = torch.zeros(batch, 5)

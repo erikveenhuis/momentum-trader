@@ -29,12 +29,14 @@ class _Optim:
         return {"o": 0}
 
 
-def _make_trainer(tmp_path: Path, *, top_k: int, min_eps: int = 0) -> RainbowTrainerModule:
+def _make_trainer(tmp_path: Path, *, top_k: int, min_pin: int = 0, min_eps: int = 0) -> RainbowTrainerModule:
     """Build a minimal trainer wired for ``_save_checkpoint`` + topk ring."""
     trainer = RainbowTrainerModule.__new__(RainbowTrainerModule)
     trainer.best_validation_metric = 0.5
+    trainer.checkpoint_pin_best_metric = 0.5
     trainer.early_stopping_counter = 0
     trainer.min_episodes_before_early_stopping = min_eps
+    trainer.min_episodes_before_checkpoint_pinning = min_pin
     trainer.top_k_best_checkpoints = top_k
     trainer._checkpoints_saved_this_run = 0
     trainer.writer = None
@@ -83,9 +85,9 @@ def test_topk_save_skips_non_finite_score(tmp_path):
 
 @pytest.mark.unit
 def test_topk_save_respects_min_episodes_gate(tmp_path):
-    """Until the ``min_episodes_before_early_stopping`` gate has been crossed
+    """Until the ``min_episodes_before_checkpoint_pinning`` gate has been crossed
     the ring must defer (mirrors the threshold-gated ``best_*`` eligibility)."""
-    trainer = _make_trainer(tmp_path, top_k=3, min_eps=5000)
+    trainer = _make_trainer(tmp_path, top_k=3, min_pin=5000, min_eps=15000)
     saved = trainer._maybe_save_topk_checkpoint(episode=4999, total_steps=1, validation_score=0.99)
     assert saved is None
     assert _topk_files(tmp_path) == []
@@ -93,6 +95,30 @@ def test_topk_save_respects_min_episodes_gate(tmp_path):
     saved = trainer._maybe_save_topk_checkpoint(episode=5000, total_steps=1, validation_score=0.99)
     assert saved is not None
     assert len(_topk_files(tmp_path)) == 1
+
+
+@pytest.mark.unit
+def test_topk_skips_flat_benchmark_validation(tmp_path):
+    """High score + ~0% return must not enter the ring when the filter is on."""
+    trainer = _make_trainer(tmp_path, top_k=3)
+    trainer.top_k_skip_flat_benchmark = True
+    trainer.top_k_flat_score_threshold = 0.585
+    trainer.top_k_flat_max_abs_return_pct = 2.0
+    saved = trainer._maybe_save_topk_checkpoint(
+        episode=100,
+        total_steps=100,
+        validation_score=0.5961,
+        validation_metrics={"total_return": -0.4},
+    )
+    assert saved is None
+    assert _topk_files(tmp_path) == []
+    saved = trainer._maybe_save_topk_checkpoint(
+        episode=200,
+        total_steps=200,
+        validation_score=0.5403,
+        validation_metrics={"total_return": -3.3},
+    )
+    assert saved is not None
 
 
 @pytest.mark.unit

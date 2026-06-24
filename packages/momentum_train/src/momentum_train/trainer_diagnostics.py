@@ -78,7 +78,8 @@ class DiagnosticsMixin:
 
         logger.info(
             "PER Stats @ env step %s (learner %s): buffer=%s/%s (%.2f%%), alpha=%.3f, beta=%.3f, "
-            "beta_progress=%.1f%%, avg_priority=%.6f, max_priority=%.6f, total_priority=%.6f",
+            "beta_progress=%.1f%%, avg_priority=%.6f, max_priority=%.6f, total_priority=%.6f, "
+            "priority_cap=%.3f, clip_rate=%.4f, tree_p95=%.6f",
             total_train_steps,
             stats.get("total_steps", -1),
             stats.get("size", 0),
@@ -90,6 +91,9 @@ class DiagnosticsMixin:
             stats.get("avg_priority", 0.0),
             stats.get("max_priority", 0.0),
             stats.get("total_priority", 0.0),
+            stats.get("priority_cap", 0.0),
+            stats.get("priority_clip_rate", 0.0),
+            stats.get("tree_priority_p95", 0.0),
         )
 
         # Tier 1d: mirror PER stats to TensorBoard so beta/alpha/fill/avg/max priority are
@@ -105,6 +109,30 @@ class DiagnosticsMixin:
                 self.writer.add_scalar("Train/PER/Alpha", float(stats.get("alpha", 0.0)), step)
                 self.writer.add_scalar("Train/PER/Fill", float(stats.get("fill_ratio", 0.0)), step)
                 self.writer.add_scalar("Train/PER/Size", float(stats.get("size", 0)), step)
+                # PER priority hygiene scalars (added with the cap/clip fix
+                # on 2026-05-22). NewTransitionPriority and PriorityCap are
+                # config-constant; PriorityClipRate and TreePriorityP95 are
+                # the actual diagnostics that move during a run.
+                self.writer.add_scalar(
+                    "Train/PER/NewTransitionPriority",
+                    float(stats.get("new_transition_priority", 0.0)),
+                    step,
+                )
+                self.writer.add_scalar(
+                    "Train/PER/PriorityCap",
+                    float(stats.get("priority_cap", 0.0)),
+                    step,
+                )
+                self.writer.add_scalar(
+                    "Train/PER/PriorityClipRate",
+                    float(stats.get("priority_clip_rate", 0.0)),
+                    step,
+                )
+                self.writer.add_scalar(
+                    "Train/PER/TreePriorityP95",
+                    float(stats.get("tree_priority_p95", 0.0)),
+                    step,
+                )
             except (OSError, RuntimeError, ValueError) as exc:  # pragma: no cover - defensive
                 logger.debug("Failed to mirror PER stats to TensorBoard: %s", exc)
 
@@ -145,7 +173,7 @@ class DiagnosticsMixin:
         try:
             gamma = float(self.agent_config.get("gamma", 0.99))
             n_steps = int(self.agent_config.get("n_steps", 1))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             gamma, n_steps = 0.99, 1
         if n_steps <= 0:
             return
@@ -310,7 +338,7 @@ class DiagnosticsMixin:
 
         try:
             threshold_episode = int(total_episodes * self.final_phase_lr_start_frac)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             logger.warning(
                 "Invalid final-phase LR start fraction %s; skipping final-phase decay.",
                 self.final_phase_lr_start_frac,
@@ -334,7 +362,7 @@ class DiagnosticsMixin:
         if isinstance(scheduler_params, dict) and "min_lr" in scheduler_params:
             try:
                 min_lr = float(scheduler_params["min_lr"])
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 logger.warning(
                     "Invalid min_lr value %s; ignoring min_lr constraint for final-phase decay.",
                     scheduler_params["min_lr"],
@@ -395,7 +423,7 @@ class DiagnosticsMixin:
             try:
                 fv = float(val)
                 fr = float(ref)
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 continue
             if math.isnan(fv) or math.isinf(fv) or math.isnan(fr) or math.isinf(fr):
                 continue
@@ -615,7 +643,7 @@ class DiagnosticsMixin:
                 # are throttled to ~5x slower.
                 try:
                     outlier_stats = tracker.get_reward_outlier_stats(self.reward_clip_value)
-                except (ValueError, KeyError, AttributeError, TypeError):  # pragma: no cover - defensive
+                except ValueError, KeyError, AttributeError, TypeError:  # pragma: no cover - defensive
                     logger.debug("Failed to compute Tier 4b reward outlier stats", exc_info=True)
                     outlier_stats = {}
                 if outlier_stats:
@@ -630,7 +658,7 @@ class DiagnosticsMixin:
                 # can read off "is action 5 actually pulling its weight?".
                 try:
                     by_action = tracker.get_reward_by_action_stats()
-                except (ValueError, KeyError, AttributeError, TypeError):  # pragma: no cover - defensive
+                except ValueError, KeyError, AttributeError, TypeError:  # pragma: no cover - defensive
                     logger.debug("Failed to compute Tier 4c reward-by-action stats", exc_info=True)
                     by_action = {}
                 for k in range(int(getattr(self.agent, "num_actions", 6))):

@@ -80,12 +80,17 @@ def test_trainer_config_missing_key_raises_keyerror():
         "reward_window": 5,
         "early_stopping_patience": 10,
         "min_episodes_before_early_stopping": 0,
+        "min_episodes_before_checkpoint_pinning": 0,
         "min_validation_threshold": 0.0,
         "benchmark_allocation_frac_start": 0.5,
         "benchmark_allocation_frac_end": 0.1,
         "benchmark_allocation_frac_anneal_episodes": 100,
         "final_phase_lr_start_frac": 0.8,
         "final_phase_lr_multiplier": 0.3,
+        "curriculum_mode": "flat",
+        "curriculum_start_frac": 0.3,
+        "curriculum_end_frac": 1.0,
+        "curriculum_recent_frac": 0.25,
     }
     # Complete dict: succeeds.
     TrainerConfig.from_dict(raw)
@@ -114,6 +119,7 @@ def test_agent_config_range_checks_polyak_tau():
         "munchausen_alpha": 0.9,
         "munchausen_entropy_tau": 0.03,
         "munchausen_log_pi_clip": -1.0,
+        "iqn_bootstrap_mode": "soft",
         "spectral_norm_enabled": False,
         "num_actions": 6,
         "window_size": 10,
@@ -123,6 +129,8 @@ def test_agent_config_range_checks_polyak_tau():
         "alpha": 0.6,
         "beta_start": 0.4,
         "beta_frames": 100,
+        "per_new_transition_priority": 1.0,
+        "per_priority_cap": 50.0,
         "grad_clip_norm": 1.0,
         "epsilon_start": 0.3,
         "epsilon_end": 0.05,
@@ -153,6 +161,96 @@ def test_agent_config_range_checks_polyak_tau():
 
     raw["polyak_tau"] = 0.005
     AgentConfig.from_dict(raw)  # succeeds
+
+
+def test_agent_config_rejects_negative_new_transition_priority():
+    """``per_new_transition_priority`` must be > 0 (it seeds the SumTree)."""
+    raw = _minimal_agent_dict()
+    raw["per_new_transition_priority"] = 0.0
+    with pytest.raises(ValueError, match="per_new_transition_priority"):
+        AgentConfig.from_dict(raw)
+
+
+def test_agent_config_rejects_cap_below_seed():
+    """``per_priority_cap`` must be >= ``per_new_transition_priority``."""
+    raw = _minimal_agent_dict()
+    raw["per_new_transition_priority"] = 10.0
+    raw["per_priority_cap"] = 5.0
+    with pytest.raises(ValueError, match="per_priority_cap"):
+        AgentConfig.from_dict(raw)
+
+
+def test_agent_config_rejects_invalid_bootstrap_mode():
+    """``iqn_bootstrap_mode`` must be ``soft``, ``greedy``, or ``double``."""
+    raw = _minimal_agent_dict()
+    raw["iqn_bootstrap_mode"] = "double_dqn"
+    with pytest.raises(ValueError, match="iqn_bootstrap_mode"):
+        AgentConfig.from_dict(raw)
+
+
+def test_agent_config_accepts_double_bootstrap_mode():
+    """``double`` is a valid IQN bootstrap mode."""
+    raw = _minimal_agent_dict()
+    raw["iqn_bootstrap_mode"] = "double"
+    cfg = AgentConfig.from_dict(raw)
+    assert cfg.iqn_bootstrap_mode == "double"
+
+
+def _minimal_agent_dict() -> dict:
+    """Minimal-but-complete AgentConfig dict, used by validation-failure tests."""
+    return {
+        "seed": 1,
+        "gamma": 0.99,
+        "lr": 1e-4,
+        "batch_size": 4,
+        "target_update_freq": 5,
+        "polyak_tau": 0.005,
+        "n_steps": 1,
+        "n_quantiles_online": 16,
+        "n_quantiles_target": 16,
+        "n_quantiles_policy": 8,
+        "quantile_embedding_dim": 16,
+        "huber_kappa": 1.0,
+        "munchausen_alpha": 0.9,
+        "munchausen_entropy_tau": 0.03,
+        "munchausen_log_pi_clip": -1.0,
+        "iqn_bootstrap_mode": "soft",
+        "spectral_norm_enabled": False,
+        "num_actions": 6,
+        "window_size": 10,
+        "n_features": 12,
+        "hidden_dim": 64,
+        "replay_buffer_size": 1000,
+        "alpha": 0.6,
+        "beta_start": 0.4,
+        "beta_frames": 100,
+        "per_new_transition_priority": 1.0,
+        "per_priority_cap": 50.0,
+        "grad_clip_norm": 1.0,
+        "epsilon_start": 0.3,
+        "epsilon_end": 0.05,
+        "epsilon_decay_steps": 1000,
+        "entropy_coeff": 0.0,
+        "store_partial_n_step": False,
+        "debug": False,
+        "quantile_logging_interval": 100,
+        "quantile_logging_percentiles": [5, 50, 95],
+        "noisy_sigma_logging_interval": 0,
+        "q_value_logging_interval": 0,
+        "q_value_histogram_interval": 0,
+        "grad_logging_interval": 0,
+        "target_net_logging_interval": 0,
+        "td_error_logging_interval": 0,
+        "nhead": 2,
+        "num_encoder_layers": 1,
+        "dim_feedforward": 128,
+        "transformer_dropout": 0.1,
+        "lr_scheduler_enabled": False,
+        "lr_scheduler_type": "StepLR",
+        "lr_scheduler_params": {},
+        "aux_loss_weight": 0.1,
+        "aux_target_feature_index": 6,
+    }
 
 
 def test_trainer_config_rejects_non_dict():

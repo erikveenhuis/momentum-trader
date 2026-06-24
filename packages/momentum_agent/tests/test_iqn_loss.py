@@ -150,6 +150,7 @@ def test_compute_iqn_target_with_munchausen_disabled_matches_reward_when_termina
         munchausen_alpha = 0.0
         munchausen_entropy_tau = 0.03
         munchausen_log_pi_clip = -1.0
+        iqn_bootstrap_mode = "soft"
 
     bound_method = RainbowDQNAgent._compute_iqn_target_quantiles
     agent = _DummyAgent()

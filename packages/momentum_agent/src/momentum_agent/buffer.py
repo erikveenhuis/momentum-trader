@@ -100,7 +100,23 @@ class SumTree:
 class PrioritizedReplayBuffer:
     """SumTree-backed prioritized experience replay buffer with importance-sampling weight annealing."""
 
-    def __init__(self, capacity, alpha=0.6, beta_start=0.4, beta_frames=100000, *, debug: bool = False):
+    def __init__(
+        self,
+        capacity,
+        alpha=0.6,
+        beta_start=0.4,
+        beta_frames=100000,
+        *,
+        new_transition_priority: float = 1.0,
+        priority_cap: float = float("inf"),
+        debug: bool = False,
+    ):
+        if new_transition_priority <= 0:
+            raise ValueError(f"new_transition_priority must be > 0, got {new_transition_priority}")
+        if priority_cap < new_transition_priority:
+            raise ValueError(
+                f"priority_cap ({priority_cap}) must be >= new_transition_priority ({new_transition_priority})"
+            )
         self.epsilon = 1e-5  # Small constant to ensure non-zero priority
         self.capacity = capacity
         self.alpha = alpha  # Priority exponent
@@ -112,6 +128,18 @@ class PrioritizedReplayBuffer:
         self.max_priority = 1.0  # Track max priority efficiently
         self.buffer_write_idx = 0  # Tracks current write position in self.buffer
         self.debug = debug
+        # PER hygiene knobs (see config_schema.py for rationale).
+        # ``new_transition_priority`` is what fresh ``store()`` calls insert
+        # into the SumTree; it is decoupled from ``max_priority`` so a
+        # one-off TD spike cannot poison every new transition. ``priority_cap``
+        # clips ``update_priorities`` outputs and is the ceiling enforced by
+        # ``clamp_tree_priorities`` after a sidecar load.
+        self.new_transition_priority = float(new_transition_priority)
+        self.priority_cap = float(priority_cap)
+        # Rolling counters mirrored to TensorBoard for diagnostics.
+        self.store_count: int = 0
+        self.update_priority_count: int = 0
+        self.update_priority_clip_count: int = 0
 
     def update_beta(self, total_steps: int):
         """Updates the beta value based on the total training steps."""
@@ -121,11 +149,15 @@ class PrioritizedReplayBuffer:
         )
 
     def store(self, *args):
-        """Stores experience and assigns max priority."""
+        """Stores experience at the configured new-transition priority.
+
+        Decoupled from ``self.max_priority`` (which only ever climbs) so a
+        single historical TD spike cannot lock every new write at a poison
+        priority. The first ``update_priorities`` call after the transition
+        is sampled will replace this seed with its own ``(|TD|+eps)^alpha``.
+        """
         experience = Experience(*args)
-        priority = self.max_priority  # Already tracked in alpha-space
-        if priority <= 0:
-            priority = 1.0
+        priority = self.new_transition_priority
 
         # Add experience to buffer deque
         if len(self.buffer) < self.capacity:
@@ -136,6 +168,7 @@ class PrioritizedReplayBuffer:
         self.tree.add(priority, self.buffer_write_idx)
         # Increment buffer write index
         self.buffer_write_idx = (self.buffer_write_idx + 1) % self.capacity
+        self.store_count += 1
 
     def sample(self, batch_size):
         """Samples batch, calculates IS weights."""
@@ -240,6 +273,17 @@ class PrioritizedReplayBuffer:
         if self.debug and np.any(new_priorities <= 0):
             raise ValueError(f"New priority calculated is non-positive: min={new_priorities.min()}")
 
+        # Clip in alpha-space so a single huge-|TD| sample cannot dominate
+        # the SumTree (and via PER, the next thousand batches). Counters
+        # mirror this to TensorBoard for visibility.
+        n = int(len(new_priorities))
+        self.update_priority_count += n
+        clipped_mask = new_priorities > self.priority_cap
+        clipped_count = int(np.count_nonzero(clipped_mask))
+        if clipped_count > 0:
+            new_priorities = np.minimum(new_priorities, self.priority_cap)
+            self.update_priority_clip_count += clipped_count
+
         # Update priorities in the deque
         for tree_idx, priority in zip(tree_indices, new_priorities, strict=False):
             if priority <= 0:
@@ -248,10 +292,49 @@ class PrioritizedReplayBuffer:
                 priority = self.epsilon
             self.tree.update(tree_idx, priority)
 
-        # Calculate max priority in the current batch and update overall max
+        # Calculate max priority in the current batch and update overall max.
+        # ``priority_cap`` already clamps ``new_priorities`` so ``max_priority``
+        # tracks an honest, bounded ceiling.
         if len(new_priorities) > 0:
-            batch_max_prio = np.max(new_priorities)
-            self.max_priority = max(self.max_priority, batch_max_prio)
+            batch_max_prio = float(np.max(new_priorities))
+            self.max_priority = min(max(self.max_priority, batch_max_prio), self.priority_cap)
+
+    def clamp_tree_priorities(self, cap: float | None = None) -> int:
+        """Clamp every leaf priority in the SumTree to ``cap`` (default ``self.priority_cap``).
+
+        Used after sidecar restore to scrub poisoned high-priority leaves
+        from a prior run. Rebuilds the SumTree internal nodes bottom-up in
+        a single O(capacity) pass so ``tree.total()`` stays consistent.
+
+        Returns the number of leaves that exceeded the cap and were clamped.
+        """
+        effective_cap = float(self.priority_cap if cap is None else cap)
+        if not np.isfinite(effective_cap) or effective_cap <= 0:
+            return 0
+
+        cap_count = int(self.capacity)
+        leaves = self.tree.tree[cap_count - 1 :]
+        over = leaves > effective_cap
+        clipped = int(np.count_nonzero(over))
+        if clipped == 0:
+            # Still pull max_priority down to the new ceiling.
+            self.max_priority = min(self.max_priority, effective_cap)
+            return 0
+
+        leaves[over] = effective_cap
+        self.tree.tree[cap_count - 1 :] = leaves
+
+        # Rebuild internal nodes bottom-up. For a sumtree of size
+        # ``2 * capacity - 1`` the internal range is ``[0, capacity - 1)``.
+        tree_arr = self.tree.tree
+        for idx in range(cap_count - 2, -1, -1):
+            left = 2 * idx + 1
+            right = left + 1
+            tree_arr[idx] = tree_arr[left] + tree_arr[right]
+
+        leaf_max = float(leaves.max()) if leaves.size > 0 else 0.0
+        self.max_priority = min(self.max_priority, effective_cap, max(1.0, leaf_max))
+        return clipped
 
     def state_dict(self):
         """Returns the state of the buffer for saving."""
@@ -271,6 +354,8 @@ class PrioritizedReplayBuffer:
             "beta_frames": self.beta_frames,
             "epsilon": self.epsilon,
             "capacity": self.capacity,
+            "new_transition_priority": self.new_transition_priority,
+            "priority_cap": self.priority_cap,
         }
 
     def load_state_dict(self, state_dict):
@@ -319,6 +404,24 @@ class PrioritizedReplayBuffer:
         self.epsilon = state_dict["epsilon"]
         # self.capacity is checked above
 
+        # PER hygiene fields in the saved state_dict are informational only:
+        # the live ctor (driven by current YAML) is authoritative, matching
+        # how ``alpha`` is re-synced from config on resume. The auto-clamp
+        # below scrubs any leaves that exceed the live ``priority_cap``.
+
+        # Auto-clamp poisoned leaves from a pre-cap run on the way in. We
+        # log how many leaves were clamped so the operator can confirm the
+        # rescue actually fired (and how aggressive it was).
+        leaves_clamped = self.clamp_tree_priorities()
+        if leaves_clamped > 0:
+            logger.warning(
+                "PER buffer load: clamped %d/%d SumTree leaves to priority_cap=%g (prior max_priority=%g)",
+                leaves_clamped,
+                int(self.capacity),
+                self.priority_cap,
+                float(state_dict["max_priority"]),
+            )
+
         # Sanity check after loading
         if self.debug and len(self.buffer) != self.tree.size:
             raise ValueError("Buffer deque length doesn't match SumTree size after load")
@@ -326,6 +429,14 @@ class PrioritizedReplayBuffer:
     def __len__(self):
         # Return the current fill size of the buffer/tree
         return self.tree.size
+
+    def clear(self) -> None:
+        """Drop all transitions and reset PER metadata to a fresh buffer."""
+        self.buffer.clear()
+        self.tree = SumTree(self.capacity, debug=self.debug)
+        self.buffer_write_idx = 0
+        self.max_priority = 1.0
+        self.beta = self.beta_start
 
     # --- Start: Side-car persistence (memmap-based, O(1) peak RAM) ---
     #
@@ -352,7 +463,12 @@ class PrioritizedReplayBuffer:
     # directory -- a resume that finds the directory without this marker
     # treats the side-car as truncated (mirror of
     # ``_probe_checkpoint_usable`` for torch.save files).
-    _SIDECAR_FORMAT_VERSION = 1
+    # v1: original layout.
+    # v2: adds ``new_transition_priority`` and ``priority_cap`` to ``meta.json``
+    #     (introduced 2026-05-22 alongside PER priority hygiene). v1 files
+    #     load successfully; the loader auto-clamps any leaves that exceed
+    #     the live buffer's ``priority_cap``.
+    _SIDECAR_FORMAT_VERSION = 2
 
     def save_to_path(self, buffer_dir: Path | str) -> Path:
         """Persist the replay buffer to ``buffer_dir`` as per-field ``.npy`` memmaps.
@@ -458,6 +574,8 @@ class PrioritizedReplayBuffer:
             "beta_frames": int(self.beta_frames),
             "epsilon": float(self.epsilon),
             "capacity": int(self.capacity),
+            "new_transition_priority": float(self.new_transition_priority),
+            "priority_cap": float(self.priority_cap),
         }
         (buffer_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
@@ -540,6 +658,26 @@ class PrioritizedReplayBuffer:
         self.beta_start = float(meta["beta_start"])
         self.beta_frames = int(meta["beta_frames"])
         self.epsilon = float(meta["epsilon"])
+
+        # PER hygiene fields in the side-car ``meta.json`` are informational
+        # only (forensics + sidecar inspection scripts); the live ctor values
+        # supplied by ``agent.per_priority_cap`` are authoritative on resume.
+        # This mirrors the ``alpha`` re-sync in run_training.py — YAML is the
+        # source of truth, persisted values are diagnostic.
+        format_version = int(meta.get("format_version", 1))
+
+        leaves_clamped = self.clamp_tree_priorities()
+        if leaves_clamped > 0:
+            logger.warning(
+                "PER side-car load (format_version=%d, dir=%s): clamped %d/%d SumTree "
+                "leaves to priority_cap=%g (prior max_priority=%g)",
+                format_version,
+                buffer_dir,
+                leaves_clamped,
+                int(self.capacity),
+                self.priority_cap,
+                float(meta["max_priority"]),
+            )
 
         if self.debug and len(self.buffer) != self.tree.size:
             raise ValueError("Buffer deque length doesn't match SumTree size after side-car load")

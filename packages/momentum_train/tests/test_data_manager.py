@@ -51,7 +51,7 @@ def test_data_manager_csv_fallback(tmp_path, monkeypatch):
 
 
 @pytest.mark.unit
-def test_data_manager_curriculum_frac(tmp_path, monkeypatch):
+def test_data_manager_curriculum_frac_earliest_pool(tmp_path, monkeypatch):
     processed_dir = tmp_path / "processed"
     for i in range(10):
         _write_npz(processed_dir / "train", f"2024-01-{i + 1:02d}_BTC-USD.npz")
@@ -64,6 +64,22 @@ def test_data_manager_curriculum_frac(tmp_path, monkeypatch):
     monkeypatch.setattr(random, "choice", lambda seq: seq[0])
     result = dm.get_random_training_file(curriculum_frac=0.3)
     assert result in dm.get_training_files()[:3]
+
+
+@pytest.mark.unit
+def test_data_manager_curriculum_frac_recent_pool(tmp_path, monkeypatch):
+    processed_dir = tmp_path / "processed"
+    for i in range(10):
+        _write_npz(processed_dir / "train", f"2024-01-{i + 1:02d}_BTC-USD.npz")
+    _write_npz(processed_dir / "validation", "2024-06-01_ETH-USD.npz")
+    _write_npz(processed_dir / "test", "2025-01-01_BTC-USD.npz")
+
+    dm = DataManager(base_dir=tmp_path, processed_dir_name="processed")
+    dm.organize_data()
+
+    monkeypatch.setattr(random, "choice", lambda seq: seq[0])
+    result = dm.get_random_training_file(curriculum_frac=0.3, sample_from_recent=True)
+    assert result in dm.get_training_files()[-3:]
 
 
 @pytest.mark.unit

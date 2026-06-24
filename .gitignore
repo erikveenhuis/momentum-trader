@@ -56,6 +56,8 @@ data/
 models/
 results/
 checkpoints/
+*.pt
+*archive*
 
 # Cache
 .ruff_cache/
@@ -66,6 +68,3 @@ checkpoints/
 
 # Lock files
 momentum_trading.lock
-
-# Legacy (optional - remove when confident)
-# legacy_src_backup/

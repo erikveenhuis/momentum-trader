@@ -17,9 +17,9 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "torch>=2.11.0",
-    "numpy==2.4.4",
-    "PyYAML==6.0.3",
+    "torch>=2.12.1",
+    "numpy>=2.4.6",
+    "PyYAML>=6.0.3",
     "momentum_agent==0.2.0",
     "momentum_env==0.2.0",
     "momentum-core==0.1.0",
@@ -28,16 +28,16 @@ dependencies = [
     # so even though we only use SummaryWriter we must install it here.
     # (The .tb-venv from scripts/tensorboard.sh is a *separate* install used
     # only to launch the web UI.)
-    "tensorboard==2.20.0",
+    "tensorboard>=2.20.0",
     # TensorBoard 2.20 imports pkg_resources, which was removed in setuptools>=82.
-    "setuptools<82",
+    "setuptools>=61.0,<82",
 ]
 
 [dependency-groups]
 dev = [
-    "pytest==9.0.3",
-    "pytest-cov==7.1.0",
-    "ruff",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.15.18",
 ]
 
 [tool.setuptools.packages.find]

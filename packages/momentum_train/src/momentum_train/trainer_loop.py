@@ -28,14 +28,19 @@ class LoopMixin:
     ) -> tuple[TradingEnv | None, dict | None, dict | None, PerformanceTracker | None]:
         """Sets up the environment and performance tracker for a new episode. Returns env, obs, info, tracker."""
         try:
-            curriculum_frac = min(1.0, 0.3 + 0.7 * (episode / max(num_episodes, 1)))
+            curriculum_frac, sample_from_recent = self.curriculum_sampling_params(episode, num_episodes)
             episode_file_path = (
                 Path(specific_file)
                 if specific_file
-                else self.data_manager.get_random_training_file(curriculum_frac=curriculum_frac)
+                else self.data_manager.get_random_training_file(
+                    curriculum_frac=curriculum_frac,
+                    sample_from_recent=sample_from_recent,
+                )
             )
             logger.info(
-                f"--- Starting Episode {episode + 1}/{num_episodes} using file: {episode_file_path.name} (curriculum={curriculum_frac:.2f}) ---"
+                f"--- Starting Episode {episode + 1}/{num_episodes} using file: {episode_file_path.name} "
+                f"(curriculum_mode={self._cfg.curriculum_mode}, pool_frac={curriculum_frac:.2f}, "
+                f"recent={sample_from_recent}) ---"
             )
         except Exception as e:
             logger.error(f"Error getting data file for episode {episode + 1}: {e}")
@@ -290,6 +295,8 @@ class LoopMixin:
             # Log PER statistics based on total training steps
             self._maybe_log_per_stats(total_train_steps)
 
+            self._maybe_save_emergency_checkpoint(episode, total_train_steps)
+
             # Log step progress periodically
             if steps_in_episode % self.log_freq == 0:
                 self._log_step_progress(
@@ -339,9 +346,14 @@ class LoopMixin:
         vec_env = create_vector_env(num_envs, self.env_config, self.data_manager)
 
         # Initial reset with curriculum files
-        curriculum_frac = min(1.0, 0.3 + 0.7 * (start_episode / max(num_episodes, 1)))
+        curriculum_frac, sample_from_recent = self.curriculum_sampling_params(start_episode, num_episodes)
         for i in range(num_envs):
-            path = str(self.data_manager.get_random_training_file(curriculum_frac=curriculum_frac))
+            path = str(
+                self.data_manager.get_random_training_file(
+                    curriculum_frac=curriculum_frac,
+                    sample_from_recent=sample_from_recent,
+                )
+            )
             vec_env.envs[i].reset(options={"data_path": path})
         obs, _info = vec_env.reset()
 
@@ -484,6 +496,9 @@ class LoopMixin:
                         break
                     steps_since_last_learn -= self.update_freq
 
+            checkpoint_episode = max(start_episode, completed_episodes - 1)
+            self._maybe_save_emergency_checkpoint(checkpoint_episode, total_train_steps)
+
             # Handle done envs
             if dones.any():
                 done_indices = np.where(dones)[0]
@@ -500,7 +515,9 @@ class LoopMixin:
 
                     if should_log_full:
                         avg_rw = np.mean(total_rewards[-self.reward_window :])
-                        curriculum_frac_now = min(1.0, 0.3 + 0.7 * (completed_episodes / max(num_episodes, 1)))
+                        curriculum_frac_now, _sample_from_recent = self.curriculum_sampling_params(
+                            completed_episodes, num_episodes
+                        )
 
                         act_str = " ".join(f"{k}:{v}" for k, v in sorted(ep_action_counts.items()))
                         # Rolling action distribution from recent window
@@ -731,8 +748,14 @@ class LoopMixin:
                 prev_completed_episodes = completed_episodes
 
                 # Reset done envs with new data
-                curriculum_frac = min(1.0, 0.3 + 0.7 * (completed_episodes / max(num_episodes, 1)))
-                next_obs = reset_done_envs(vec_env, dones, self.data_manager, curriculum_frac)
+                curriculum_frac, sample_from_recent = self.curriculum_sampling_params(completed_episodes, num_episodes)
+                next_obs = reset_done_envs(
+                    vec_env,
+                    dones,
+                    self.data_manager,
+                    curriculum_frac,
+                    sample_from_recent=sample_from_recent,
+                )
 
                 # Push scheduled benchmark frac into the freshly-reset envs.
                 # Anchored on ``completed_episodes`` so the schedule advances
@@ -770,6 +793,7 @@ class LoopMixin:
         start_total_steps: int,
         initial_best_score: float,
         initial_early_stopping_counter: int,
+        initial_checkpoint_pin_best_metric: float = -np.inf,
         specific_file: str | None = None,
     ):
         """Train the Rainbow DQN agent by orchestrating helper methods."""
@@ -779,6 +803,7 @@ class LoopMixin:
         assert isinstance(specific_file, (str, type(None)))
 
         self.best_validation_metric = initial_best_score
+        self.checkpoint_pin_best_metric = initial_checkpoint_pin_best_metric
         self.early_stopping_counter = initial_early_stopping_counter
         total_train_steps = start_total_steps
         self.total_train_steps = start_total_steps
@@ -787,6 +812,8 @@ class LoopMixin:
         self._abort_training = False
         self._abort_reason = None
         self._abort_step = None
+        self._emergency_checkpoint_requested = False
+        self._install_emergency_checkpoint_signal_handler()
 
         logger.info("====== STARTING/RESUMING RAINBOW DQN TRAINING ======")
         logger.info(f"Starting from Episode: {start_episode + 1}/{num_episodes}")

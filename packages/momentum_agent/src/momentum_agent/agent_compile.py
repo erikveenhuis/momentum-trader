@@ -40,6 +40,11 @@ def compile_networks_or_raise(
             "torch.compile is not available in this PyTorch version. Please upgrade to PyTorch 2.0+ for optimal performance."
         )
 
+    # PyTorch 2.12+ can raise CantSplit when compiling a second network shape
+    # in the same process (common in tests that construct multiple agents).
+    if hasattr(torch, "_dynamo"):
+        torch._dynamo.reset()
+
     logger.info("Applying torch.compile to network and target_network (REQUIRED for training).")
     compile_modes = ["default", "reduce-overhead", "max-autotune"]
 

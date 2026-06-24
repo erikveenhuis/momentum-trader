@@ -20,20 +20,20 @@ dependencies = [
     "momentum_agent==0.2.0",
     "momentum_env==0.2.0",
     "momentum-core==0.1.0",
-    "alpaca-py==0.43.3",
-    "numpy==2.4.4",
-    "pandas==3.0.2",
-    "requests==2.33.1",
+    "alpaca-py>=0.43.4",
+    "numpy>=2.4.6",
+    "pandas>=3.0.3",
+    "requests>=2.34.2",
     # alpaca-py 0.43.2 imports pytz from alpaca.data.requests but doesn't
     # declare it as a dependency. Pin it here so warmup-time imports of the
     # historical bar API don't crash with ModuleNotFoundError.
-    "pytz==2026.1.post1",
+    "pytz>=2026.2",
 ]
 
 [dependency-groups]
 dev = [
-    "pytest==9.0.3",
-    "ruff",
+    "pytest>=9.1.1",
+    "ruff>=0.15.18",
 ]
 
 [project.scripts]

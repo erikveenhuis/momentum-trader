@@ -98,12 +98,23 @@ class StubBuffer:
     def __init__(self):
         self.loaded_from_path = None
         self.loaded_from_state = None
+        self.clamp_tree_priorities_calls = 0
+        self.priority_cap = 50.0
+        self.max_priority = 1.0
 
     def load_from_path(self, path):
         self.loaded_from_path = path
 
     def load_state_dict(self, state):
         self.loaded_from_state = state
+
+    def clamp_tree_priorities(self, cap=None):
+        self.clamp_tree_priorities_calls += 1
+        return 0
+
+    def clear(self):
+        self.loaded_from_path = None
+        self.loaded_from_state = None
 
     def __len__(self):
         return 0
@@ -156,6 +167,7 @@ class StubTrainer:
         start_total_steps,
         initial_best_score,
         initial_early_stopping_counter,
+        initial_checkpoint_pin_best_metric=-float("inf"),
         specific_file=None,
     ):
         self.captured_start_total_steps = start_total_steps
@@ -694,3 +706,135 @@ def test_resume_reset_value_head_on_resume_calls_reset_and_strips_optimizer(monk
     assert agent.reset_iqn_heads_sync_target is True
     assert agent.total_steps == 400
     assert trainer.captured_start_total_steps == 1234
+
+
+@pytest.mark.unit
+def test_resume_reset_buffer_on_resume_skips_buffer_load(monkeypatch, tmp_path):
+    """``--reset-buffer-on-resume`` must not load side-car or legacy buffer_state."""
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    checkpoint_path.write_text("dummy")
+    config = _base_config(str(tmp_path))
+
+    def fake_load_checkpoint(path):
+        return {
+            "episode": 5,
+            "total_train_steps": 1234,
+            "best_validation_metric": 0.5,
+            "early_stopping_counter": 0,
+            "agent_config": config["agent"],
+            "agent_total_steps": 400,
+            "network_state_dict": {},
+            "target_network_state_dict": {},
+            "optimizer_state_dict": {"stale": True},
+            "buffer_sidecar_relpath": "checkpoint.pt.buffer",
+            "buffer_state": {"legacy-stub": True},
+        }
+
+    _apply_common_resume_monkeypatches(
+        monkeypatch,
+        tmp_path,
+        find_latest=lambda model_dir, prefix: str(checkpoint_path),
+        load_checkpoint=fake_load_checkpoint,
+    )
+
+    data_manager = make_stub_data_manager(tmp_path)
+
+    agent, trainer = run_training_module.run_training(
+        config,
+        data_manager,
+        resume_training_flag=True,
+        reset_buffer_on_resume=True,
+    )
+
+    assert isinstance(agent, StubAgent)
+    assert agent.buffer.loaded_from_path is None
+    assert agent.buffer.loaded_from_state is None
+    assert trainer.captured_start_total_steps == 1234
+
+
+@pytest.mark.unit
+def test_resume_reset_buffer_and_value_head_together(monkeypatch, tmp_path):
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    checkpoint_path.write_text("dummy")
+    config = _base_config(str(tmp_path))
+
+    def fake_load_checkpoint(path):
+        return {
+            "episode": 10303,
+            "total_train_steps": 14837760,
+            "best_validation_metric": -float("inf"),
+            "early_stopping_counter": 0,
+            "agent_config": config["agent"],
+            "agent_total_steps": 741888,
+            "network_state_dict": {},
+            "target_network_state_dict": {},
+            "optimizer_state_dict": {},
+            "buffer_sidecar_relpath": "checkpoint.pt.buffer",
+        }
+
+    _apply_common_resume_monkeypatches(
+        monkeypatch,
+        tmp_path,
+        find_latest=lambda model_dir, prefix: str(checkpoint_path),
+        load_checkpoint=fake_load_checkpoint,
+    )
+
+    data_manager = make_stub_data_manager(tmp_path)
+
+    agent, _trainer = run_training_module.run_training(
+        config,
+        data_manager,
+        resume_training_flag=True,
+        reset_value_head_on_resume=True,
+        reset_buffer_on_resume=True,
+    )
+
+    assert agent.reset_iqn_heads_called is True
+    assert agent.buffer.loaded_from_path is None
+
+
+@pytest.mark.unit
+def test_resume_clamp_priorities_on_resume_invokes_buffer_clamp(monkeypatch, tmp_path):
+    """``--clamp-priorities-on-resume`` calls ``buffer.clamp_tree_priorities`` after restore.
+
+    Smoke-test stub: the live load path already auto-clamps if leaves
+    exceed ``priority_cap``; this flag is the explicit operator escape
+    hatch for the case where the auto-clamp didn't fire but we still
+    want a loud post-load scrub.
+    """
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    checkpoint_path.write_text("dummy")
+    config = _base_config(str(tmp_path))
+
+    def fake_load_checkpoint(path):
+        return {
+            "episode": 5,
+            "total_train_steps": 100,
+            "best_validation_metric": 0.0,
+            "early_stopping_counter": 0,
+            "agent_config": config["agent"],
+            "agent_total_steps": 50,
+            "network_state_dict": {},
+            "target_network_state_dict": {},
+            "optimizer_state_dict": {},
+            "buffer_sidecar_relpath": "checkpoint.pt.buffer",
+        }
+
+    _apply_common_resume_monkeypatches(
+        monkeypatch,
+        tmp_path,
+        find_latest=lambda model_dir, prefix: str(checkpoint_path),
+        load_checkpoint=fake_load_checkpoint,
+    )
+
+    data_manager = make_stub_data_manager(tmp_path)
+
+    agent, _trainer = run_training_module.run_training(
+        config,
+        data_manager,
+        resume_training_flag=True,
+        clamp_priorities_on_resume=True,
+    )
+
+    assert agent.buffer.clamp_tree_priorities_calls == 1
+    assert agent.buffer.loaded_from_path is not None

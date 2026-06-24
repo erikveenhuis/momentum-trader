@@ -61,6 +61,28 @@ def test_find_latest_checkpoint_by_episode_number(tmp_path):
 
 
 @pytest.mark.unit
+def test_find_latest_checkpoint_finds_topk_when_only_pinned_file(tmp_path):
+    """Warm-start from a pinned top-K file when no latest_* rotation exists."""
+    _write_valid_checkpoint(
+        tmp_path / "checkpoint_trainer_topk_20260603_ep1800_score_0.5299.pt",
+    )
+
+    result = find_latest_checkpoint(model_dir=str(tmp_path))
+    assert result is not None
+    assert "topk_20260603_ep1800" in result
+
+
+@pytest.mark.unit
+def test_find_latest_checkpoint_prefers_latest_over_topk_at_same_episode(tmp_path):
+    _write_valid_checkpoint(tmp_path / "checkpoint_trainer_topk_20260603_ep1800_score_0.5299.pt")
+    _write_valid_checkpoint(tmp_path / "checkpoint_trainer_latest_20260603_ep1800_reward0.5299.pt")
+
+    result = find_latest_checkpoint(model_dir=str(tmp_path))
+    assert result is not None
+    assert "latest_20260603_ep1800" in result
+
+
+@pytest.mark.unit
 def test_find_latest_checkpoint_falls_back_to_latest_pt(tmp_path):
     _write_valid_checkpoint(tmp_path / "checkpoint_trainer_latest.pt")
 

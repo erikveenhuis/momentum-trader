@@ -55,6 +55,7 @@ class ValidationMixin:
 
         # Store old best score for "is_best" decision
         old_best_validation_metric = self.best_validation_metric
+        old_pin_best_metric = self.checkpoint_pin_best_metric
 
         # Run validation if needed
         if val_files and self.should_validate(episode, tracker.get_recent_metrics(), force=force_validation):
@@ -77,29 +78,32 @@ class ValidationMixin:
             # MODIFIED: Corrected is_best determination
             # An improvement is "best" if it's better than the old best by at least the threshold.
             # self.best_validation_metric has already been updated by validate() if validation_score was strictly > old_best_validation_metric.
-            # During min_episodes_before_early_stopping, validate() does not update best; force is_best False so we do not save misleading "best" checkpoints.
+            # During min_episodes_before_early_stopping, validate() does not update
+            # best_validation_metric; force is_best False so we do not save misleading
+            # "best" checkpoints from the early-stop tracker.
+            # Checkpoint pinning (top-K / peak / threshold-gated best_*) uses a
+            # separate gate and ``checkpoint_pin_best_metric``.
             completed_episodes = episode + 1
-            eligible_for_best = (
-                self.min_episodes_before_early_stopping <= 0
-                or completed_episodes >= self.min_episodes_before_early_stopping
+            eligible_for_pinning = (
+                self.min_episodes_before_checkpoint_pinning <= 0
+                or completed_episodes >= self.min_episodes_before_checkpoint_pinning
             )
-            if eligible_for_best and validation_score > old_best_validation_metric + self.min_validation_threshold:
+            if eligible_for_pinning and validation_score > old_pin_best_metric + self.min_validation_threshold:
                 is_best = True
-                # self.best_validation_metric is already updated by validate() to validation_score
                 logger.info(
-                    f"  >>> NEW BEST CHECKPOINT (Score: {validation_score:.4f} > Old best: {old_best_validation_metric:.4f} + Threshold: {self.min_validation_threshold}) <<< "
+                    f"  >>> NEW BEST CHECKPOINT (Score: {validation_score:.4f} > Pin best: {old_pin_best_metric:.4f} + Threshold: {self.min_validation_threshold}) <<< "
                 )
             else:
                 is_best = False
-                if not eligible_for_best:
+                if not eligible_for_pinning:
                     logger.info(
-                        "  Skipping best checkpoint (completed %d/%d episodes before min_episodes_before_early_stopping).",
+                        "  Skipping best checkpoint (completed %d/%d episodes before min_episodes_before_checkpoint_pinning).",
                         completed_episodes,
-                        self.min_episodes_before_early_stopping,
+                        self.min_episodes_before_checkpoint_pinning,
                     )
                 else:
                     logger.info(
-                        f"  No improvement for best checkpoint (Current: {validation_score:.4f}, Best tracked: {self.best_validation_metric:.4f}, Old best for this run: {old_best_validation_metric:.4f}, Threshold: {self.min_validation_threshold})"
+                        f"  No improvement for best checkpoint (Current: {validation_score:.4f}, Pin best: {old_pin_best_metric:.4f}, Threshold: {self.min_validation_threshold})"
                     )
 
             # --- Log Validation Score and Metrics to TensorBoard --- #
@@ -180,7 +184,7 @@ class ValidationMixin:
                             continue
                         try:
                             value_f = float(value)
-                        except (TypeError, ValueError):
+                        except TypeError, ValueError:
                             continue
                         if math.isnan(value_f) or math.isinf(value_f):
                             continue
@@ -201,7 +205,7 @@ class ValidationMixin:
                 # greedy outperforms training. NaN-safe via _safe_eval_gap_scalar.
                 try:
                     train_recent = tracker.get_recent_metrics() if tracker is not None else {}
-                except (ValueError, KeyError, AttributeError, TypeError):  # pragma: no cover - defensive
+                except ValueError, KeyError, AttributeError, TypeError:  # pragma: no cover - defensive
                     train_recent = {}
                 if train_recent:
                     self._emit_eval_gap_scalars(avg_val_metrics, train_recent, episode)
@@ -239,12 +243,25 @@ class ValidationMixin:
                 )
                 should_stop_training = False
 
+            strict_validation_improvement = bool(
+                eligible_for_pinning and np.isfinite(validation_score) and validation_score > old_pin_best_metric
+            )
+
+            if (
+                eligible_for_pinning
+                and np.isfinite(validation_score)
+                and validation_score > self.checkpoint_pin_best_metric
+            ):
+                self.checkpoint_pin_best_metric = float(validation_score)
+
             # Save checkpoint AFTER validation
             self._save_checkpoint(
                 episode=episode + 1,
                 total_steps=total_train_steps,
                 is_best=is_best,  # Pass the flag indicating if this is the best
                 validation_score=validation_score,  # Pass the score achieved
+                validation_metrics=avg_val_metrics if avg_val_metrics else None,
+                strict_validation_improvement=strict_validation_improvement,
             )
             save_now = False  # Avoid double saving
 

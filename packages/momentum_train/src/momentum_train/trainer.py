@@ -16,7 +16,7 @@ from .data import DataManager  # Use relative import
 from .metrics import (  # Use relative import
     PerformanceTracker,
 )
-from .schedules import compute_benchmark_frac
+from .schedules import compute_benchmark_frac, compute_curriculum_sampling
 from .trainer_checkpoint import CheckpointMixin
 from .trainer_diagnostics import DiagnosticsMixin
 from .trainer_loop import LoopMixin
@@ -64,6 +64,10 @@ class RainbowTrainerModule(CheckpointMixin, ValidationMixin, DiagnosticsMixin, L
         self._run_cfg = RunConfig.from_dict(config["run"]) if "run" in config else None
         self.run_config = config.get("run", {})
         self.best_validation_metric = -np.inf
+        # Best score seen for checkpoint pinning (top-K / peak / best_*), updated
+        # only after ``min_episodes_before_checkpoint_pinning``. Independent of
+        # ``best_validation_metric``, which tracks early stopping.
+        self.checkpoint_pin_best_metric = -np.inf
         self.writer = writer
         # Inject the trainer's writer into the agent so internal diagnostics
         # (categorical target stats, NoisyNet sigma, Q-stats, grad norms, target-net
@@ -97,10 +101,16 @@ class RainbowTrainerModule(CheckpointMixin, ValidationMixin, DiagnosticsMixin, L
         self.early_stopping_patience = int(self._cfg.early_stopping_patience)
         self.early_stopping_counter = 0
         self.min_episodes_before_early_stopping = max(0, int(self._cfg.min_episodes_before_early_stopping))
+        self.min_episodes_before_checkpoint_pinning = max(0, int(self._cfg.min_episodes_before_checkpoint_pinning))
         if self.min_episodes_before_early_stopping > 0:
             logger.info(
                 "Early stopping and best-validation tracking deferred until at least %d training episodes complete.",
                 self.min_episodes_before_early_stopping,
+            )
+        if self.min_episodes_before_checkpoint_pinning > 0:
+            logger.info(
+                "Checkpoint pinning (top-K / peak / best_*) deferred until at least %d training episodes complete.",
+                self.min_episodes_before_checkpoint_pinning,
             )
         self.min_validation_threshold = float(self._cfg.min_validation_threshold)
         self.validation_freq = int(self._cfg.validation_freq)
@@ -124,11 +134,27 @@ class RainbowTrainerModule(CheckpointMixin, ValidationMixin, DiagnosticsMixin, L
         # ``checkpoint_trainer_topk_*`` stream that ignores
         # ``min_validation_threshold``. See ``CheckpointMixin._maybe_save_topk_checkpoint``.
         self.top_k_best_checkpoints = max(0, int(self._cfg.top_k_best_checkpoints))
+        self.top_k_skip_flat_benchmark = bool(self._cfg.top_k_skip_flat_benchmark)
+        self.top_k_flat_score_threshold = float(self._cfg.top_k_flat_score_threshold)
+        self.top_k_flat_max_abs_return_pct = float(self._cfg.top_k_flat_max_abs_return_pct)
+        self.peak_checkpoint_keep_last_n = max(0, int(self._cfg.peak_checkpoint_keep_last_n))
         if self.top_k_best_checkpoints > 0:
             logger.info(
                 "Top-K best-validation ring enabled: pinning up to %d highest-scoring "
                 "`checkpoint_trainer_topk_*` file(s) (independent of min_validation_threshold).",
                 self.top_k_best_checkpoints,
+            )
+            if self.top_k_skip_flat_benchmark:
+                logger.info(
+                    "Top-K flat-benchmark filter: score>=%.3f with |return|<%.1f%% skipped.",
+                    self.top_k_flat_score_threshold,
+                    self.top_k_flat_max_abs_return_pct,
+                )
+        if self.peak_checkpoint_keep_last_n > 0:
+            logger.info(
+                "Peak checkpoint stream enabled: keeping %d strict-improvement save(s) with "
+                "full PER buffer (`checkpoint_trainer_peak_*`).",
+                self.peak_checkpoint_keep_last_n,
             )
 
         # ------------------------------------------------------------------
@@ -232,6 +258,9 @@ class RainbowTrainerModule(CheckpointMixin, ValidationMixin, DiagnosticsMixin, L
         self._abort_training = False
         self._abort_reason: str | None = None
         self._abort_step: int | None = None
+        # Set by SIGUSR1 (``scripts/training_watchdog.sh``); consumed on the next
+        # safe point in the training loop so checkpoint I/O stays off the handler.
+        self._emergency_checkpoint_requested = False
 
     def should_stop_early(self, validation_metrics: list[dict]) -> bool:
         """Check if training should stop early based on validation performance."""
@@ -273,6 +302,17 @@ class RainbowTrainerModule(CheckpointMixin, ValidationMixin, DiagnosticsMixin, L
             start=self.benchmark_frac_start,
             end=self.benchmark_frac_end,
             anneal_episodes=self.benchmark_frac_anneal_episodes,
+        )
+
+    def curriculum_sampling_params(self, episode: int, num_episodes: int) -> tuple[float, bool]:
+        """Return ``(pool_frac, sample_from_recent)`` for training file selection."""
+        return compute_curriculum_sampling(
+            episode=int(episode),
+            num_episodes=int(num_episodes),
+            mode=self._cfg.curriculum_mode,
+            start_frac=self._cfg.curriculum_start_frac,
+            end_frac=self._cfg.curriculum_end_frac,
+            recent_frac=self._cfg.curriculum_recent_frac,
         )
 
     def _apply_benchmark_frac_to_env(self, env, episode: int) -> float:
@@ -349,10 +389,20 @@ class RainbowTrainerModule(CheckpointMixin, ValidationMixin, DiagnosticsMixin, L
 
         if self.min_episodes_before_early_stopping > 0 and self.min_episodes_before_early_stopping > num_episodes_int:
             logger.warning(
-                "min_episodes_before_early_stopping=%d > num_episodes=%d: no `best` "
-                "checkpoint will ever be saved during this run. Lower the threshold or "
-                "raise run.episodes if you want best-tracking enabled.",
+                "min_episodes_before_early_stopping=%d > num_episodes=%d: early stopping and "
+                "best-validation tracking will never activate. Lower the threshold or raise run.episodes.",
                 self.min_episodes_before_early_stopping,
+                num_episodes_int,
+            )
+
+        if (
+            self.min_episodes_before_checkpoint_pinning > 0
+            and self.min_episodes_before_checkpoint_pinning > num_episodes_int
+        ):
+            logger.warning(
+                "min_episodes_before_checkpoint_pinning=%d > num_episodes=%d: no top-K / peak / "
+                "best_* checkpoint will ever be pinned. Lower the threshold or raise run.episodes.",
+                self.min_episodes_before_checkpoint_pinning,
                 num_episodes_int,
             )
 

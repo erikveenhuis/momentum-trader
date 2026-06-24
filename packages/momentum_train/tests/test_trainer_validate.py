@@ -13,6 +13,7 @@ def _create_minimal_trainer(tmp_path) -> RainbowTrainerModule:
     trainer.validation_freq = 1
     trainer.checkpoint_save_freq = 5
     trainer.best_validation_metric = -np.inf
+    trainer.checkpoint_pin_best_metric = -np.inf
     trainer.early_stopping_counter = 0
     trainer.min_validation_threshold = 0.0
     trainer.model_dir = tmp_path
@@ -21,6 +22,7 @@ def _create_minimal_trainer(tmp_path) -> RainbowTrainerModule:
     trainer.writer = None
     trainer.reward_window = 10
     trainer.min_episodes_before_early_stopping = 0
+    trainer.min_episodes_before_checkpoint_pinning = 0
     trainer.agent = SimpleNamespace(lr_scheduler_enabled=False, num_actions=6)
     trainer._progress_path = str(tmp_path / "progress.jsonl")
     # Tier 4a default for tests: disabled unless explicitly opted in. Avoids
@@ -446,16 +448,26 @@ def test_per_buffer_distribution_audit_skipped_when_interval_zero(tmp_path):
 def test_handle_validation_and_checkpointing_triggers_best_checkpoint(tmp_path):
     trainer = _create_minimal_trainer(tmp_path)
     trainer.best_validation_metric = 0.2
+    trainer.checkpoint_pin_best_metric = 0.2
 
     save_calls = []
 
-    def capture_save(self, episode, total_steps, is_best, validation_score=None):
+    def capture_save(
+        self,
+        episode,
+        total_steps,
+        is_best,
+        validation_score=None,
+        validation_metrics=None,
+        strict_validation_improvement=False,
+    ):
         save_calls.append(
             {
                 "episode": episode,
                 "total_steps": total_steps,
                 "is_best": is_best,
                 "validation_score": validation_score,
+                "strict_validation_improvement": strict_validation_improvement,
             }
         )
 
@@ -485,6 +497,7 @@ def test_handle_validation_and_checkpointing_triggers_best_checkpoint(tmp_path):
 
     assert should_stop is False
     assert trainer.best_validation_metric == pytest.approx(0.5)
+    assert trainer.checkpoint_pin_best_metric == pytest.approx(0.5)
     assert len(save_calls) == 1
 
     call = save_calls[0]
@@ -512,6 +525,7 @@ def _capture_handler_setup(tmp_path, *, validation_freq: int, checkpoint_save_fr
     trainer.validation_freq = validation_freq
     trainer.checkpoint_save_freq = checkpoint_save_freq
     trainer.best_validation_metric = 0.2
+    trainer.checkpoint_pin_best_metric = 0.2
 
     validate_calls: list[int] = []
     save_calls: list[dict] = []
@@ -521,13 +535,22 @@ def _capture_handler_setup(tmp_path, *, validation_freq: int, checkpoint_save_fr
         trainer.best_validation_metric = 0.5
         return False, 0.5, {"avg_reward": 1.0}
 
-    def capture_save(self, episode, total_steps, is_best, validation_score=None):
+    def capture_save(
+        self,
+        episode,
+        total_steps,
+        is_best,
+        validation_score=None,
+        validation_metrics=None,
+        strict_validation_improvement=False,
+    ):
         save_calls.append(
             {
                 "episode": int(episode),
                 "total_steps": int(total_steps),
                 "is_best": bool(is_best),
                 "validation_score": validation_score,
+                "strict_validation_improvement": strict_validation_improvement,
             }
         )
 

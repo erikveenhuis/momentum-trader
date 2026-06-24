@@ -62,7 +62,7 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
     - Prioritized Experience Replay (PER)
     - Dueling Networks (implicit in RainbowNetwork)
     - Multi-step Returns
-    - Double Q-Learning
+    - Double Q-Learning (when ``iqn_bootstrap_mode == "double"``)
     - Noisy Nets for exploration
     """
 
@@ -135,6 +135,8 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
         self.alpha = c.alpha
         self.beta_start = c.beta_start
         self.beta_frames = c.beta_frames
+        self.per_new_transition_priority = float(c.per_new_transition_priority)
+        self.per_priority_cap = float(c.per_priority_cap)
         self.grad_clip_norm = c.grad_clip_norm
         self.epsilon_start = float(c.epsilon_start)
         self.epsilon_end = float(c.epsilon_end)
@@ -151,6 +153,7 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
         self.munchausen_alpha = float(c.munchausen_alpha)
         self.munchausen_entropy_tau = float(c.munchausen_entropy_tau)
         self.munchausen_log_pi_clip = float(c.munchausen_log_pi_clip)
+        self.iqn_bootstrap_mode = str(c.iqn_bootstrap_mode)
         # BTR Stage 3: spectral norm on dueling head NoisyLinears.
         self.spectral_norm_enabled = bool(c.spectral_norm_enabled)
         self.quantile_logging_interval = int(c.quantile_logging_interval)
@@ -334,6 +337,8 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
             self.alpha,
             self.beta_start,
             self.beta_frames,
+            new_transition_priority=self.per_new_transition_priority,
+            priority_cap=self.per_priority_cap,
             debug=self.debug_mode,
         )
         # Per-env N-step return buffers (vectorized training support)
@@ -387,6 +392,35 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
         beta_frames = getattr(buffer, "beta_frames", 0)
         beta_progress = min(1.0, self.total_steps / beta_frames) if beta_frames else 1.0
 
+        # PER hygiene diagnostics: cumulative clip counters from the buffer.
+        # Rates are reported over the buffer's entire history (cheap, no
+        # rolling window state needed); operationally what matters is
+        # whether the cap is firing at all.
+        new_priority = float(getattr(buffer, "new_transition_priority", 0.0))
+        priority_cap = float(getattr(buffer, "priority_cap", 0.0))
+        update_count = int(getattr(buffer, "update_priority_count", 0))
+        clip_count = int(getattr(buffer, "update_priority_clip_count", 0))
+        clip_rate = (clip_count / update_count) if update_count > 0 else 0.0
+
+        # Sample the leaf-priority tail. The SumTree leaves live in
+        # ``tree[capacity-1:]``; we sample to keep the cost bounded for
+        # capacity=1M. ``p95`` is the diagnostic we actually care about
+        # (mass of "high-but-not-clipped" priorities).
+        tree_p95 = 0.0
+        try:
+            tree_arr = buffer.tree.tree[capacity - 1 :]
+            sample_size = min(int(tree_arr.size), 8192)
+            if sample_size > 0:
+                if int(tree_arr.size) > sample_size:
+                    sample = np.random.choice(tree_arr, size=sample_size, replace=False)
+                else:
+                    sample = tree_arr
+                nonzero = sample[sample > 0]
+                if nonzero.size > 0:
+                    tree_p95 = float(np.quantile(nonzero, 0.95))
+        except AttributeError, ValueError:  # pragma: no cover - defensive
+            tree_p95 = 0.0
+
         return {
             "size": size,
             "capacity": capacity,
@@ -398,6 +432,12 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
             "avg_priority": avg_priority,
             "max_priority": max_priority,
             "total_steps": self.total_steps,
+            "new_transition_priority": new_priority,
+            "priority_cap": priority_cap,
+            "priority_clip_count": clip_count,
+            "priority_update_count": update_count,
+            "priority_clip_rate": clip_rate,
+            "tree_priority_p95": tree_p95,
         }
 
     @property
@@ -862,35 +902,40 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
     ) -> torch.Tensor:
         """Compute the Munchausen-IQN target quantile values ``[B, K']``.
 
-        The target is the Munchausen-DQN augmentation of a soft-policy IQN
-        bootstrap, layered entirely on the *target* network (Vieillard et al.
-        2020; BTR Stage 2). With ``alpha`` the Munchausen scale and
-        ``tau_M`` the entropy temperature, the per-quantile target is::
+        Bootstrap mode is controlled by ``self.iqn_bootstrap_mode``:
 
-            taus_*  ~ U(0, 1)^{B x K'}
-            Z_t     = Z_target(s', a, taus_next)                # [B, A, K']
-            q_next  = E_tau' Z_target(s', a, taus_next)         # [B, A]
-            log_pi' = log_softmax(q_next / tau_M, dim=1)        # [B, A]
-            pi'     = exp(log_pi')                              # [B, A]
-            soft_V  = sum_a pi'[..., None] * (Z_t - tau_M * log_pi'[..., None])  # [B, K']
+        * ``soft`` — Munchausen-DQN soft-policy IQN bootstrap (Vieillard et al.
+          2020; BTR Stage 2). With ``alpha`` the Munchausen scale and ``tau_M``
+          the entropy temperature::
+
+              taus_*  ~ U(0, 1)^{B x K'}
+              Z_t     = Z_target(s', a, taus_next)                # [B, A, K']
+              q_next  = E_tau' Z_target(s', a, taus_next)         # [B, A]
+              log_pi' = log_softmax(q_next / tau_M, dim=1)        # [B, A]
+              pi'     = exp(log_pi')                              # [B, A]
+              bootstrap_z = sum_a pi'[..., None] * (Z_t - tau_M * log_pi'[..., None])
+
+        * ``greedy`` — target-net argmax IQN bootstrap (vanilla DQN-style)::
+
+              bootstrap_z = Z_target(s', argmax_a Q_target(s', a), taus_next)  # [B, K']
+
+        * ``double`` — Rainbow Double-DQN IQN bootstrap::
+
+              a* = argmax_a Q_online(s', a)   # online net, K_policy taus
+              bootstrap_z = Z_target(s', a*, taus_next)  # [B, K']
+
+        All modes share the Munchausen immediate-reward term when ``alpha > 0``::
 
             log_pi  = log_softmax(Q_target(s, taus_curr) / tau_M, dim=1)
             log_pi_a = clamp(log_pi.gather(actions), min=log_pi_clip)  # [B]
-
-            T_z = r + alpha * tau_M * log_pi_a + (1 - done) * gamma^n * soft_V
+            T_z = r + alpha * tau_M * log_pi_a + (1 - done) * gamma^n * bootstrap_z
 
         The Munchausen log-policy bonus on ``log_pi_a`` is *not* masked by
-        ``(1 - done)``: it is the immediate-reward component, not part of
-        the bootstrapped value, and stays attached even at episode
-        terminations. ``alpha = 0`` collapses the bonus, leaving the soft
-        target-net bootstrap intact (i.e. an entropy-regularised IQN); set
-        ``alpha = 0`` *and* ``tau_M -> 0`` to recover plain target-net
-        argmax IQN (used in the Stage 2 ablation tests).
+        ``(1 - done)``. ``alpha = 0`` collapses the bonus.
 
-        The online network is intentionally never invoked here: Munchausen
-        replaces the Double-DQN argmax with a target-net soft policy, which
-        is the variance-reduction story behind Vieillard et al.'s
-        suppression of dominated-action overestimation.
+        The online network is invoked only in ``double`` mode (action selection
+        at s'); ``soft`` and ``greedy`` use the target net exclusively for the
+        next-state bootstrap.
         """
         with torch.no_grad():
             batch_size = next_market_data_batch.shape[0]
@@ -907,7 +952,6 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
                 dtype=next_market_data_batch.dtype,
             )
 
-            # Soft-policy bootstrap on the *target* net: E_{a~pi'} [Z(s', a, tau') - tau_M * log pi'(a|s')].
             target_quantiles_all = self.target_network.get_quantiles(
                 next_market_data_batch, next_account_state_batch, taus_target
             )  # [B, A, K']
@@ -916,14 +960,31 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
                     "Target net quantile shape mismatch"
                 )
             q_next_target = target_quantiles_all.mean(dim=2)  # [B, A]
-            log_pi_next = torch.log_softmax(q_next_target / tau_M, dim=1)  # [B, A]
-            pi_next = torch.exp(log_pi_next)  # [B, A]
-            # soft_value_z[b, k'] = sum_a pi'(a|s')[b, a] * (Z(s', a, tau')[b, a, k'] - tau_M * log pi'(a|s')[b, a])
-            soft_value_z = (pi_next.unsqueeze(2) * (target_quantiles_all - tau_M * log_pi_next.unsqueeze(2))).sum(
-                dim=1
-            )  # [B, K']
+            batch_idx = torch.arange(batch_size, device=self.device)
+
+            if self.iqn_bootstrap_mode == "soft":
+                log_pi_next = torch.log_softmax(q_next_target / tau_M, dim=1)  # [B, A]
+                pi_next = torch.exp(log_pi_next)  # [B, A]
+                bootstrap_z = (pi_next.unsqueeze(2) * (target_quantiles_all - tau_M * log_pi_next.unsqueeze(2))).sum(
+                    dim=1
+                )  # [B, K']
+            elif self.iqn_bootstrap_mode == "double":
+                taus_policy = torch.rand(
+                    batch_size,
+                    self.n_quantiles_policy,
+                    device=self.device,
+                    dtype=next_market_data_batch.dtype,
+                )
+                q_next_online = self.network.get_q_values(
+                    next_market_data_batch, next_account_state_batch, taus_policy
+                )  # [B, A]
+                best_actions = q_next_online.argmax(dim=1)  # [B]
+                bootstrap_z = target_quantiles_all[batch_idx, best_actions, :]  # [B, K']
+            else:  # greedy — target-net argmax
+                best_actions = q_next_target.argmax(dim=1)  # [B]
+                bootstrap_z = target_quantiles_all[batch_idx, best_actions, :]  # [B, K']
             if self.debug_mode:
-                assert soft_value_z.shape == (batch_size, n_target), "Soft value shape mismatch"
+                assert bootstrap_z.shape == (batch_size, n_target), "Bootstrap quantile shape mismatch"
 
             # Munchausen log-policy bonus on the *current* state, target net.
             taus_curr = torch.rand(
@@ -941,7 +1002,7 @@ class RainbowDQNAgent(AgentDiagnosticsMixin, AgentCheckpointMixin):
             munchausen_bonus = alpha * tau_M * log_pi_a.unsqueeze(1)  # [B, 1] broadcasts across K'
 
             target_q_z = (
-                rewards + munchausen_bonus + (1.0 - dones) * (self.gamma**self.n_steps) * soft_value_z
+                rewards + munchausen_bonus + (1.0 - dones) * (self.gamma**self.n_steps) * bootstrap_z
             )  # [B, K']
             if self.debug_mode:
                 assert target_q_z.shape == (batch_size, n_target), f"Target quantile shape mismatch: {target_q_z.shape}"

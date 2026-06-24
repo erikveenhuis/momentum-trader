@@ -1,5 +1,53 @@
 # Configuration for Rainbow DQN Trading Agent Training
 #
+# === Active probe #12 (2026-06-24) — critic stability resume from ep10200 topk ===
+# Probe #11 (flat curriculum fresh run) halted @ ep ~11536: val 0.25 / PV $605, TD mean ~1200+.
+# Best artifact: models/checkpoint_trainer_topk_20260624_ep10200_score_0.4311.pt (val -7.8%).
+# Root cause: IQN Q-scale drift (not data corruption); n-step rewards still O(1e-3) at TD blow-up.
+#
+# Probe #12 bundle (stability, keep encoder + value head):
+#   lr 1.5e-5 -> 1e-5; polyak_tau 0.001 -> 0.005; PER alpha 0.45 -> 0.35;
+#   per_priority_cap 50 -> 25; update_freq 40 -> 60; keep curriculum_mode flat.
+#   NO --reset-value-head-on-resume (preserve weights at best topk).
+#
+# --- Step 0: quarantine stale high-episode checkpoints (resume picks MAX ep in models/) ---
+#   mkdir -p models/_quarantine_probe12
+#   mv models/checkpoint_trainer_latest_* models/_quarantine_probe12/ 2>/dev/null || true
+#   mv models/checkpoint_trainer_latest_*.buffer models/_quarantine_probe12/ 2>/dev/null || true
+#   Keep: checkpoint_trainer_topk_20260624_ep10200_score_0.4311.pt (+ other topk if desired)
+#
+# --- Step 1: resume from ep10200 topk ---
+#   uv run python -m momentum_train.run_training --config_path config/training_config.yaml \\
+#     --resume --reset-buffer-on-resume --reset-lr-on-resume --reset-noisy-on-resume \\
+#     --benchmark-frac-override 0.45
+#
+# Pass/fail (STOP EARLY — max ~400–600 episodes):
+#   * PASS  -> Train/TD_Error_Mean stays < ~500; val score > ~0.40 and improving; no 100% one-action val x2
+#   * FAIL  -> TD > ~500 sustained ~200 learner steps; val flat/worse x2; train single action > ~70%
+#
+# --- Prior probe #11 (2026-06-21) — FRESH flat curriculum; halted ep11536 val 0.25 ---
+# TD crept 0.2 -> 1200+ over ~16M env steps; overtrading on val (not flat 0.5846 basin).
+#
+# Curriculum modes (trainer section):
+#   flat                  — uniform random over ALL train files (active)
+#   linear_chronological  — legacy 0.3→1.0 ramp over run length
+#   recent                — uniform over newest curriculum_recent_frac of files
+#
+# --- Prior probe #9 (2026-06-19) — short escape from ep3007; collapsed action 4 @ ep7115 ---
+# lr 1.5e-5, update_freq 40, num_vector_envs 4. Val locked 0.5846 / 100% action 4. Halt.
+#
+# --- Prior probe #8 (lr 2e-5, polyak 0.001, eps_end 0.10): re-collapsed to 100% val action 3 @ 0.5673 ---
+# iqn_bootstrap_mode: greedy. TD blow-up ~850k env steps; val flat from collapse.
+#
+# --- Prior probe #3 (2026-05-25, double-DQN — FAILED long run) ---
+# iqn_bootstrap_mode: double. Held off +41k Q blow-up early; TD re-climbed to ~12k by ep ~15k.
+#
+# --- Prior probe #2 header (2026-05-23, target-net greedy — PARTIAL) ---
+# iqn_bootstrap_mode: greedy. Spike ~880k env / ~44k learner; recovery then re-creep.
+#
+# --- Prior probe #1 header (2026-05-22, soft bootstrap — FAILED) ---
+# PER hygiene + tau_M=0.01 + lr=2e-5. See experiment log below for TD trajectory.
+#
 # --- Experiment log (PER / IQN stability) ---
 # Prior polluted long run: models/runs/20260505-101223 (alpha=0 ablation mid-run; TD/Q blow-up).
 # Current fresh run: archive-on-fresh-start, TB models/runs/20260511-202918, progress.jsonl from 2026-05-11.
@@ -23,11 +71,11 @@
 # Next probes (LR already 5e-5): one change per short run, watch Train/TD_Error_Mean and
 #   Train/Quantile/Max vs bounded-reward ballpark (~50 with |r|<=0.5, gamma=0.99):
 #   1) tau_M=0.001 + alpha=0.45 — ran on fresh run; val OK-ish but TD still ~1e5+ at halt — move on.
-#   2) n_steps: 3 -> 2 or 1 — top candidate before another long continue.
-#   3) Resume with fresh IQN heads (encoder + buffer kept):
+#   2) n_steps: 3 -> 1 — active probe (2026-05-22 fresh run; shorter bootstrap horizon).
+#   3) Resume with fresh IQN heads + empty PER (encoder + counters kept):
 #        uv run python -m momentum_train.run_training --config_path config/training_config.yaml \\
-#          --resume --reset-value-head-on-resume
-#      Drops optimizer moments; re-inits tau_embedding + dueling streams; syncs target heads.
+#          --resume --reset-value-head-on-resume --reset-buffer-on-resume
+#      Use checkpoint 20260516_ep10303 (quarantine 20260521_* first). Drops optimizer + buffer.
 #   3b) Fresh encoder warm-start (migrate / best_*) with new value head — if resume feels stale.
 #   4) polyak_tau: 0.005 -> 0.01 — only if target lag suspected.
 #   5) LR 5e-5 -> 2e-5 — last resort; pair with (2) or (3).
@@ -60,7 +108,12 @@ agent:
   # PER + DDQN-IQN + Munchausen recipe, not buffer composition. Lower LR
   # gives the optimiser less per-step compounding and lets the slow Polyak
   # target catch up before each batch's bootstrap is itself stale.
-  lr: 0.00005           # Reduced from 1e-4 (was 3e-4 originally) for BTR-v3 stability run
+  # 2026-05-22 stability probe (paired with tau_M=0.01 and PER cap=50): cut
+  # lr 5e-5 -> 2e-5 to slow per-step compounding into the bootstrap. Last-
+  # resort knob from the probe ladder (see header item 5); used together
+  # with the cap/clamp PER fix so the buffer can no longer amplify a
+  # single TD spike for millions of steps.
+  lr: 0.00001           # Probe #12: down from 1.5e-5; slow Q compounding after ep10200 resume
   # batch_size kept at 8192 for BTR-v3. Earlier draft of BTR-v3 lowered
   # this to 4096 as a belt-and-suspenders move against PER concentration,
   # but the dominant divergence levers are lr / polyak_tau /
@@ -94,7 +147,7 @@ agent:
   transformer_dropout: 0.1
 
   # Rainbow + IQN params
-  n_steps: 3            # Reduced from 5; shorter horizon for minute-scale momentum trades
+  n_steps: 1            # Probe 2026-05-22: was 3; 1-step returns + gamma^1 bootstrap to limit TD amplification
   # IQN distributional head (replaces C51 num_atoms/v_min/v_max). Quantile
   # samples are drawn fresh every step from U(0, 1); the network learns the
   # quantile function rather than fixed-support probabilities.
@@ -119,8 +172,17 @@ agent:
   # runaway absolute Q scales (~1e5) and PER, compounded bootstrap noise. Cut
   # tau_M to sharpen toward target-net greedy / near-argmax weighting (~6× vs
   # 0.03). Tightened 0.005 -> 0.001 (2026-05). May 2026 TB: critic scales still worsened — see header Update.
-  munchausen_entropy_tau: 0.001  # was 0.005; sharper target softmax (smaller → nearer argmax)
+  # 2026-05-22 stability probe: raise tau_M 0.001 -> 0.01 so the soft-IQN
+  # target distribution is less peaky when Q magnitudes drift. Tiny tau in
+  # the prior run effectively collapsed the softmax onto a single (possibly
+  # mis-scaled) target quantile, amplifying any critic-side error. 0.01 is
+  # still bounded enough that the Munchausen bonus stays in [-0.01, 0] per
+  # step (alpha=0 currently, so the bonus contributes 0 regardless).
+  munchausen_entropy_tau: 0.01  # Used by soft bootstrap / Munchausen bonus only; ignored when mode=greedy
   munchausen_log_pi_clip: -1.0  # Floor on log-pi; only binds when munchausen_alpha > 0
+  # IQN bootstrap at s': ``greedy`` = target-net argmax (probe #4, 2026-06-02);
+  # ``double`` = Rainbow Double-DQN (probe #3, failed at scale); ``soft`` = softmax mix.
+  iqn_bootstrap_mode: greedy
 
   # Spectral normalization on the dueling head NoisyLinear weights (BTR Stage 3).
   # Constrains the operator norm of weight_mu in value/advantage streams to
@@ -134,26 +196,28 @@ agent:
   target_net_logging_interval: 250
   td_error_logging_interval: 100
   # PER: priority = (|TD|+eps)**alpha. Restored 0.45 after alpha=0 did not fix critic drift (header).
-  alpha: 0.45           # BTR-v5 Option A; softer than 0.6 linear TD weighting
+  alpha: 0.35           # Probe #12: down from 0.45; softer PER on outlier TD spikes
   beta_start: 0.4       # Increased from 0.3; less bias early on
   beta_frames: 200000   # Reduced from 400k; reach full IS correction sooner
+  # PER priority hygiene (added 2026-05-22 to break the
+  # max_priority -> new-store -> TD-spike feedback loop). New transitions
+  # enter at this fixed alpha-space priority instead of inheriting the
+  # historical max; the cap clamps per-update priorities so a single
+  # blown batch cannot dominate sampling for millions of steps.
+  per_new_transition_priority: 1.0  # Canonical PER default; decoupled from max_priority
+  per_priority_cap: 25.0            # Probe #12: down from 50; |TD|<=~1.1k before clip at alpha=0.35
 
-  # LR scheduler
-  lr_scheduler_enabled: true
-  lr_scheduler_type: 'CosineAnnealingLR'  # Smoother than ReduceLROnPlateau for long runs
+  # LR scheduler — disabled for probe #7 short escape run (constant lr above).
+  lr_scheduler_enabled: false
+  lr_scheduler_type: 'CosineAnnealingLR'  # Re-enable for long runs after escape probe
   lr_scheduler_params:
-    # T_max sized for the actual learner-step budget. The previous 500k value
-    # cycled multiple times through the cosine period (the run reached ~5.7M
-    # learner steps, ~11x past T_max), which manifested as a head-churn
-    # pattern in the canvas health-report. 50M ≈ remaining run length and
-    # keeps the schedule monotonic for the rest of training.
     T_max: 50000000     # Cosine period in learner steps (~full training run)
     eta_min: 0.00001    # Floor LR
 
   # Exploration (epsilon-greedy on top of NoisyNets)
   epsilon_start: 0.3    # Initial random action probability; NoisyNets alone collapse to constant action
-  epsilon_end: 0.05     # Floor epsilon after annealing (higher floor for long-run exploration)
-  epsilon_decay_steps: 2000000  # Anneal over this many env steps (post-warmup)
+  epsilon_end: 0.12     # Probe #9: up from 0.10; moderate exploration without probe #7 chaos
+  epsilon_decay_steps: 8000000  # Probe #7: extended from 2M — re-anneal curve at high env_steps
 
   # Action entropy regularization
   entropy_coeff: 0.0    # Disabled; benchmark-relative reward structurally prevents action collapse
@@ -168,7 +232,7 @@ agent:
   # which then encoded the drift into the bootstrap target. tau=0.005 cuts
   # the lag to ~200 steps, killing the slow-bootstrap-pressure feedback
   # loop while still keeping the target net distinct from online.
-  polyak_tau: 0.005     # Increased from 0.001 for BTR-v3 stability run
+  polyak_tau: 0.005     # Probe #12: up from 0.001; faster target tracking (~200-step lag)
   store_partial_n_step: true
   debug: false
 
@@ -206,9 +270,9 @@ trainer:
   # Costs: 2x CPU load on env-stepping subprocesses (fine on >= 8 physical
   # cores) and 2x learner-call frequency in wall-clock terms. Within the
   # YAML's documented "4-8 recommended" supported band.
-  num_vector_envs: 8        # Raised from 4 for BTR-v3 throughput
+  num_vector_envs: 4        # Probe #9: down from 8; fewer grad updates/hour for stability
   warmup_steps: 20000       # With action masking, warmup produces cleaner transitions
-  update_freq: 20           # Learn every 20 env steps; vectorized loop uses threshold counter to avoid modulo drift
+  update_freq: 60           # Probe #12: up from 40; fewer learner calls per env step
   # gradient_updates_per_step lowered 2 -> 1 at the BTR-v3 cutover. With
   # update_freq=20 and 2 grad updates/step the agent did 1 grad update per
   # 10 env steps; combined with batch_size=8192 and PER, the off-policy
@@ -224,28 +288,26 @@ trainer:
   # Disk hygiene: cap how many `checkpoint_trainer_latest_*` files are kept
   # on disk after each save. Each checkpoint is ~9 GB (PER buffer dominates),
   # so an unbounded 50k-episode run @ checkpoint_save_freq=50 would need
-  # ~9 TB. With keep_last_n=10 the periodic-checkpoint footprint stays
-  # bounded at ~90 GB — comfortable on a 500 GB partition while still
-  # giving `recover_from_collapse.py --from-episode N` a useful rollback
-  # window of the last ~10 saves (~500 episodes at default save_freq).
+  # ~9 TB. With keep_last_n=30 the periodic-checkpoint footprint stays
+  # bounded at ~270 GB — fits a 500 GB partition while giving
+  # `recover_from_collapse.py --from-episode N` a ~1500-episode rollback window
+  # at checkpoint_save_freq=50 (the V51-era gap that motivated this raise).
   # Notes:
   #   - 0 disables rotation (keep every save). Use only when disk is unlimited.
-  #   - `best_*.pt` files and `recover` script outputs at older episodes are
-  #     never auto-rotated; only the periodic `latest_*` stream is.
+  #   - `best_*.pt`, `peak_*`, `topk_*`, and `recover` outputs are never rotated
+  #     by this pass — only the periodic `latest_*` stream is.
   #   - The most recent N (sorted by episode number in the filename) survive.
   #   - Safe to change between `--resume` runs; the new value takes effect on
   #     the next periodic save.
-  latest_checkpoint_keep_last_n: 10
+  latest_checkpoint_keep_last_n: 5
   reward_window: 20
   reward_clip: 0.5          # Soft cap on per-step reward magnitude (IQN itself has unbounded support)
-  # Raised 5000 -> 15000 after the BTR-v3 fresh run hit early stopping at ep
-  # ~7400. Diagnosis: ``best_validation_metric`` got anchored on the very first
-  # eligible validation at ep 5000 (score 0.406) — exactly where the
-  # benchmark anneal floor was reached and action mix collapsed toward action 0
-  # (~70% flat). Extending this gate past the new anneal end (also 15000)
-  # ensures best-tracking starts on a stationary policy, not on a transitional
-  # one that's still rebalancing as the reward landscape changes.
-  min_episodes_before_early_stopping: 15000  # Defer best-tracking until after the extended benchmark anneal completes
+  # Early stopping + best_validation_metric tracking deferred until benchmark
+  # anneal completes (see benchmark_allocation_frac_anneal_episodes).
+  min_episodes_before_early_stopping: 15000
+  # Top-K / peak / threshold-gated best_* saves — separate gate (code fix 2026-06-02).
+  # Align with validation_freq so first real val at ep 200 can pin checkpoints.
+  min_episodes_before_checkpoint_pinning: 200
   early_stopping_patience: 12  # Increased from 6; more runway for slow convergence
   final_phase_lr_start_frac: 0.85  # Later start since cosine already decays smoothly
   final_phase_lr_multiplier: 0.3
@@ -253,14 +315,26 @@ trainer:
 
   # Top-K best-validation ring. Independent of ``min_validation_threshold``:
   # the K highest-scoring validation runs are pinned on disk as
-  # ``checkpoint_trainer_topk_<DATE>_ep<N>_score_<X>.pt`` so that small
-  # improvements (e.g. +0.0008 on top of the prior best) still survive,
-  # giving us a recovery option if the threshold-gated ``best_*`` save
-  # misses a true peak. 0 disables; 3-5 is a reasonable safety net.
-  # ``best_*`` and ``topk_*`` files coexist; rotation only touches
-  # ``latest_*``. The ring is rescanned from filenames on every save so it
-  # round-trips across ``--resume``.
-  top_k_best_checkpoints: 5
+  # ``checkpoint_trainer_topk_<DATE>_ep<N>_score_<X>.pt`` (~50 MB, no buffer).
+  # Small improvements still enter the ring; flat-benchmark vals (~0.596 with
+  # ~0% return) are skipped when ``top_k_skip_flat_benchmark`` is true so
+  # active-trading peaks (~0.54) are not evicted. 0 disables the ring.
+  top_k_best_checkpoints: 10
+  top_k_skip_flat_benchmark: true
+  top_k_flat_score_threshold: 0.585
+  top_k_flat_max_abs_return_pct: 2.0
+  # Peak stream: full ``latest_*``-style checkpoint + PER buffer whenever
+  # validation strictly improves checkpoint_pin_best_metric (after
+  # min_episodes_before_checkpoint_pinning). Use for recovery after collapse;
+  # ~9 GB per file. 0 disables. Reduced 8 -> 3 to cap disk (~27 GB).
+  peak_checkpoint_keep_last_n: 3
+
+  # Training-file pool sampling (``schedules.compute_curriculum_sampling``).
+  # Probe #11/#12: flat = uniform random over all ~23k train files every episode.
+  curriculum_mode: flat
+  curriculum_start_frac: 0.3    # linear_chronological only (legacy default ramp start)
+  curriculum_end_frac: 1.0      # linear_chronological only (legacy default ramp end)
+  curriculum_recent_frac: 0.25  # recent only: newest 25% of files (e.g. 2023–2024)
 
   # Benchmark allocation frac schedule (linear anneal from start -> end across
   # the first N episodes; anchored on absolute episode index so --resume keeps
@@ -269,9 +343,9 @@ trainer:
   # to be reward-neutral. Useful early as anti-collapse pressure; once the
   # agent has demonstrated non-flat action diversity it becomes structural
   # long bias, which fights the sniper objective.
-  # Anneal length is aligned with min_episodes_before_early_stopping so the
-  # benchmark reaches its low-pressure end value just as best-checkpoint
-  # selection becomes active.
+  # Anneal length (15k eps) is longer than min_episodes_before_early_stopping (5k):
+  # checkpoint pins can start at ep 5000 while anti-flat benchmark pressure
+  # continues through ep 15000.
   #
   # Extended 2026-05-05 after fresh BTR-v3 run early-stopped at ep ~7400 with
   # ~70% action-0 (flat) policy collapse. The previous schedule (0.50 -> 0.10

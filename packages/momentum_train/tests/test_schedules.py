@@ -18,7 +18,7 @@ import math
 from types import SimpleNamespace
 
 import pytest
-from momentum_train.schedules import compute_benchmark_frac
+from momentum_train.schedules import compute_benchmark_frac, compute_curriculum_sampling
 
 # ---------------------------------------------------------------------------
 # compute_benchmark_frac math
@@ -71,6 +71,96 @@ def test_compute_benchmark_frac_resume_anchored_on_absolute_episode():
     expected = 0.5 + (0.10 - 0.5) * (3499 / 5000)
     assert value == pytest.approx(expected)
     assert value < 0.5 and value > 0.10
+
+
+# ---------------------------------------------------------------------------
+# compute_curriculum_sampling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_compute_curriculum_sampling_flat_mode():
+    frac, recent = compute_curriculum_sampling(
+        0,
+        50_000,
+        mode="flat",
+        start_frac=0.3,
+        end_frac=1.0,
+        recent_frac=0.25,
+    )
+    assert frac == pytest.approx(1.0)
+    assert recent is False
+    frac_late, recent_late = compute_curriculum_sampling(
+        40_000,
+        50_000,
+        mode="flat",
+        start_frac=0.3,
+        end_frac=1.0,
+        recent_frac=0.25,
+    )
+    assert frac_late == pytest.approx(1.0)
+    assert recent_late is False
+
+
+@pytest.mark.unit
+def test_compute_curriculum_sampling_linear_chronological_matches_legacy():
+    frac0, recent0 = compute_curriculum_sampling(
+        0,
+        50_000,
+        mode="linear_chronological",
+        start_frac=0.3,
+        end_frac=1.0,
+        recent_frac=0.25,
+    )
+    assert frac0 == pytest.approx(0.3)
+    assert recent0 is False
+
+    frac_mid, _ = compute_curriculum_sampling(
+        25_000,
+        50_000,
+        mode="linear_chronological",
+        start_frac=0.3,
+        end_frac=1.0,
+        recent_frac=0.25,
+    )
+    assert frac_mid == pytest.approx(0.65)
+
+    frac_end, _ = compute_curriculum_sampling(
+        50_000,
+        50_000,
+        mode="linear_chronological",
+        start_frac=0.3,
+        end_frac=1.0,
+        recent_frac=0.25,
+    )
+    assert frac_end == pytest.approx(1.0)
+
+
+@pytest.mark.unit
+def test_compute_curriculum_sampling_recent_mode():
+    frac, recent = compute_curriculum_sampling(
+        999,
+        50_000,
+        mode="recent",
+        start_frac=0.3,
+        end_frac=1.0,
+        recent_frac=0.25,
+    )
+    assert frac == pytest.approx(0.25)
+    assert recent is True
+
+
+@pytest.mark.unit
+def test_compute_curriculum_sampling_unknown_mode_raises():
+    with pytest.raises(ValueError, match="Unknown curriculum_mode"):
+        compute_curriculum_sampling(
+            0,
+            100,
+            mode="bogus",
+            start_frac=0.3,
+            end_frac=1.0,
+            recent_frac=0.25,
+        )
 
 
 # ---------------------------------------------------------------------------

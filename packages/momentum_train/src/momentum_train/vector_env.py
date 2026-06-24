@@ -55,6 +55,8 @@ def reset_done_envs(
     done_mask: np.ndarray,
     data_manager: DataManager,
     curriculum_frac: float,
+    *,
+    sample_from_recent: bool = False,
 ) -> dict[str, np.ndarray]:
     """Reset sub-envs indicated by *done_mask*, injecting fresh data files.
 
@@ -69,7 +71,12 @@ def reset_done_envs(
     for i in range(vec_env.num_envs):
         if not done_mask[i]:
             continue
-        new_path = str(data_manager.get_random_training_file(curriculum_frac=curriculum_frac))
+        new_path = str(
+            data_manager.get_random_training_file(
+                curriculum_frac=curriculum_frac,
+                sample_from_recent=sample_from_recent,
+            )
+        )
         vec_env.envs[i].reset(options={"data_path": new_path})
 
     obs, _info = vec_env.reset(options={"reset_mask": done_mask})

@@ -114,21 +114,31 @@ class DataManager:
         self._ensure_organized()
         return self.test_files
 
-    def get_random_training_file(self, curriculum_frac: float = 1.0) -> Path:
+    def get_random_training_file(
+        self,
+        curriculum_frac: float = 1.0,
+        *,
+        sample_from_recent: bool = False,
+    ) -> Path:
         """Get a random training file, optionally restricted by curriculum fraction.
 
         Args:
             curriculum_frac: Fraction of training files to sample from (0..1).
-                The files are sorted by name (chronologically), so a fraction < 1
-                restricts to earlier (typically lower-volatility) data.
+                Files are sorted by name (chronologically). When
+                ``sample_from_recent`` is false, the pool is the **earliest**
+                ``curriculum_frac`` fraction; when true, the **newest** fraction.
         """
         self._ensure_organized()
         num_files = len(self.train_files)
         assert num_files > 0, "Cannot get random file: No training files available."
 
         pool_size = max(1, int(num_files * min(max(curriculum_frac, 0.0), 1.0)))
-        pool = self.train_files[:pool_size]
+        if sample_from_recent:
+            pool = self.train_files[-pool_size:]
+        else:
+            pool = self.train_files[:pool_size]
         random_file = random.choice(pool)
-        logger.debug(f"[DataManager] Selected file: {random_file.name} (pool={pool_size}/{num_files})")
+        tail = "recent" if sample_from_recent else "earliest"
+        logger.debug(f"[DataManager] Selected file: {random_file.name} (pool={pool_size}/{num_files}, {tail})")
         assert random_file.exists(), f"Chosen random training file does not exist: {random_file}"
         return random_file

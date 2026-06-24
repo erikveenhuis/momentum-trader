@@ -53,7 +53,24 @@ def test_buffer_init(per_buffer):
     assert per_buffer.alpha == ALPHA
     assert per_buffer.beta == BETA_START
     assert per_buffer.max_priority == 1.0
+    assert per_buffer.new_transition_priority == 1.0
+    assert per_buffer.priority_cap == float("inf")
     assert len(per_buffer) == 0
+
+
+@pytest.mark.unit
+def test_buffer_clear_resets_size_and_priorities(per_buffer):
+    for i in range(20):
+        per_buffer.store(*create_dummy_experience(i))
+    per_buffer.max_priority = 999.0
+    per_buffer.beta = 0.9
+
+    per_buffer.clear()
+
+    assert len(per_buffer) == 0
+    assert per_buffer.max_priority == 1.0
+    assert per_buffer.beta == BETA_START
+    assert per_buffer.tree.total() == 0.0
 
 
 @pytest.mark.unit
@@ -68,14 +85,182 @@ def test_buffer_store_single(per_buffer):
 
 
 @pytest.mark.unit
-def test_buffer_store_respects_max_priority(per_buffer):
-    """New experiences should inherit the tracked max priority without reapplying alpha."""
-    per_buffer.max_priority = 0.25
-    exp = create_dummy_experience()
-    per_buffer.store(*exp)
+def test_buffer_store_uses_configured_new_transition_priority():
+    """New transitions enter at ``new_transition_priority``, **not** ``max_priority``.
 
-    # Only one item stored, total priority should equal the set max priority.
-    assert per_buffer.tree.total() == pytest.approx(0.25)
+    Regression guard for the PER hygiene fix (2026-05-22): before this
+    change, ``store()`` used ``max_priority`` directly, so a single
+    historical TD spike pinned every new write at a poison priority
+    until it was sampled and re-rated. This test asserts the decoupling
+    that broke the feedback loop.
+    """
+    buf = PrioritizedReplayBuffer(
+        BUFFER_CAPACITY,
+        ALPHA,
+        BETA_START,
+        BETA_FRAMES,
+        new_transition_priority=1.0,
+        priority_cap=50.0,
+    )
+    buf.max_priority = 999.0  # Simulate a contaminated historical spike.
+    buf.store(*create_dummy_experience())
+
+    # SumTree total reflects only the configured new-transition priority.
+    assert buf.tree.total() == pytest.approx(1.0)
+    # ``max_priority`` is left untouched; only ``update_priorities`` may move it.
+    assert buf.max_priority == pytest.approx(999.0)
+
+
+@pytest.mark.unit
+def test_buffer_update_priorities_clips_to_cap():
+    """``update_priorities`` caps in alpha-space so a single huge |TD| cannot dominate."""
+    buf = PrioritizedReplayBuffer(
+        BUFFER_CAPACITY,
+        alpha=1.0,  # Identity in alpha-space; |TD|+eps == priority.
+        beta_start=BETA_START,
+        beta_frames=BETA_FRAMES,
+        new_transition_priority=1.0,
+        priority_cap=10.0,
+    )
+    for i in range(BATCH_SIZE):
+        buf.store(*create_dummy_experience(i))
+    _, tree_indices, _ = buf.sample(BATCH_SIZE)
+
+    huge_td = torch.full((BATCH_SIZE,), 1_000.0)
+    buf.update_priorities(tree_indices, huge_td)
+
+    leaves = [buf.tree.tree[idx] for idx in tree_indices]
+    assert max(leaves) == pytest.approx(10.0)
+    assert buf.max_priority == pytest.approx(10.0)
+    # Counters track that the clip actually fired.
+    assert buf.update_priority_clip_count == BATCH_SIZE
+
+
+@pytest.mark.unit
+def test_buffer_clamp_tree_priorities_rebuilds_total():
+    """``clamp_tree_priorities`` clips poisoned leaves and rebuilds internal sums."""
+    buf = PrioritizedReplayBuffer(
+        BUFFER_CAPACITY,
+        alpha=1.0,
+        beta_start=BETA_START,
+        beta_frames=BETA_FRAMES,
+        new_transition_priority=1.0,
+        priority_cap=5.0,
+    )
+    for i in range(BUFFER_CAPACITY):
+        buf.store(*create_dummy_experience(i))
+
+    # Manually poison a few leaves to simulate priorities written before
+    # the cap existed (the v1 sidecar load scenario).
+    leaf_offset = BUFFER_CAPACITY - 1
+    for tree_idx in (leaf_offset, leaf_offset + 10, leaf_offset + 50):
+        buf.tree.tree[tree_idx] = 1_000.0
+    buf.max_priority = 1_000.0
+
+    clamped = buf.clamp_tree_priorities()
+
+    assert clamped == 3
+    leaves = buf.tree.tree[leaf_offset:]
+    assert leaves.max() == pytest.approx(5.0)
+    # Internal SumTree nodes are rebuilt: tree[0] must equal sum of leaves.
+    assert buf.tree.tree[0] == pytest.approx(float(leaves.sum()))
+    assert buf.max_priority <= 5.0
+
+
+@pytest.mark.unit
+def test_buffer_sidecar_load_auto_clamps_pre_cap_priorities(tmp_path):
+    """v1 side-cars (or any sidecar with leaves above the live cap) auto-clamp on load."""
+    # Save a buffer with a high cap so leaves can grow large.
+    big = PrioritizedReplayBuffer(
+        BUFFER_CAPACITY,
+        alpha=1.0,
+        beta_start=BETA_START,
+        beta_frames=BETA_FRAMES,
+        new_transition_priority=1.0,
+        priority_cap=10_000.0,
+    )
+    for i in range(BUFFER_CAPACITY):
+        big.store(*create_dummy_experience(i))
+    _, tree_indices, _ = big.sample(BATCH_SIZE)
+    big.update_priorities(tree_indices, torch.full((BATCH_SIZE,), 1_000.0))
+    assert big.max_priority >= 1_000.0
+
+    sidecar = tmp_path / "big.buffer"
+    big.save_to_path(sidecar)
+
+    # Load into a buffer with a tight cap. The poisoned leaves must be
+    # scrubbed and ``max_priority`` collapsed to the new ceiling.
+    tight = PrioritizedReplayBuffer(
+        BUFFER_CAPACITY,
+        alpha=1.0,
+        beta_start=BETA_START,
+        beta_frames=BETA_FRAMES,
+        new_transition_priority=1.0,
+        priority_cap=5.0,
+    )
+    tight.load_from_path(sidecar)
+
+    leaves = tight.tree.tree[BUFFER_CAPACITY - 1 :]
+    assert leaves.max() <= 5.0
+    assert tight.max_priority <= 5.0
+    # SumTree consistency: tree[0] == sum(leaves).
+    assert tight.tree.tree[0] == pytest.approx(float(leaves.sum()))
+
+
+@pytest.mark.unit
+def test_buffer_sidecar_meta_persists_per_hygiene_fields(tmp_path):
+    """meta.json is stamped with cap/seed fields under format_version=2 (forensic record).
+
+    The persisted values are informational only -- on load, the live
+    ctor (driven by current YAML via the agent) wins, matching how
+    ``alpha`` is re-synced from config in run_training.py.
+    """
+    import json
+
+    buf = PrioritizedReplayBuffer(
+        BUFFER_CAPACITY,
+        ALPHA,
+        BETA_START,
+        BETA_FRAMES,
+        new_transition_priority=2.5,
+        priority_cap=42.0,
+    )
+    for i in range(20):
+        buf.store(*create_dummy_experience(i))
+    sidecar = tmp_path / "ckpt.buffer"
+    buf.save_to_path(sidecar)
+
+    meta = json.loads((sidecar / "meta.json").read_text())
+    assert meta["format_version"] == 2
+    assert meta["new_transition_priority"] == pytest.approx(2.5)
+    assert meta["priority_cap"] == pytest.approx(42.0)
+
+    # Loader keeps the ctor-supplied (current-YAML) values; meta is forensic.
+    restored = PrioritizedReplayBuffer(
+        BUFFER_CAPACITY,
+        ALPHA,
+        BETA_START,
+        BETA_FRAMES,
+        new_transition_priority=3.0,
+        priority_cap=100.0,
+    )
+    restored.load_from_path(sidecar)
+    assert restored.new_transition_priority == pytest.approx(3.0)
+    assert restored.priority_cap == pytest.approx(100.0)
+
+
+@pytest.mark.unit
+def test_buffer_ctor_rejects_cap_below_seed():
+    """``priority_cap`` < ``new_transition_priority`` is incoherent and must fail fast."""
+    with pytest.raises(ValueError, match="priority_cap"):
+        PrioritizedReplayBuffer(
+            BUFFER_CAPACITY,
+            ALPHA,
+            BETA_START,
+            BETA_FRAMES,
+            new_transition_priority=10.0,
+            priority_cap=1.0,
+        )
 
 
 @pytest.mark.unit
