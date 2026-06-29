@@ -21,7 +21,7 @@ dependencies = [
     "momentum_env==0.2.0",
     "momentum-core==0.1.0",
     "alpaca-py>=0.43.4",
-    "numpy>=2.4.6",
+    "numpy>=2.5.0",
     "pandas>=3.0.3",
     "requests>=2.34.2",
     # alpaca-py 0.43.2 imports pytz from alpaca.data.requests but doesn't
