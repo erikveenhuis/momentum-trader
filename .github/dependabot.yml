@@ -1,20 +1,18 @@
 version: 2
 updates:
-  # Update Python dependencies via uv (handles pyproject.toml + uv.lock)
-  - package-ecosystem: "uv"
+  # Use "pip" instead of "uv" — more stable for most Python projects
+  - package-ecosystem: "pip"
     directory: "/"
     schedule:
       interval: "weekly"
-    # Optional: group related updates to reduce noise
     groups:
       production-dependencies:
         dependency-type: "production"
       development-dependencies:
         dependency-type: "development"
-    # Limit open PRs to avoid overwhelming the repo
     open-pull-requests-limit: 10
 
-  # Also keep GitHub Actions up to date
+  # Keep GitHub Actions updated
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
